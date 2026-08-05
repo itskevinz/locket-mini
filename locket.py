@@ -634,6 +634,7 @@ def _live_moments_loop(s: LocketSession, state: Dict[str, Any]):
             req = {"action": "getMoments", "id": None, "pageToken": None,
                    "clientTarget": "all", "_client": {"os": "Windows"}}
             ws.send(json.dumps(req))
+            state["last_ws_pull"] = time.time()
         elif action in ("getMoments", "getNewMoments"):
             raw = data.get("data")
             if not isinstance(raw, list):
@@ -643,6 +644,8 @@ def _live_moments_loop(s: LocketSession, state: Dict[str, Any]):
                 with state["lock"]:
                     state["items"] = _merge_moments(state.get("items") or [], items)
                     state["updated_at"] = time.time()
+                    state["last_fetch_at"] = time.time()
+                    state["bootstrapped"] = True
                 logger.info("LIVE WS +%d moments for %s (total %d)",
                             len(items), s.local_id[:8], len(state["items"]))
         elif action == "error" or data.get("error"):
@@ -668,9 +671,20 @@ def _live_moments_loop(s: LocketSession, state: Dict[str, Any]):
             state["ws"] = ws
             wst = threading.Thread(target=lambda: ws.run_forever(ping_interval=25, ping_timeout=8), daemon=True)
             wst.start()
-            # stay up until stop or socket dies
+            # stay up until stop or socket dies; every ~45s re-pull getMoments so we
+            # recover moments missed when the server skipped a push frame
             while not stop.is_set() and wst.is_alive():
                 stop.wait(5)
+                try:
+                    last_pull = state.get("last_ws_pull") or 0
+                    if time.time() - last_pull >= 45 and state.get("ws"):
+                        state["last_ws_pull"] = time.time()
+                        state["ws"].send(json.dumps({
+                            "action": "getMoments", "id": None, "pageToken": None,
+                            "clientTarget": "all", "_client": {"os": "Windows"},
+                        }))
+                except Exception as e:
+                    logger.debug("LIVE WS periodic pull skip: %s", e)
             try:
                 ws.close()
             except Exception:
@@ -682,10 +696,9 @@ def _live_moments_loop(s: LocketSession, state: Dict[str, Any]):
             stop.wait(8)  # reconnect backoff
 
 
-def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, Any]]:
-    """Return cached moments; kick off initial fetch + live listener if needed."""
+def _ensure_moments_state(local_id: str) -> Dict[str, Any]:
     with _MOMENTS_LOCK:
-        st = _MOMENTS_CACHE.get(s.local_id)
+        st = _MOMENTS_CACHE.get(local_id)
         if st is None:
             st = {
                 "items": [],
@@ -695,27 +708,76 @@ def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, 
                 "ws": None,
                 "updated_at": 0,
                 "bootstrapped": False,
+                "fetching": False,  # prevent parallel one-shot WS storms
+                "last_fetch_at": 0,
             }
-            _MOMENTS_CACHE[s.local_id] = st
+            _MOMENTS_CACHE[local_id] = st
+        return st
 
-    # Already have data and not forcing — return immediately
+
+def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int = 28) -> List[Dict[str, Any]]:
+    """One-shot WS fetch and merge into state. Single-flight per user."""
+    started_here = False
     with st["lock"]:
-        if st["bootstrapped"] and not force and st["items"]:
+        if st.get("fetching"):
+            started_here = False
+        else:
+            st["fetching"] = True
+            started_here = True
+
+    if not started_here:
+        # Another request is fetching — wait briefly for it, then return whatever is cached
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with st["lock"]:
+                if not st.get("fetching"):
+                    return list(st.get("items") or [])
+            time.sleep(0.2)
+        with st["lock"]:
+            return list(st.get("items") or [])
+
+    items: List[Dict[str, Any]] = []
+    try:
+        items, _ = get_moments_ws(s, timeout=timeout)
+    except Exception as e:
+        logger.error("moments fetch failed: %s", e)
+        items = []
+
+    with st["lock"]:
+        st["fetching"] = False
+        st["last_fetch_at"] = time.time()
+        if items:
+            st["items"] = _merge_moments(st.get("items") or [], items)
+            st["updated_at"] = time.time()
+            st["bootstrapped"] = True
+        elif not st.get("bootstrapped"):
+            # First boot failed with empty — still mark so we don't tight-loop
+            st["bootstrapped"] = True
+        return list(st.get("items") or [])
+
+
+def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, Any]]:
+    """Return cached moments; kick off initial fetch + live listener if needed.
+
+    force=True always hits binhake via one-shot WebSocket (used when user re-opens
+    the Moments tab). Soft path returns memory cache when warm.
+    """
+    st = _ensure_moments_state(s.local_id)
+
+    with st["lock"]:
+        warm = (
+            st.get("bootstrapped")
+            and not force
+            and st.get("items")
+            and (time.time() - (st.get("last_fetch_at") or st.get("updated_at") or 0)) < 25
+        )
+        if warm:
             return list(st["items"])
 
-    # Bootstrap with one-shot WS (blocking, but only the first time)
-    try:
-        items, _ = get_moments_ws(s, timeout=30)
-    except Exception as e:
-        logger.error("moments bootstrap failed: %s", e)
-        items = []
-    with st["lock"]:
-        st["items"] = _merge_moments(st.get("items") or [], items)
-        st["bootstrapped"] = True
-        st["updated_at"] = time.time()
-        out = list(st["items"])
+    out = _fetch_and_store_moments(s, st, timeout=28)
 
-    # Start long-lived listener if not running
+    # Start long-lived listener if not running (best-effort on long-lived hosts;
+    # on serverless the thread dies with the worker — poll/force still work).
     th = st.get("thread")
     if th is None or not th.is_alive():
         st["stop"].clear()
@@ -727,17 +789,24 @@ def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, 
 
 
 def poll_new_moments(s: LocketSession, since: float = 0) -> Tuple[List[Dict[str, Any]], float]:
-    """Return moments updated after `since` timestamp, plus current updated_at."""
-    st = _MOMENTS_CACHE.get(s.local_id)
-    if not st:
-        items = get_moments_cached(s)
-        st = _MOMENTS_CACHE.get(s.local_id)
-        return items, (st or {}).get("updated_at", time.time())
+    """Return moments if cache advanced past `since`. If cache is stale, refresh first."""
+    st = _ensure_moments_state(s.local_id)
+    now = time.time()
+    with st["lock"]:
+        last = st.get("last_fetch_at") or st.get("updated_at") or 0
+        has_data = bool(st.get("items"))
+    # If nothing yet, or last upstream fetch > 40s ago — pull fresh before answering poll
+    if not has_data or (now - last) > 40:
+        try:
+            get_moments_cached(s, force=True)
+        except Exception as e:
+            logger.warning("poll refresh failed: %s", e)
     with st["lock"]:
         updated = st.get("updated_at") or 0
+        items = list(st.get("items") or [])
         if updated <= since:
             return [], updated
-        return list(st.get("items") or []), updated
+        return items, updated
 
 
 def stop_moments_live(local_id: str):
@@ -1657,7 +1726,10 @@ function showPage(name){
     // Always start at top — previous scrollTop causes auto-load of entire feed
     _momentsBootLock = true;
     scrollMomentsTop();
-    loadMoments();
+    // Re-entering the tab: force upstream refresh if data is older than 20s so
+    // new friend posts show without a full page reload.
+    var age = (Date.now()/1000) - (momentsUpdatedAt || 0);
+    loadMoments(age > 20 || !momentsCache.length);
     startMomentsPoll();
     // release lock after first paint settles (prevents near-bottom cascade)
     setTimeout(function(){ _momentsBootLock = false; scrollMomentsTop(); }, 220);
@@ -2208,23 +2280,33 @@ function prefetchMomentImages(items, count){
 function loadMoments(force){
   var local=readMomentsLocal();
   var warm=local && (Date.now()-(local.ts||0)<MOMENTS_TTL_MS) && local.moments && local.moments.length;
+  // Soft path: paint cache immediately, refresh in background.
+  // Soft window shortened from 5 min → 20s so re-opening the tab pulls new posts.
   if(!force && momentsCache.length){
     renderMomentsUI(momentsCache);
-    if(Date.now()/1000 - momentsUpdatedAt < 300) return; // 5 min server soft
+    if(Date.now()/1000 - momentsUpdatedAt < 20) return;
+    // stale soft cache — fall through to network (force upstream)
+    force = true;
   }else if(!force && warm){
     momentsCache=local.moments;
     momentsUpdatedAt=local.updated_at||(local.ts/1000);
     momentsLoaded=true;
     renderMomentsUI(momentsCache);
     prefetchMomentImages(momentsCache, PREFETCH_COUNT);
-    // silent background refresh
-    api('/api/moments').then(function(d){
+    // Always force upstream on localStorage warm path so new posts arrive
+    api('/api/moments?force=1').then(function(d){
       if(!d.ok) return;
       var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
+      var prevLen = momentsCache.length;
+      var prevTop = momentsCache[0] && (momentsCache[0].thumbnail_url||momentsCache[0].url||'');
       momentsCache=items;
       momentsUpdatedAt=d.updated_at||(Date.now()/1000);
       writeMomentsLocal(items, momentsUpdatedAt);
-      if($('page-moments')&&$('page-moments').classList.contains('active')) renderMomentsUI(items);
+      var top = items[0] && (items[0].thumbnail_url||items[0].url||'');
+      if($('page-moments')&&$('page-moments').classList.contains('active') &&
+         (items.length!==prevLen || top!==prevTop)){
+        renderMomentsUI(items);
+      }
       prefetchMomentImages(items, PREFETCH_COUNT);
     }).catch(function(){});
     return;
@@ -2235,7 +2317,8 @@ function loadMoments(force){
     if(grid) grid.innerHTML=Array(IS_PHONE?3:6).fill('<div class="skeleton" style="width:100%;height:0;padding-bottom:100%;border-radius:14px"></div>').join('');
     if(feed) feed.innerHTML='<div class="feed-skel"><div class="skeleton"></div><div class="skeleton" style="height:18px;width:60%;border-radius:8px;padding-bottom:0"></div></div>';
   }
-  const q=force?'?force=1':'';
+  // Default to force when caller asked OR we fell through from stale memory cache
+  const q = (force ? '?force=1' : '?force=1');
   api('/api/moments'+q).then(function(d){
     if(!d.ok){
       if(!momentsCache.length){
@@ -2243,6 +2326,9 @@ function loadMoments(force){
         $('momentsGrid').innerHTML='';
         $('momentsEmpty').classList.remove('hidden');
         hideProgress(0);
+      } else {
+        // keep showing old cache; soft notice
+        toast(d.error||'Không làm mới được Moments');
       }
       return;
     }
@@ -2259,6 +2345,8 @@ function loadMoments(force){
       $('momentsGrid').innerHTML='';
       $('momentsEmpty').classList.remove('hidden');
       hideProgress(0);
+    } else {
+      toast('Lỗi mạng — đang hiện Moments đã lưu');
     }
   });
 }
@@ -2297,13 +2385,16 @@ function preloadMoments(){
 }
 function startMomentsPoll(){
   stopMomentsPoll();
-  momentsPollTimer=setInterval(()=>{
-    api('/api/moments/poll?since='+encodeURIComponent(momentsUpdatedAt||0)).then(d=>{
+  momentsPollTimer=setInterval(function(){
+    api('/api/moments/poll?since='+encodeURIComponent(momentsUpdatedAt||0)).then(function(d){
       if(!d.ok||!d.changed)return;
-      const items=(d.moments||[]).filter(m=>m&&(m.thumbnail_url||m.video_url||m.url));
+      const items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
       if(!items.length)return;
+      var prevTop = momentsCache[0] && (momentsCache[0].thumbnail_url||momentsCache[0].url||'');
+      var nextTop = items[0] && (items[0].thumbnail_url||items[0].url||'');
       momentsCache=items;
       momentsUpdatedAt=d.updated_at||momentsUpdatedAt;
+      try{ writeMomentsLocal(items, momentsUpdatedAt); }catch(e){}
       // Only re-render if user is still on moments tab, and only if they're near the
       // top — a full re-render clears momentsRendered/scroll back to 0, which used to
       // yank people back to the top mid-scroll every ~15s while they were browsing
@@ -2316,10 +2407,12 @@ function startMomentsPoll(){
             ? (!$('page-moments') || $('page-moments').scrollTop < 200)
             : ((window.pageYOffset||document.documentElement.scrollTop||0) < 200);
         }catch(e){}
-        if(nearTop) renderMomentsUI(items);
+        if(nearTop && (items.length!==(window._momentItems||[]).length || nextTop!==prevTop)){
+          renderMomentsUI(items);
+        }
       }
-    }).catch(()=>{});
-  },15000);
+    }).catch(function(){});
+  }, 8000); // 8s — was 15s; pairs with server poll that refreshes when cache >40s old
 }
 function stopMomentsPoll(){
   if(momentsPollTimer){clearInterval(momentsPollTimer);momentsPollTimer=null}
@@ -3151,6 +3244,7 @@ def api_upload():
             st = _MOMENTS_CACHE.get(s.local_id)
             if st:
                 st["bootstrapped"] = False
+                st["last_fetch_at"] = 0
         return jsonify({"ok": True, "result": result})
     except requests.HTTPError as e:
         logger.error("UPLOAD http error: %s", e)
