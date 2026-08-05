@@ -1212,19 +1212,32 @@ body{
 .upload-actions .btn-ghost{flex:1;font-size:13px;padding:10px;margin:0 4px}
 
 /* ---------- Live camera (in-page, giống Locket gốc) ---------- */
-.lc-frame{width:100%;height:0;padding-bottom:100%;position:relative;border-radius:24px;overflow:hidden;background:#0a0a0a;
-  -webkit-transform:translateZ(0);transform:translateZ(0)}
-.lc-frame video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;display:block;background:#0a0a0a}
-.lc-frame video.mirrored{-webkit-transform:scaleX(-1);transform:scaleX(-1)}
+/* Explicit square size via JS (_sizeLcFrame) — padding-bottom alone can stretch
+   the video stream on iOS 12 / iPhone 6 Safari. */
+.live-cam{width:100%;margin:0 0 4px}
+.lc-frame{width:100%;position:relative;border-radius:24px;overflow:hidden;background:#0a0a0a;
+  -webkit-transform:translateZ(0);transform:translateZ(0);
+  height:0;padding-bottom:100%}
+.lc-frame.sized{height:auto;padding-bottom:0}
+.lc-frame video{
+  position:absolute;top:0;left:0;right:0;bottom:0;
+  width:100%;height:100%;
+  max-width:none;max-height:none;
+  object-fit:cover;-webkit-object-fit:cover;
+  object-position:center center;
+  display:block;background:#0a0a0a;
+  -webkit-transform:translateZ(0)
+}
+.lc-frame video.mirrored{-webkit-transform:scaleX(-1) translateZ(0);transform:scaleX(-1) translateZ(0)}
 .lc-hint{position:absolute;top:50%;left:0;right:0;-webkit-transform:translateY(-50%);transform:translateY(-50%);
-  text-align:center;color:var(--text2);font-weight:700;font-size:13px;padding:0 20px}
+  text-align:center;color:var(--text2);font-weight:700;font-size:13px;padding:0 20px;z-index:2}
 .lc-hint .spinner{margin-bottom:8px}
 .lc-flash-btn{position:absolute;top:12px;left:12px;z-index:3;width:36px;height:36px;border-radius:50%;
   background:rgba(0,0,0,.45);border:none;color:#fff;display:flex;align-items:center;justify-content:center;
   cursor:pointer;-webkit-appearance:none}
 .lc-flash-btn.on{color:var(--accent)}
 .lc-flash-btn.hidden{display:none}
-.lc-flash-overlay{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;z-index:4}
+.lc-flash-overlay{position:absolute;top:0;left:0;right:0;bottom:0;background:#fff;opacity:0;pointer-events:none;z-index:4}
 .lc-flash-overlay.fire{opacity:.85;transition:opacity .12s ease-out}
 .lc-bar{display:flex;align-items:center;justify-content:center;gap:36px;padding:16px 10px 2px}
 .lc-side{width:46px;height:46px;border-radius:50%;background:var(--surface);border:1px solid var(--border);
@@ -1409,7 +1422,7 @@ body{
     </div>
     <div class="live-cam hidden" id="liveCam">
       <div class="lc-frame">
-        <video id="lcVideo" playsinline muted autoplay></video>
+        <video id="lcVideo" playsinline webkit-playsinline muted autoplay></video>
         <div class="lc-hint hidden" id="lcHint"><span class="spinner light"></span><br>Đang mở camera…</div>
         <div class="lc-flash-overlay" id="lcFlashOverlay"></div>
         <button type="button" class="lc-flash-btn hidden" id="lcFlashBtn" onclick="toggleTorch(event)" aria-label="Đèn flash"><i class="bi bi-lightning-charge-fill"></i></button>
@@ -1659,6 +1672,18 @@ function showPage(name){
       $('uploadPlaceholder').classList.add('hidden');
       $('liveCam').classList.remove('hidden');
       startLiveCamera();
+      // Scroll camera into comfortable view (switches sit above; user should not have to drag)
+      setTimeout(function(){ scrollUploadCameraIntoView(); }, 60);
+      setTimeout(function(){ scrollUploadCameraIntoView(); }, 280);
+    } else {
+      // still jump near top of upload form so preview is usable
+      setTimeout(function(){
+        try{
+          var page=$('page-upload');
+          if(page) page.scrollIntoView({block:'start'});
+          window.scrollTo(0, Math.max(0, (page?page.offsetTop:0) - 8));
+        }catch(e){}
+      }, 40);
     }
   } else {
     stopLiveCamera();
@@ -2396,6 +2421,44 @@ function isLiveCamera(){
 function toggleLiveCamera(on){
   try{ localStorage.setItem('locket_live_camera', on?'1':'0'); }catch(e){}
   if(!croppedBlob) openCapture();
+  if(on) setTimeout(function(){ scrollUploadCameraIntoView(); }, 80);
+}
+/** Force .lc-frame to true 1:1 using measured width — fixes stretch on iPhone 6 / iOS 12. */
+function _sizeLcFrame(){
+  try{
+    var frame = document.querySelector('#liveCam .lc-frame');
+    if(!frame || frame.offsetParent===null) return;
+    var w = frame.clientWidth || frame.offsetWidth;
+    if(!w) return;
+    // Cap so shutter bar + switches stay on screen (iPhone 6 = 667h)
+    var maxSide = Math.min(w, Math.max(220, (window.innerHeight || 500) - 260));
+    frame.style.width = maxSide + 'px';
+    frame.style.height = maxSide + 'px';
+    frame.style.paddingBottom = '0';
+    frame.style.marginLeft = 'auto';
+    frame.style.marginRight = 'auto';
+    frame.classList.add('sized');
+  }catch(e){}
+}
+function scrollUploadCameraIntoView(){
+  try{
+    _sizeLcFrame();
+    var target = $('liveCam');
+    if(!target || target.classList.contains('hidden')) target = $('previewBox');
+    if(!target) return;
+    // Prefer centering the square in the visible area above the bottom nav
+    var rect = target.getBoundingClientRect();
+    var navH = 64 + 8;
+    var viewH = (window.innerHeight || document.documentElement.clientHeight) - navH;
+    var idealTop = Math.max(0, (viewH - rect.height) / 2);
+    var delta = rect.top - idealTop;
+    if(Math.abs(delta) > 12){
+      var y = (window.pageYOffset || document.documentElement.scrollTop || 0) + delta;
+      try{ window.scrollTo(0, Math.max(0, y)); }catch(e){}
+      try{ document.documentElement.scrollTop = Math.max(0, y); }catch(e){}
+      try{ document.body.scrollTop = Math.max(0, y); }catch(e){}
+    }
+  }catch(e){}
 }
 // Decide what the "upload spot" should show right now: live camera, file-pick box, or leave the
 // existing preview/caption alone (a photo is already captured and waiting to be sent).
@@ -2410,6 +2473,7 @@ function openCapture(){
     $('uploadPlaceholder').classList.add('hidden');
     $('liveCam').classList.remove('hidden');
     startLiveCamera();
+    setTimeout(function(){ scrollUploadCameraIntoView(); }, 60);
   } else {
     stopLiveCamera();
     $('liveCam').classList.add('hidden');
@@ -2430,15 +2494,38 @@ function startLiveCamera(){
   stopLiveCamera();
   lcWantActive=true; lcStarting=true;
   const hint=$('lcHint'); if(hint) hint.classList.remove('hidden');
-  navigator.mediaDevices.getUserMedia({
+  _sizeLcFrame();
+  // Do NOT force square capture resolution — old iOS often ignores ideal 640x640 and
+  // returns a stretched stream. Ask for facingMode only; CSS object-fit:cover + square
+  // frame crops to 1:1 visually. Capture still center-crops to 1080².
+  var constraints = {
     audio:false,
-    video:{ facingMode:lcFacing, width:{ideal:640}, height:{ideal:640} }
+    video:{ facingMode: { ideal: lcFacing } }
+  };
+  // Fallback for very old webkit that only understands string facingMode
+  try{
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      throw new Error('getUserMedia không hỗ trợ');
+    }
+  }catch(e0){}
+  navigator.mediaDevices.getUserMedia(constraints).catch(function(){
+    // retry with plain string facingMode (iOS 11/12 quirk)
+    return navigator.mediaDevices.getUserMedia({audio:false, video:{facingMode: lcFacing}});
   }).then(s=>{
     lcStarting=false;
     if(!lcWantActive){ s.getTracks().forEach(t=>t.stop()); return; }
     lcStream=s; lcTrack=s.getVideoTracks()[0];
-    const v=$('lcVideo'); v.srcObject=s; v.classList.toggle('mirrored', lcFacing==='user');
+    const v=$('lcVideo');
+    // iPhone 6: explicit playsinline attrs + muted required before play()
+    try{ v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline',''); v.muted=true; v.playsInline=true; }catch(e){}
+    v.srcObject=s;
+    v.classList.toggle('mirrored', lcFacing==='user');
+    var tryPlay = function(){ try{ var p=v.play(); if(p&&p.catch) p.catch(function(){}); }catch(e){} };
+    tryPlay();
+    v.onloadedmetadata = function(){ tryPlay(); _sizeLcFrame(); scrollUploadCameraIntoView(); };
     if(hint) hint.classList.add('hidden');
+    _sizeLcFrame();
+    setTimeout(function(){ _sizeLcFrame(); scrollUploadCameraIntoView(); }, 120);
     try{
       const caps=lcTrack.getCapabilities && lcTrack.getCapabilities();
       const fb=$('lcFlashBtn');
@@ -2634,18 +2721,31 @@ function updateOnlineUI(){
 }
 function toggleAutoCamera(on){
   try{ localStorage.setItem('locket_auto_camera', on?'1':'0'); }catch(e){}
+  // If user turns it on while already on the site, jump to camera now
+  if(on){
+    setTimeout(function(){
+      showPage('upload');
+      if(!isLiveCamera()) setTimeout(function(){ triggerCamera(); }, 280);
+      else setTimeout(function(){ scrollUploadCameraIntoView(); }, 200);
+    }, 50);
+  }
 }
 function isAutoCamera(){
   try{ return localStorage.getItem('locket_auto_camera')==='1'; }catch(e){ return false; }
 }
 function maybeAutoCamera(){
   if(!isAutoCamera()) return;
-  if(isLiveCamera()) return;
-  // slight delay so page paints, then open upload + camera
-  setTimeout(()=>{
+  // Always switch to Đăng. Live camera mode opens in-page stream;
+  // otherwise open the system camera picker (capture=environment).
+  setTimeout(function(){
     showPage('upload');
-    setTimeout(()=>triggerCamera(), 350);
-  }, 400);
+    if(!isLiveCamera()){
+      setTimeout(function(){ triggerCamera(); }, 350);
+    } else {
+      setTimeout(function(){ scrollUploadCameraIntoView(); }, 200);
+      setTimeout(function(){ scrollUploadCameraIntoView(); }, 500);
+    }
+  }, 350);
 }
 
 /* ===================== Upload: send ===================== */
@@ -2714,6 +2814,17 @@ document.addEventListener('visibilitychange',()=>{
   }
 });
 window.addEventListener('pagehide', stopLiveCamera);
+window.addEventListener('resize', function(){
+  if($('liveCam') && !$('liveCam').classList.contains('hidden')) _sizeLcFrame();
+});
+window.addEventListener('orientationchange', function(){
+  setTimeout(function(){
+    if($('liveCam') && !$('liveCam').classList.contains('hidden')){
+      _sizeLcFrame();
+      scrollUploadCameraIntoView();
+    }
+  }, 200);
+});
 (function initAutoCamera(){
   const sw=$('autoCameraSwitch');
   if(sw) sw.checked=isAutoCamera();
