@@ -1,0 +1,3055 @@
+#!/usr/bin/env python3
+"""
+Locket Web — All-in-one Flask app, powered by the binhake action-API
+(https://locket.binhake.dev/server/) for everything except login, which still
+goes through Locket's own Firebase auth.
+
+Server-side console logs every Firebase/binhake call. Moments are cached and
+kept warm via a long-lived WebSocket so reopening Moments is instant;
+/api/moments/poll streams live updates. Token auto-refresh + Remember me
+(30-day permanent session).
+
+Requires: pip install flask requests pillow websocket-client
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import threading
+import os
+import sys
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+from requests.adapters import HTTPAdapter, Retry
+from PIL import Image
+from flask import Flask, request, session, jsonify, render_template_string
+
+try:
+    import websocket  # websocket-client
+except ImportError:
+    websocket = None
+
+# ============================================================
+# Console logger (server-side, colored) — separate from the
+# per-request debug records that get shipped to the browser.
+# ============================================================
+
+class ColorFormatter(logging.Formatter):
+    COLORS = {"DEBUG": "\033[36m", "INFO": "\033[32m", "WARNING": "\033[33m",
+              "ERROR": "\033[31m", "CRITICAL": "\033[35m"}
+    RESET = "\033[0m"; DIM = "\033[2m"; BOLD = "\033[1m"
+
+    def format(self, record):
+        c = self.COLORS.get(record.levelname, "")
+        ts = self.formatTime(record, "%H:%M:%S")
+        msg = record.getMessage()
+        lines = msg.split("\n")
+        out = f"{self.DIM}{ts}{self.RESET} {c}{record.levelname:8}{self.RESET} {self.BOLD}{lines[0]}{self.RESET}"
+        for line in lines[1:]:
+            out += f"\n{' '*20}{self.DIM}{line}{self.RESET}"
+        return out
+
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(ColorFormatter())
+logger = logging.getLogger("LocketWeb")
+logger.setLevel(logging.DEBUG)
+logger.handlers = []
+logger.addHandler(handler)
+
+
+def _snip(text: Optional[str], n: int = 900) -> str:
+    if text is None:
+        return ""
+    return text if len(text) <= n else text[:n] + f"…(+{len(text)-n}b)"
+
+
+def console_log(label: str, method: str, url: str, payload=None, status=None, resp_text=None, duration=None):
+    lines = [f"{'='*60}", f"  {label}", f"  {method} {url}"]
+    if payload is not None:
+        try:
+            p = json.dumps(payload, ensure_ascii=False, indent=2)
+        except Exception:
+            p = str(payload)
+        lines.append(f"  >>> PAYLOAD:\n    {_snip(p).replace(chr(10), chr(10)+'    ')}")
+    if status is not None:
+        color = "\033[32m" if status < 300 else "\033[33m" if status < 400 else "\033[31m"
+        lines.append(f"  <<< STATUS: {color}{status}\033[0m")
+    if resp_text is not None:
+        lines.append(f"  <<< BODY: {_snip(resp_text, 600)}")
+    if duration is not None:
+        lines.append(f"  <<< TIME: {duration:.3f}s")
+    lines.append("=" * 60)
+    logger.info("\n".join(lines))
+
+
+def make_debug(kind: str, label: str, method: str, url: str, payload=None,
+                status=None, resp_text=None, duration=None, error=None) -> Dict[str, Any]:
+    """One entry for the browser-side debug console."""
+    return {
+        "t": time.time(),
+        "kind": kind,           # "send" | "recv" | "error"
+        "label": label,
+        "method": method,
+        "url": url,
+        "payload": payload if payload is None else json.loads(json.dumps(payload, default=str, ensure_ascii=False)),
+        "status": status,
+        "body": _snip(resp_text, 1500) if resp_text else None,
+        "duration": round(duration, 3) if duration is not None else None,
+        "error": str(error) if error else None,
+    }
+
+
+# ============================================================
+# Config
+# ============================================================
+
+FIREBASE_API_KEY = "AIzaSyCQngaaXQIfJaH0aS2l7REgIjD7nL431So"
+LOGIN_URL = f"https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key={FIREBASE_API_KEY}"
+ACCOUNT_URL = f"https://www.googleapis.com/identitytoolkit/v3/relyingparty/getAccountInfo?key={FIREBASE_API_KEY}"
+REFRESH_URL = f"https://securetoken.googleapis.com/v1/token?key={FIREBASE_API_KEY}"
+
+BINHAKE_API = "https://locket.binhake.dev/server/"
+WS_URL = "wss://locket.binhake.dev/server/"
+
+# Moments live-cache (per local_id). Avoids re-fetching the full history every tab open.
+_MOMENTS_LOCK = threading.Lock()
+_MOMENTS_CACHE: Dict[str, Dict[str, Any]] = {}
+# token refresh tracking
+_TOKEN_LOCK = threading.Lock()
+
+IOS_UA = "com.locket.Locket/1.100.0 iPhone/18.2 hw/iPhone14_3"
+FIREBASE_GMPID = "1:641029076083:ios:cc8eb46290d69b234fa606"
+IOS_BUNDLE = "com.locket.Locket"
+
+WEB_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+]
+
+GOLD_BADGE = "https://locket.binhake.dev/assets/images/locket_gold_badge_small_Normal@2x.png"
+CELEB_BADGE = "https://locket.binhake.dev/assets/images/celebrity_badge_small_Normal@2x.png"
+FONT_URL = "https://raw.githubusercontent.com/itskevinz/assets/main/proxima_soft_bold.otf"
+FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_preview_Normal@2x.png"
+
+
+class LocketError(RuntimeError):
+    pass
+
+
+@dataclass
+class LocketSession:
+    id_token: str
+    refresh_token: Optional[str]
+    local_id: str
+    email: str
+    display_name: str
+    photo_url: str
+    ua: str
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+
+# ============================================================
+# binhake_core — auth (Firebase, unchanged) + every other call
+# through https://locket.binhake.dev/server/ (action-based POST,
+# cookie-authenticated with user_id, plus a WebSocket for moments).
+# ============================================================
+
+def _fb_headers() -> Dict[str, str]:
+    return {
+        "Accept": "*/*",
+        "Content-Type": "application/json",
+        "User-Agent": IOS_UA,
+        "X-Client-Version": "iOS/FirebaseSDK/10.23.1/FirebaseCore-iOS",
+        "X-Firebase-GMPID": FIREBASE_GMPID,
+        "X-Ios-Bundle-Identifier": IOS_BUNDLE,
+    }
+
+
+def _web_headers(id_token: str, ua: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {id_token}",
+        "Content-Type": "application/json",
+        "Origin": "https://locket.binhake.dev",
+        "Referer": "https://locket.binhake.dev/posts.html",
+        "User-Agent": ua,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.7",
+        "X-Client-OS": "Windows",
+        "Sec-Ch-Ua": '"Not=A?Brand";v="99", "Chromium";v="151"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Gpc": "1",
+        "Dnt": "1",
+    }
+
+
+def _make_http() -> requests.Session:
+    s = requests.Session()
+    adapter = HTTPAdapter(
+        pool_connections=10, pool_maxsize=10,
+        # GET only — retrying POST automatically risks double-submitting a non-idempotent
+        # action (e.g. posting the same moment twice) if the first attempt actually landed
+        # server-side but the response got lost. Reads are safe to retry, writes aren't.
+        max_retries=Retry(total=2, backoff_factor=0.6,
+                           status_forcelist=[500, 502, 503, 504],
+                           allowed_methods=["GET"]),
+    )
+    s.mount("https://", adapter)
+    return s
+
+
+# Shared retrying session for read-only upstream calls (currently: image proxy). A single
+# transient 502/503/504 from Firebase/Google Storage used to fail the request outright and
+# surface as our own 502 all the way to the browser — this was previously built but never
+# actually wired up anywhere, so every hiccup was a hard failure with no retry.
+_http = _make_http()
+
+
+class LoginError(RuntimeError):
+    """Carries whatever debug entries were captured before the failure, so
+    the browser's debug console still shows the real request/response even
+    when login fails (bad password, network down, Firebase change, etc)."""
+    def __init__(self, message: str, debug: List[Dict[str, Any]], friendly: Optional[str] = None):
+        super().__init__(message)
+        self.debug = debug
+        self.friendly = friendly or message
+
+
+def login(email: str, password: str, timeout: int = 30) -> Tuple[LocketSession, List[Dict[str, Any]]]:
+    """Firebase login — the one call that stays on Locket's own API, because
+    binhake authenticates the exact same way under the hood."""
+    debug: List[Dict[str, Any]] = []
+    payload = {"email": email.strip(), "password": password,
+               "clientType": "CLIENT_TYPE_IOS", "returnSecureToken": True}
+    debug.append(make_debug("send", "FIREBASE LOGIN", "POST", LOGIN_URL, {"email": email, "password": "***"}))
+
+    t0 = time.time()
+    try:
+        r = requests.post(LOGIN_URL, json=payload, headers=_fb_headers(), timeout=timeout)
+    except requests.exceptions.RequestException as e:
+        dt = time.time() - t0
+        console_log("FIREBASE LOGIN — CONNECTION FAILED", "POST", LOGIN_URL, {"email": email}, None, str(e), dt)
+        debug.append(make_debug("error", "FIREBASE LOGIN", "POST", LOGIN_URL, None, None, None, dt, e))
+        raise LoginError(str(e), debug,
+                          friendly=f"Không kết nối được tới máy chủ Firebase/Locket ({type(e).__name__}). "
+                                    "Kiểm tra mạng, DNS, hoặc tường lửa trên máy chạy server.") from e
+
+    dt = time.time() - t0
+    console_log("FIREBASE LOGIN", "POST", LOGIN_URL, {"email": email}, r.status_code, r.text, dt)
+    debug.append(make_debug("recv" if r.ok else "error", "FIREBASE LOGIN", "POST", LOGIN_URL,
+                             None, r.status_code, r.text, dt))
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        friendly = "Sai email hoặc mật khẩu."
+        try:
+            msg = (r.json().get("error") or {}).get("message", "")
+            if msg:
+                friendly = f"Đăng nhập thất bại: {msg}"
+        except Exception:
+            pass
+        raise LoginError(str(e), debug, friendly=friendly) from e
+    data = r.json()
+
+    t1 = time.time()
+    try:
+        r2 = requests.post(ACCOUNT_URL, json={"idToken": data["idToken"]}, headers=_fb_headers(), timeout=timeout)
+        dt2 = time.time() - t1
+        console_log("ACCOUNT INFO", "POST", ACCOUNT_URL, {"idToken": "***"}, r2.status_code, r2.text, dt2)
+        debug.append(make_debug("recv", "ACCOUNT INFO", "POST", ACCOUNT_URL, None, r2.status_code, r2.text, dt2))
+        display_name, photo_url = "", ""
+        if r2.ok:
+            users = (r2.json() or {}).get("users") or []
+            if users:
+                display_name = users[0].get("displayName") or ""
+                photo_url = users[0].get("photoUrl") or ""
+    except requests.exceptions.RequestException as e:
+        # Non-fatal — we already have a valid id_token, account info is just extra polish.
+        dt2 = time.time() - t1
+        debug.append(make_debug("error", "ACCOUNT INFO", "POST", ACCOUNT_URL, None, None, None, dt2, e))
+        display_name, photo_url = "", ""
+
+    if not display_name:
+        display_name = data.get("email", email).split("@")[0]
+
+    ses = LocketSession(
+        id_token=data["idToken"], refresh_token=data.get("refreshToken"),
+        local_id=data["localId"], email=data.get("email", email),
+        display_name=display_name, photo_url=photo_url,
+        ua=WEB_UA_POOL[hash(data["localId"]) % len(WEB_UA_POOL)], raw=data,
+    )
+    return ses, debug
+
+
+def refresh_id_token(s: LocketSession, timeout: int = 20) -> bool:
+    """Exchange refreshToken for a fresh idToken. API key is iOS-restricted so
+    we must send the same X-Ios-Bundle-Identifier / GMPID headers as login."""
+    if not s.refresh_token:
+        return False
+    with _TOKEN_LOCK:
+        t0 = time.time()
+        try:
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "*/*",
+                "User-Agent": IOS_UA,
+                "X-Client-Version": "iOS/FirebaseSDK/10.23.1/FirebaseCore-iOS",
+                "X-Firebase-GMPID": FIREBASE_GMPID,
+                "X-Ios-Bundle-Identifier": IOS_BUNDLE,
+            }
+            r = requests.post(
+                REFRESH_URL,
+                data={"grant_type": "refresh_token", "refresh_token": s.refresh_token},
+                headers=headers,
+                timeout=timeout,
+            )
+            dt = time.time() - t0
+            console_log("FIREBASE REFRESH", "POST", REFRESH_URL, {"refresh_token": "***"}, r.status_code, r.text, dt)
+            if not r.ok:
+                return False
+            data = r.json()
+            new_id = data.get("id_token") or data.get("idToken")
+            new_rt = data.get("refresh_token") or data.get("refreshToken") or s.refresh_token
+            if not new_id:
+                return False
+            s.id_token = new_id
+            s.refresh_token = new_rt
+            try:
+                session["token"] = new_id
+                session["refresh_token"] = new_rt
+                session["token_issued_at"] = time.time()
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            logger.warning("Token refresh failed: %s", e)
+            return False
+
+
+def ensure_fresh_token(s: LocketSession) -> LocketSession:
+    issued = session.get("token_issued_at") or 0
+    if time.time() - issued > 50 * 60:
+        if refresh_id_token(s):
+            session["token_issued_at"] = time.time()
+    return s
+
+
+def binhake_call(action: str, s: LocketSession, extra: Optional[Dict[str, Any]] = None,
+                  timeout: int = 25) -> Tuple[Any, Dict[str, Any]]:
+    """Generic POST to the binhake action-API. Returns (parsed_json, debug_entry)."""
+    payload = {"action": action, **(extra or {})}
+    cookies = {"user_id": s.local_id}
+    headers = _web_headers(s.id_token, s.ua)
+    t0 = time.time()
+    err = None
+    r = None
+    try:
+        r = requests.post(BINHAKE_API, headers=headers, json=payload, cookies=cookies, timeout=timeout)
+        dt = time.time() - t0
+        console_log(f"LOCK {action}", "POST", "api://lock/" + action, payload, r.status_code, r.text, dt)
+        r.raise_for_status()
+        dbg = make_debug("recv", f"binhake:{action}", "POST", BINHAKE_API, payload, r.status_code, r.text, dt)
+        try:
+            return r.json(), dbg
+        except ValueError:
+            raise LocketError(f"binhake:{action} returned non-JSON body")
+    except requests.HTTPError as e:
+        dt = time.time() - t0
+        dbg = make_debug("error", f"binhake:{action}", "POST", BINHAKE_API, payload,
+                          getattr(r, "status_code", None), getattr(r, "text", None), dt, e)
+        console_log(f"LOCK {action} FAIL", "POST", "api://lock/" + action, payload,
+                     getattr(r, "status_code", None), getattr(r, "text", None), dt)
+        raise
+    except Exception as e:
+        dt = time.time() - t0
+        dbg = make_debug("error", f"binhake:{action}", "POST", BINHAKE_API, payload, None, None, dt, e)
+        console_log(f"LOCK {action} ERROR", "POST", "api://lock/" + action, payload, None, str(e), dt)
+        raise LocketError(str(e)) from e
+
+
+def _first(d: Dict[str, Any], *keys, default=None):
+    for k in keys:
+        if isinstance(d, dict) and k in d and d[k] not in (None, ""):
+            return d[k]
+    return default
+
+
+def _split_display_name(name: str) -> Tuple[str, str]:
+    parts = (name or "").strip().split(None, 1)
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1]
+
+
+
+def _flatten_firestore_value(v):
+    if not isinstance(v, dict):
+        return v
+    if "stringValue" in v:
+        return v["stringValue"]
+    if "integerValue" in v:
+        return int(v["integerValue"])
+    if "doubleValue" in v:
+        return float(v["doubleValue"])
+    if "booleanValue" in v:
+        return v["booleanValue"]
+    if "timestampValue" in v:
+        from datetime import datetime, timezone
+        try:
+            ts = v["timestampValue"].replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts)
+            return {"_seconds": int(dt.timestamp()), "_nanoseconds": 0}
+        except Exception:
+            return {"_seconds": 0, "_nanoseconds": 0}
+    if "nullValue" in v:
+        return None
+    if "arrayValue" in v:
+        values = v["arrayValue"].get("values", [])
+        return [_flatten_firestore_value(x) for x in values]
+    if "mapValue" in v:
+        fields = v["mapValue"].get("fields", {})
+        return {k: _flatten_firestore_value(val) for k, val in fields.items()}
+    return v
+
+
+def flatten_firestore(doc):
+    if not isinstance(doc, dict):
+        return doc
+    fields = doc.get("fields")
+    if not isinstance(fields, dict):
+        return doc
+    result = {}
+    for k, v in fields.items():
+        result[k] = _flatten_firestore_value(v)
+    for key in ("createTime", "updateTime", "name"):
+        if key in doc:
+            result[key] = doc[key]
+    return result
+
+def _normalize_user(u: Dict[str, Any]) -> Dict[str, Any]:
+    """binhake's exact field names aren't guaranteed everywhere, so every
+    likely alias is checked. If a field is missing here, check the debug
+    console — the raw payload is right there and this function just needs
+    another key added to the matching _first(...) call."""
+    if not isinstance(u, dict):
+        return {}
+    first_name = _first(u, "first_name", "firstName", default="")
+    last_name = _first(u, "last_name", "lastName", default="")
+    if not first_name and not last_name:
+        # confirmed real shape from getInfo: only a combined "displayName"
+        first_name, last_name = _split_display_name(_first(u, "displayName", "display_name", "name", default=""))
+    pic = _first(u, "profile_picture_url", "profilePictureUrl",
+                 "avatar", "avatar_url", "photo_url", "photoUrl", default="") or ""
+    if isinstance(pic, str):
+        pic = pic.replace("firebasestorage.googleapis.com:443", "firebasestorage.googleapis.com")
+    return {
+        "uid": _first(u, "uid", "user_id", "userId", "id", default=""),
+        "username": _first(u, "username", "user_name", default=""),
+        "first_name": first_name,
+        "last_name": last_name,
+        "profile_picture_url": pic,
+        "celebrity": bool(_first(u, "celebrity", "is_celebrity", default=False)),
+        "badge": _first(u, "badge", "badge_type", default="") or "",
+        "streak": _first(u, "streak", "streak_count", "streakCount", "current_streak", default=0),
+    }
+
+
+def get_self_info(s: LocketSession) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """action=getInfo — confirmed real shape:
+    {"success":true,"data":{"displayName":"...","photoUrl":"..."},
+     "streak":{"count":396,"last_updated_yyyymmdd":20260804}}
+    Note streak sits at the TOP level, as a sibling of "data" — not inside it."""
+    debug = [make_debug("send", "binhake:getInfo", "POST", BINHAKE_API, {"action": "getInfo"})]
+    data, dbg = binhake_call("getInfo", s)
+    debug.append(dbg)
+
+    body = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else (data or {})
+    info = _normalize_user(body)
+
+    streak_val = 0
+    if isinstance(data, dict):
+        streak_obj = data.get("streak")
+        if isinstance(streak_obj, dict):
+            streak_val = _first(streak_obj, "count", "streak", "value", default=0)
+        elif isinstance(streak_obj, (int, float)):
+            streak_val = streak_obj
+        elif not streak_val:
+            streak_val = _first(data, "streak_count", "streakCount", default=0)
+    info["streak"] = streak_val or 0
+
+    if not info.get("first_name") and not info.get("username"):
+        info["first_name"] = s.display_name
+    if not info.get("profile_picture_url"):
+        info["profile_picture_url"] = s.photo_url
+    return info, debug
+
+
+def get_friends(s: LocketSession) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """action=getFriendsList_v3 — full friend list with profiles, already
+    server-side (binhake resolves profiles for us, no N+1 fan-out needed)."""
+    debug = [make_debug("send", "binhake:getFriendsList_v3", "POST", BINHAKE_API, {"action": "getFriendsList_v3"})]
+    data, dbg = binhake_call("getFriendsList_v3", s)
+    debug.append(dbg)
+    raw_list = None
+    if isinstance(data, dict):
+        for path in (data.get("data"), data.get("friends"), (data.get("result") or {}).get("data")):
+            if isinstance(path, list):
+                raw_list = path
+                break
+    if raw_list is None:
+        raw_list = []
+    friends = [_normalize_user(u) for u in raw_list if isinstance(u, dict)]
+
+    def sort_key(p):
+        name = (f"{p.get('first_name','')} {p.get('last_name','')}").strip() or p.get("username") or p.get("uid") or ""
+        return name.casefold()
+
+    celebs = sorted([p for p in friends if p.get("celebrity")], key=sort_key)
+    normals = sorted([p for p in friends if not p.get("celebrity")], key=sort_key)
+    return celebs + normals, debug
+
+
+def get_moments_ws(s: LocketSession, page_token=None, client_target="all", timeout: int = 25
+                    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """binhake serves the full/paginated moment history over its WebSocket.
+    The server may reply with either action="getMoments" or action="getNewMoments"
+    (both carry the same Firestore-shaped data)."""
+    if not websocket:
+        raise LocketError("websocket-client is not installed (pip install websocket-client)")
+
+    debug: List[Dict[str, Any]] = []
+    result = {"frame": None, "done": threading.Event()}
+    ws_holder = [None]
+
+    def on_open(ws):
+        ws_holder[0] = ws
+        auth_frame = {"action": "auth", "token": s.id_token, "_client": {"os": "Windows"}}
+        debug.append(make_debug("send", "ws:auth", "WS", WS_URL, {"action": "auth", "token": "***"}))
+        ws.send(json.dumps(auth_frame))
+
+    def on_message(ws, message):
+        try:
+            data = json.loads(message)
+        except Exception as e:
+            debug.append(make_debug("error", "ws:message", "WS", WS_URL, None, None, message[:500], None, e))
+            return
+        action = data.get("action")
+        debug.append(make_debug("recv", f"ws:{action}", "WS", WS_URL, None, None,
+                                 json.dumps(data, ensure_ascii=False)[:1500]))
+        if action == "authenticated":
+            req = {"action": "getMoments", "id": None, "pageToken": page_token,
+                   "clientTarget": client_target, "_client": {"os": "Windows"}}
+            debug.append(make_debug("send", "ws:getMoments", "WS", WS_URL, req))
+            ws.send(json.dumps(req))
+        elif action in ("getMoments", "getNewMoments"):
+            result["frame"] = data
+            result["done"].set()
+            ws.close()
+        elif action == "error" or data.get("error"):
+            result["done"].set()
+            ws.close()
+
+    def on_error(ws, error):
+        debug.append(make_debug("error", "ws:error", "WS", WS_URL, None, None, None, None, error))
+        result["done"].set()
+
+    def on_close(ws, code, msg):
+        result["done"].set()
+
+    ws = websocket.WebSocketApp(
+        WS_URL,
+        header=["Origin: https://locket.binhake.dev", f"User-Agent: {s.ua}", f"Cookie: user_id={s.local_id}"],
+        on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close,
+    )
+    wst = threading.Thread(target=lambda: ws.run_forever(ping_interval=25, ping_timeout=4))
+    wst.daemon = True
+    wst.start()
+    result["done"].wait(timeout=timeout)
+    if ws_holder[0]:
+        try:
+            ws_holder[0].close()
+        except Exception:
+            pass
+    wst.join(timeout=2)
+
+    frame = result["frame"] or {}
+    items = frame.get("data")
+    if not isinstance(items, list):
+        items = [items] if items else []
+
+    items = [flatten_firestore(item) for item in items if isinstance(item, dict)]
+    return items, debug
+
+
+def _moment_key(m: Dict[str, Any]) -> str:
+    return str(m.get("canonical_uid") or m.get("md5") or m.get("thumbnail_url") or id(m))
+
+
+def _merge_moments(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = {_moment_key(m) for m in existing}
+    out = list(existing)
+    for m in incoming:
+        k = _moment_key(m)
+        if k not in seen:
+            seen.add(k)
+            out.append(m)
+    def sort_ts(m):
+        d = m.get("date") or {}
+        return (d.get("_seconds") if isinstance(d, dict) else 0) or 0
+    out.sort(key=sort_ts, reverse=True)
+    return out
+
+
+def _live_moments_loop(s: LocketSession, state: Dict[str, Any]):
+    """Long-lived WS: auth once, then keep listening for getNewMoments frames."""
+    if not websocket:
+        return
+    stop: threading.Event = state["stop"]
+
+    def on_open(ws):
+        state["ws"] = ws
+        ws.send(json.dumps({"action": "auth", "token": s.id_token, "_client": {"os": "Windows"}}))
+        logger.info("LIVE WS open for %s", s.local_id[:8])
+
+    def on_message(ws, message):
+        try:
+            data = json.loads(message)
+        except Exception:
+            return
+        action = data.get("action")
+        if action == "authenticated":
+            req = {"action": "getMoments", "id": None, "pageToken": None,
+                   "clientTarget": "all", "_client": {"os": "Windows"}}
+            ws.send(json.dumps(req))
+        elif action in ("getMoments", "getNewMoments"):
+            raw = data.get("data")
+            if not isinstance(raw, list):
+                raw = [raw] if raw else []
+            items = [flatten_firestore(x) for x in raw if isinstance(x, dict)]
+            if items:
+                with state["lock"]:
+                    state["items"] = _merge_moments(state.get("items") or [], items)
+                    state["updated_at"] = time.time()
+                logger.info("LIVE WS +%d moments for %s (total %d)",
+                            len(items), s.local_id[:8], len(state["items"]))
+        elif action == "error" or data.get("error"):
+            logger.warning("LIVE WS error frame: %s", _snip(str(data), 200))
+
+    def on_error(ws, error):
+        logger.warning("LIVE WS error %s: %s", s.local_id[:8], error)
+
+    def on_close(ws, code, msg):
+        logger.info("LIVE WS closed %s code=%s", s.local_id[:8], code)
+        state["ws"] = None
+
+    while not stop.is_set():
+        try:
+            # refresh token periodically so long-lived WS can re-auth
+            refresh_id_token(s)
+            ws = websocket.WebSocketApp(
+                WS_URL,
+                header=["Origin: https://locket.binhake.dev", f"User-Agent: {s.ua}",
+                        f"Cookie: user_id={s.local_id}"],
+                on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close,
+            )
+            state["ws"] = ws
+            wst = threading.Thread(target=lambda: ws.run_forever(ping_interval=25, ping_timeout=8), daemon=True)
+            wst.start()
+            # stay up until stop or socket dies
+            while not stop.is_set() and wst.is_alive():
+                stop.wait(5)
+            try:
+                ws.close()
+            except Exception:
+                pass
+            wst.join(timeout=3)
+        except Exception as e:
+            logger.warning("LIVE WS loop exception: %s", e)
+        if not stop.is_set():
+            stop.wait(8)  # reconnect backoff
+
+
+def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, Any]]:
+    """Return cached moments; kick off initial fetch + live listener if needed."""
+    with _MOMENTS_LOCK:
+        st = _MOMENTS_CACHE.get(s.local_id)
+        if st is None:
+            st = {
+                "items": [],
+                "lock": threading.Lock(),
+                "stop": threading.Event(),
+                "thread": None,
+                "ws": None,
+                "updated_at": 0,
+                "bootstrapped": False,
+            }
+            _MOMENTS_CACHE[s.local_id] = st
+
+    # Already have data and not forcing — return immediately
+    with st["lock"]:
+        if st["bootstrapped"] and not force and st["items"]:
+            return list(st["items"])
+
+    # Bootstrap with one-shot WS (blocking, but only the first time)
+    try:
+        items, _ = get_moments_ws(s, timeout=30)
+    except Exception as e:
+        logger.error("moments bootstrap failed: %s", e)
+        items = []
+    with st["lock"]:
+        st["items"] = _merge_moments(st.get("items") or [], items)
+        st["bootstrapped"] = True
+        st["updated_at"] = time.time()
+        out = list(st["items"])
+
+    # Start long-lived listener if not running
+    th = st.get("thread")
+    if th is None or not th.is_alive():
+        st["stop"].clear()
+        th = threading.Thread(target=_live_moments_loop, args=(s, st), daemon=True)
+        st["thread"] = th
+        th.start()
+
+    return out
+
+
+def poll_new_moments(s: LocketSession, since: float = 0) -> Tuple[List[Dict[str, Any]], float]:
+    """Return moments updated after `since` timestamp, plus current updated_at."""
+    st = _MOMENTS_CACHE.get(s.local_id)
+    if not st:
+        items = get_moments_cached(s)
+        st = _MOMENTS_CACHE.get(s.local_id)
+        return items, (st or {}).get("updated_at", time.time())
+    with st["lock"]:
+        updated = st.get("updated_at") or 0
+        if updated <= since:
+            return [], updated
+        return list(st.get("items") or []), updated
+
+
+def stop_moments_live(local_id: str):
+    with _MOMENTS_LOCK:
+        st = _MOMENTS_CACHE.pop(local_id, None)
+    if not st:
+        return
+    st["stop"].set()
+    ws = st.get("ws")
+    if ws:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def upload_media(s: LocketSession, data: bytes, filename: str, content_type: str,
+                  caption: str = "", recipients: str = "all", timeout: int = 90,
+                  thumb_data: Optional[bytes] = None, thumb_name: Optional[str] = None,
+                  thumb_type: Optional[str] = None,
+                  ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """action=uploadMedia — binhake expects BOTH multipart fields:
+    - thumb  (preview / square jpeg)
+    - media  (full media; for photos same bytes as thumb)
+    Missing either field returns MISSING_FIELDS 400.
+    """
+    debug = []
+    form = {
+        "action": "uploadMedia",
+        "captionID": "defaultCaption",
+        "captionText": caption or "",
+        "payload": "null",
+        "mediaCropPayload": "null",
+        "recipients": recipients,
+        "mode": '{"restoreToggle":false,"restoreDate":null,"exceptGroupToggle":false}',
+    }
+    # Real binhake upload (HAR): sends both "thumb" and "media" as binary parts.
+    t_data = thumb_data if thumb_data is not None else data
+    t_name = thumb_name or filename
+    t_type = thumb_type or content_type
+    files = {
+        "thumb": (t_name, t_data, t_type),
+        "media": (filename, data, content_type),
+    }
+    h = _web_headers(s.id_token, s.ua)
+    h.pop("Content-Type", None)
+    cookies = {"user_id": s.local_id}
+
+    debug.append(make_debug("send", "binhake:uploadMedia", "POST", BINHAKE_API,
+                             {**form, "thumb": f"<{len(t_data)}b {t_type}>",
+                              "media": f"<{len(data)}b {content_type}>"}))
+    t0 = time.time()
+    r = requests.post(BINHAKE_API, headers=h, data=form, files=files, cookies=cookies, timeout=timeout)
+    dt = time.time() - t0
+    console_log("LOCK uploadMedia", "POST", "api://lock/uploadMedia",
+                {**form, "thumb": t_name, "media": filename}, r.status_code, r.text, dt)
+    debug.append(make_debug("recv" if r.ok else "error", "binhake:uploadMedia", "POST", BINHAKE_API,
+                             None, r.status_code, r.text, dt))
+    r.raise_for_status()
+    try:
+        return r.json(), debug
+    except ValueError:
+        raise LocketError("uploadMedia returned non-JSON body")
+
+
+# Locket-style limits: square ~1080, keep visual quality high, shrink if over size cap
+_LOCKET_MAX_SIDE = 1080
+_LOCKET_MAX_BYTES = 1_500_000  # ~1.5MB soft limit before quality steps down
+
+
+def _new_upload_name() -> str:
+    return f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}.jpg"
+
+
+def compress_image(raw_bytes: bytes) -> Tuple[bytes, str]:
+    """Crop to 1:1, resize to 1080, JPEG with high quality. Step quality down only if over size limit.
+
+    Fast path: the client-side cropper already ships a square 1080 JPEG under the size cap in the
+    common case, so we probe the header (cheap — no full decode) and pass those bytes through
+    untouched instead of re-decoding/re-encoding an image that's already correct.
+    """
+    if len(raw_bytes) <= _LOCKET_MAX_BYTES and raw_bytes[:3] == b"\xff\xd8\xff":
+        try:
+            probe = Image.open(io.BytesIO(raw_bytes))
+            if probe.format == "JPEG" and probe.mode == "RGB" and probe.size == (_LOCKET_MAX_SIDE, _LOCKET_MAX_SIDE):
+                return raw_bytes, _new_upload_name()
+        except Exception:
+            pass
+
+    img = Image.open(io.BytesIO(raw_bytes))
+    # JPEG draft decode: have libjpeg decode straight to a lower DCT scale instead of full
+    # resolution then downsampling in Python — several times faster on large source photos
+    # and the exact same end quality once we resize down to _LOCKET_MAX_SIDE anyway.
+    if img.format == "JPEG":
+        try:
+            img.draft("RGB", (_LOCKET_MAX_SIDE, _LOCKET_MAX_SIDE))
+        except Exception:
+            pass
+    if img.mode not in ("RGB",):
+        img = img.convert("RGB")
+    w, h = img.size
+    if w != h:
+        side = min(w, h)
+        left, top = (w - side) // 2, (h - side) // 2
+        img = img.crop((left, top, left + side, top + side))
+    if img.size[0] != _LOCKET_MAX_SIDE:
+        # Plain LANCZOS, no reducing_gap shortcut — draft decode above already did the
+        # heavy lifting for speed; this final resize runs at full quality so the upload
+        # doesn't lose sharpness. (reducing_gap pre-shrinks with a cheap box filter before
+        # LANCZOS, which is faster but visibly softer — not worth it on the one image the
+        # user is actually posting.)
+        img = img.resize((_LOCKET_MAX_SIDE, _LOCKET_MAX_SIDE), Image.LANCZOS)
+    data = None
+    for quality in (92, 88, 84, 80, 76, 72):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        data = buf.getvalue()
+        if len(data) <= _LOCKET_MAX_BYTES:
+            break
+    return data, _new_upload_name()
+
+
+_ALLOWED_IMG_HOSTS = (
+    "firebasestorage.googleapis.com",
+    "storage.googleapis.com",
+    "lh3.googleusercontent.com",
+    "googleusercontent.com",
+    "locket.binhake.dev",
+)
+# cache key = (url, max_side) → (ts, bytes, mime)
+_img_cache: Dict[Tuple[str, int], Tuple[float, bytes, str]] = {}
+_IMG_CACHE_TTL = 900
+_IMG_CACHE_MAX = 160
+
+
+def fetch_image_as_jpeg(url: str, max_side: int = 720, timeout: int = 15) -> Tuple[bytes, str]:
+    """Download remote media and re-encode as JPEG so iOS 12 Safari (no WebP) can show it.
+    max_side controls resize — use 480 for feed thumbs, 1080 for viewer."""
+    max_side = max(64, min(int(max_side or 720), 1280))
+    cache_key = (url, max_side)
+    now = time.time()
+    hit = _img_cache.get(cache_key)
+    if hit and now - hit[0] < _IMG_CACHE_TTL:
+        return hit[1], hit[2]
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower()
+    if not host or not any(host == h or host.endswith("." + h) for h in _ALLOWED_IMG_HOSTS):
+        raise LocketError("image host not allowed")
+    r = _http.get(url, timeout=timeout, headers={
+        "User-Agent": IOS_UA,
+        "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+    })
+    r.raise_for_status()
+    raw = r.content
+    ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if ctype.startswith("video/"):
+        raise LocketError("video not proxyable as image")
+
+    # Fast path: already JPEG/PNG under size budget — skip re-encode when possible
+    is_jpeg = ctype in ("image/jpeg", "image/jpg") or url.lower().endswith((".jpg", ".jpeg"))
+    try:
+        img = Image.open(io.BytesIO(raw))
+        # Header-only at this point (no decode yet) — size/mode/format are cheap for JPEG.
+        if getattr(img, "is_animated", False):
+            img.seek(0)
+        w0, h0 = img.size
+        needs_resize = max(w0, h0) > max_side
+        needs_convert = img.mode not in ("RGB",) or not is_jpeg or ctype == "image/webp" or url.lower().endswith(".webp")
+
+        if not needs_resize and is_jpeg and img.mode == "RGB":
+            data, out_mime = raw, "image/jpeg"
+        else:
+            # JPEG draft decode: ask libjpeg to decode at a reduced DCT scale close to the
+            # target instead of full resolution — this is the dominant cost for big source
+            # photos, and skipping it is the single biggest win for slow/old devices.
+            if needs_resize and img.format == "JPEG":
+                try:
+                    img.draft("RGB", (max_side, max_side))
+                except Exception:
+                    pass
+            img.load()
+            if img.mode in ("RGBA", "LA", "P"):
+                bg = Image.new("RGB", img.size, (0, 0, 0))
+                rgba = img.convert("RGBA")
+                bg.paste(rgba, mask=rgba.split()[-1])
+                img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            if needs_resize:
+                w, h = img.size
+                if max(w, h) > max_side:
+                    # Draft already did most of the shrinking (to within ~2x of target), so a
+                    # LANCZOS pass here is nearly as cheap as BILINEAR was on the full image,
+                    # and sharper. Plain LANCZOS (no reducing_gap) — full quality, no softening.
+                    if w >= h:
+                        img = img.resize((max_side, max(1, int(h * max_side / w))), Image.LANCZOS)
+                    else:
+                        img = img.resize((max(1, int(w * max_side / h)), max_side), Image.LANCZOS)
+            # thumbs: lower quality + no optimize (optimize is slow) — iPhone 6 friendly
+            quality = 65 if max_side <= 400 else (72 if max_side <= 540 else (78 if max_side <= 800 else 85))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality, optimize=False)
+            data = buf.getvalue()
+            out_mime = "image/jpeg"
+    except Exception as e:
+        logger.warning("JPEG convert fail (%s): %s — serving original", ctype, e)
+        if ctype in ("image/jpeg", "image/jpg", "image/png", "image/gif"):
+            data, out_mime = raw, ctype
+        else:
+            raise LocketError(f"cannot convert image ({ctype}): {e}")
+    if len(_img_cache) >= _IMG_CACHE_MAX:
+        oldest = min(_img_cache.items(), key=lambda kv: kv[1][0])[0]
+        _img_cache.pop(oldest, None)
+    _img_cache[cache_key] = (now, data, out_mime)
+    return data, out_mime
+
+
+HTML = """\
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Locket Mini</title>
+<meta name="description" content="Locket Mini — xem và đăng khoảnh khắc với bạn bè, nhanh gọn trên mọi thiết bị.">
+<meta name="theme-color" content="#000000">
+<meta name="application-name" content="Locket Mini">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Locket Mini">
+<meta name="mobile-web-app-capable" content="yes">
+<meta property="og:title" content="Locket Mini">
+<meta property="og:description" content="Pics from your best friends — web mini client.">
+<meta property="og:type" content="website">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="{{ favicon_url }}">
+<link rel="apple-touch-icon" href="{{ favicon_url }}">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+<link rel="preconnect" href="https://cdnjs.cloudflare.com">
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
+<style>
+@font-face{
+  font-family:'ProximaSoft';
+  src:url('{{ font_url }}') format('opentype');
+  font-weight:400 900;
+  font-display:swap;
+}
+:root{
+  --bg:#000; --bg-bottom:#2B1F00; --surface:#141414; --surface2:#1b1b1b;
+  --accent:#FFB800; --glow:rgba(255,199,0,.5);
+  --text:rgba(255,255,255,.9); --text2:rgba(255,255,255,.64); --muted:rgba(255,255,255,.4);
+  --border:rgba(255,255,255,.08);
+  --nav-h:64px;
+  --top-h:52px;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+html{height:100%;height:-webkit-fill-available}
+html,body{margin:0;padding:0}
+body{
+  font-family:'ProximaSoft',ui-rounded,-apple-system,'Segoe UI',sans-serif;
+  background:linear-gradient(180deg,var(--bg) 0%,var(--bg) 60%,var(--bg-bottom) 100%) fixed;
+  color:var(--text);-webkit-font-smoothing:antialiased;overscroll-behavior-y:none;
+  min-height:100vh;min-height:-webkit-fill-available;
+  overflow-x:hidden;
+}
+.app{max-width:520px;margin:0 auto;min-height:100vh;min-height:-webkit-fill-available;padding-bottom:calc(var(--nav-h) + env(safe-area-inset-bottom));position:relative}
+@media (min-width:768px){
+  .app{max-width:560px}
+  .dash-greet .name{font-size:24px}
+  .btn{font-size:17px;padding:16px}
+  .moment-card{border-radius:14px}
+  .moments-grid{grid-template-columns:repeat(3,1fr);gap:10px}
+}
+@media (min-width:1024px){
+  .app{max-width:640px}
+  .moments-grid{grid-template-columns:repeat(4,1fr)}
+}
+.topbar{position:sticky;top:0;z-index:50;background:rgba(0,0,0,.94);
+  padding:calc(10px + env(safe-area-inset-top)) 16px 10px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border)}
+.topbar .brand{font-weight:800;font-size:16px;letter-spacing:.2px;display:flex;align-items:center;gap:8px}
+.topbar .brand img{width:22px;height:22px;border-radius:6px}
+.pill{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:500px;padding:7px 14px;
+  font-size:13px;font-weight:700;display:inline-flex;align-items:center;gap:6px;cursor:pointer;transition:transform .15s}
+.pill:active{transform:scale(.95)}
+.page{padding:16px;display:none}
+.page.active{display:block;animation:fadeIn .25s ease both}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.hidden{display:none !important}
+.btn{width:100%;padding:15px;border:none;border-radius:500px;background:var(--accent);color:rgba(0,0,0,.8);
+  font-family:inherit;font-weight:800;font-size:16px;cursor:pointer;transition:transform .1s,opacity .2s;
+  box-shadow:0 0 30px var(--glow)}
+.btn:active{transform:scale(.98)}
+.btn:disabled{opacity:.55;box-shadow:none}
+.btn-ghost{background:rgba(255,255,255,.08);color:var(--text);box-shadow:none}
+.input{width:100%;padding:13px 16px;border:1px solid var(--border);border-radius:16px;background:var(--surface);
+  color:var(--text);font-family:inherit;font-size:15px;outline:none;transition:border-color .2s}
+.input:focus{border-color:var(--accent)}
+.label{font-size:11px;font-weight:800;color:var(--text2);margin:0 0 6px 2px;display:block;text-transform:uppercase;letter-spacing:.6px}
+.card{background:var(--surface);border-radius:20px;padding:18px;margin-bottom:12px;border:1px solid var(--border)}
+
+/* ---------- Login ---------- */
+.login-hero{text-align:center;padding:56px 0 30px}
+.login-hero .icon{width:88px;height:88px;border-radius:24px;margin:0 auto;box-shadow:0 0 60px var(--glow);object-fit:cover}
+.login-hero h1{margin:22px 0 6px;font-size:28px;font-weight:800;color:var(--text)}
+.login-hero p{color:var(--text2);margin:0;font-size:15px;font-weight:700;max-width:240px;margin:0 auto}
+
+/* ---------- Dash ---------- */
+.dash-head{display:flex;align-items:center;gap:14px;margin-bottom:18px}
+.dash-greet{flex:1;min-width:0}
+.dash-greet .hi{font-size:13px;color:var(--text2);font-weight:700;margin:0 0 2px}
+.dash-greet .name{font-size:21px;font-weight:800;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.streak-card{display:flex;align-items:center;gap:12px;background:linear-gradient(135deg,rgba(255,184,0,.16),rgba(255,184,0,.04));
+  border:1px solid rgba(255,184,0,.25)}
+.streak-num{font-size:30px;font-weight:800;color:var(--accent);line-height:1}
+.streak-label{font-size:12px;color:var(--text2);font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.quick-row{display:flex;gap:10px;margin-top:4px}
+.quick-row .btn{padding:13px}
+
+/* ---------- Moments grid 2x3 ---------- */
+/* Moments: desktop = square grid; phone = vertical snap feed (1 per screen) */
+.moments-head{display:flex;align-items:center;justify-content:space-between;padding:0 16px 12px}
+.moments-head h2{margin:0;font-size:20px;font-weight:800}
+/* Floating "newest" button — all devices, large hit target (iOS 12 safe) */
+.moments-top-btn{position:fixed;right:14px;bottom:78px;z-index:80;
+  width:56px;height:56px;border-radius:50%;border:none;background:#FFB800;color:#111;
+  display:none;-webkit-box-align:center;-webkit-box-pack:center;
+  align-items:center;justify-content:center;cursor:pointer;padding:0;
+  box-shadow:0 4px 18px rgba(255,184,0,.45);-webkit-tap-highlight-color:transparent}
+.moments-top-btn.show{display:-webkit-box;display:-webkit-flex;display:flex}
+.moments-top-btn:active{-webkit-transform:scale(.94);transform:scale(.94)}
+.moments-top-btn i{color:#111;pointer-events:none}
+.moments-more{text-align:center;padding:14px;color:var(--muted);font-size:13px;font-weight:700}
+.feed-skel{padding:12px;display:flex;flex-direction:column;align-items:center}
+.feed-skel .skeleton{width:90%;height:0;padding-bottom:90%;border-radius:18px;margin-bottom:10px}
+.moments-grid{display:grid;grid-template-columns:repeat(3,1fr);padding:0 12px}
+.moments-grid > *{margin:0 4px 8px}
+/* Square via padding-bottom — aspect-ratio unsupported on iOS 12 */
+.moment-card{position:relative;border-radius:14px;overflow:hidden;background:var(--surface);cursor:pointer;width:100%;height:0;padding-bottom:100%}
+.moment-card img,.moment-card video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover}
+.moment-overlay{position:absolute;top:0;left:0;width:100%;height:100%;background:linear-gradient(180deg,rgba(0,0,0,.4) 0%,transparent 30%,transparent 55%,rgba(0,0,0,.72) 100%);pointer-events:none}
+.moment-top{position:absolute;top:6px;left:6px;right:6px;z-index:3;display:flex;align-items:center;
+  background:rgba(0,0,0,.55);border-radius:500px;padding:3px 8px 3px 3px;max-width:calc(100% - 12px)}
+.moment-top .avatar-wrap{margin-right:4px}
+.moment-top .mname{font-size:10px;font-weight:800;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1}
+.moment-top .mtime{font-size:9px;color:rgba(255,255,255,.65);margin-left:auto;flex-shrink:0}
+.moment-caption{position:absolute;bottom:10px;left:50%;-webkit-transform:translateX(-50%);transform:translateX(-50%);
+  z-index:3;background:rgba(0,0,0,.55);border-radius:500px;padding:7px 16px;font-size:12px;font-weight:700;color:#fff;
+  text-align:center;white-space:normal;word-break:break-word;line-height:1.35;max-width:92%;width:auto;
+  max-height:4.2em;overflow:hidden;display:inline-block;box-sizing:border-box}
+.moments-empty,.friends-empty{text-align:center;padding:50px 20px;color:var(--muted)}
+.moments-empty i,.friends-empty i{opacity:.5;margin-bottom:10px;display:inline-block}
+
+/* Mobile feed — iOS 12 safe (no aspect-ratio / no flex gap / no inset) */
+.moments-feed{display:none;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.moments-feed .feed-slide{
+  display:block;padding:10px 14px 16px;box-sizing:border-box;text-align:center}
+.moments-feed .feed-card{position:relative;display:inline-block;width:88%;max-width:340px;
+  height:0;padding-bottom:88%;border-radius:14px;overflow:hidden;background:#111;vertical-align:top}
+.moments-feed .feed-card img,.moments-feed .feed-card video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover}
+.moments-feed .feed-meta{width:88%;max-width:340px;margin:10px auto 0;padding:0;text-align:left}
+.moments-feed .feed-name{font-size:14px;font-weight:800;display:flex;align-items:center}
+.moments-feed .feed-name .avatar-wrap{margin-right:8px}
+.moments-feed .feed-card .moment-caption{bottom:10px}
+@media (max-width:520px){
+  .moments-grid{display:none}
+  .moments-feed{display:block}
+  .moments-head{padding:6px 12px}
+  .moments-head h2{font-size:17px}
+  #page-moments.active{
+    position:fixed;left:0;right:0;top:0;bottom:0;
+    max-width:520px;margin:0 auto;
+    padding-top:56px;padding-bottom:70px;
+    overflow-y:auto;-webkit-overflow-scrolling:touch;
+    z-index:40;background:#000;
+  }
+  #page-moments.active .moments-feed{display:block}
+  #page-moments.active .feed-card{
+    width:86%;
+    max-width:320px;
+    padding-bottom:86%;
+  }
+  .moments-top-btn{right:14px;bottom:78px;width:52px;height:52px}
+  #page-upload.active{padding-bottom:8px}
+  .preview-box{max-height:40vh}
+}
+
+/* Fullscreen viewer */
+.viewer{position:fixed;top:0;left:0;right:0;bottom:0;background:#000;z-index:150;display:none;flex-direction:column;align-items:center;justify-content:center}
+.viewer.open,.viewer:not(.hidden){display:flex}
+.viewer img,.viewer video{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;background:#000}
+.viewer-head{position:absolute;top:0;left:0;right:0;padding:24px 16px 30px;
+  z-index:2;background:linear-gradient(180deg,rgba(0,0,0,.7),transparent);display:flex;align-items:center}
+.viewer-close{margin-left:auto;width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.14);
+  border:none;color:#fff;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.viewer-caption{position:absolute;bottom:24px;left:16px;right:16px;z-index:2;
+  background:rgba(0,0,0,.6);border-radius:14px;padding:12px 16px;font-size:14px;font-weight:600;text-align:center;
+  white-space:normal;word-break:break-word;line-height:1.4;max-height:30vh;overflow-y:auto}
+
+@media (max-width:375px){
+  .moment-card,.moments-feed .feed-card{border-radius:10px;box-shadow:none}
+  .page.active{animation:none}
+  .skeleton{animation:none;background:#1a1a1a}
+}
+
+/* ---------- Friends ---------- */
+.friends-count{font-size:13px;color:var(--text2);font-weight:700;margin:2px 0 14px}
+.friends-count b{color:var(--accent)}
+.friend-row{display:flex;align-items:center;padding:12px 0;border-bottom:1px solid var(--border)}
+.friend-row:last-child{border-bottom:none}
+.friend-row .avatar-wrap{margin-right:14px}
+.friend-info{min-width:0;flex:1}
+.friend-name{font-weight:800;font-size:16.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.friend-user{font-size:13px;color:var(--text2);font-weight:600;margin-top:2px}
+.friend-streak{margin-left:auto;flex-shrink:0;font-size:13px;font-weight:800;color:var(--accent);display:flex;align-items:center}
+.friend-streak .bi{margin-left:3px}
+.contact-card{margin-top:14px}
+.contact-card .label-row{font-size:12px;font-weight:800;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px}
+.contact-links{display:block}
+.contact-link{display:flex;align-items:center;padding:12px 14px;border-radius:14px;background:rgba(255,255,255,.05);
+  border:1px solid var(--border);color:var(--text);text-decoration:none;font-weight:700;font-size:14px;margin-bottom:8px}
+.contact-link:active{background:rgba(255,255,255,.1)}
+.contact-link .bi{margin-right:12px;font-size:22px}
+.contact-link span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.contact-link .cl-handle{color:var(--text2);font-weight:600;font-size:12.5px;margin-left:auto}
+.switch-row{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-radius:14px;
+  background:var(--surface);border:1px solid var(--border);margin-bottom:12px}
+.switch-row .sw-text{font-size:13px;font-weight:700;line-height:1.35;padding-right:12px}
+.switch-row .sw-sub{font-size:11px;color:var(--text2);font-weight:600;margin-top:2px}
+.switch{position:relative;width:46px;height:28px;flex-shrink:0;display:inline-block}
+.switch input{position:absolute;opacity:0;width:46px;height:28px;margin:0;z-index:2;cursor:pointer}
+.switch .slider{position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(255,255,255,.18);border-radius:500px;cursor:pointer}
+.switch .slider:before{content:'';position:absolute;width:22px;height:22px;left:3px;top:3px;background:#fff;border-radius:50%;
+  -webkit-transition:-webkit-transform .2s;transition:transform .2s}
+.switch input:checked+.slider{background:var(--accent)}
+.switch input:checked+.slider:before{-webkit-transform:translateX(18px);transform:translateX(18px);background:#111}
+.queue-box{margin-top:12px;border-radius:14px;border:1px solid var(--border);background:var(--surface);overflow:hidden}
+.queue-box .qb-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border);
+  font-size:12px;font-weight:800;color:var(--text2);text-transform:uppercase;letter-spacing:.4px}
+.queue-item{display:flex;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border)}
+.queue-item:last-child{border-bottom:none}
+.queue-item img{width:44px;height:44px;border-radius:10px;object-fit:cover;background:#222;flex-shrink:0;margin-right:10px}
+.queue-item .qi-info{min-width:0;flex:1}
+.queue-item .qi-title{font-size:13px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.queue-item .qi-status{font-size:11px;font-weight:600;color:var(--text2);margin-top:2px}
+.queue-item .qi-status.pending{color:var(--accent)}
+.queue-item .qi-status.uploading{color:#4ea8ff}
+.queue-item .qi-status.error{color:#ff6b6b}
+.queue-item .qi-status.done{color:#3ddc84}
+.offline-banner{display:none;padding:10px 14px;margin-bottom:12px;border-radius:12px;
+  background:rgba(255,184,0,.12);border:1px solid rgba(255,184,0,.3);font-size:12.5px;font-weight:700;color:var(--accent)}
+.offline-banner.show{display:block}
+
+/* ---------- Avatar — no inset (iOS 12) ---------- */
+.avatar-wrap{position:relative;flex-shrink:0;overflow:visible}
+.avatar-ring{position:absolute;top:0;left:0;width:100%;height:100%}
+.avatar-img{position:absolute;border-radius:50%;overflow:hidden;background:var(--surface2)}
+.avatar-img img{width:100%;height:100%;object-fit:cover;display:block}
+.avatar-badge{position:absolute;bottom:-1px;right:-1px;pointer-events:none}
+.fm-contentPunch{-webkit-mask-image:radial-gradient(circle at 100% 100%,transparent 11px,black 12px);
+  mask-image:radial-gradient(circle at 100% 100%,transparent 11px,black 12px)}
+
+/* ---------- Upload ---------- */
+.preview-box{width:100%;height:0;padding-bottom:100%;background:var(--surface);border-radius:24px;overflow:hidden;
+  position:relative;border:2px dashed var(--border);cursor:pointer}
+.preview-box img,.preview-box video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover}
+.preview-hint{position:absolute;top:50%;left:0;right:0;-webkit-transform:translateY(-50%);transform:translateY(-50%);
+  text-align:center;color:var(--text2);font-weight:700;font-size:13px;padding:0 20px}
+.preview-hint i{opacity:.6;margin-bottom:10px;display:inline-block}
+#fileInput,#cameraInput{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0,0,0,0)}
+.upload-actions{display:flex;margin-top:10px}
+.upload-actions .btn-ghost{flex:1;font-size:13px;padding:10px;margin:0 4px}
+
+/* ---------- Live camera (in-page, giống Locket gốc) ---------- */
+.lc-frame{width:100%;height:0;padding-bottom:100%;position:relative;border-radius:24px;overflow:hidden;background:#0a0a0a;
+  -webkit-transform:translateZ(0);transform:translateZ(0)}
+.lc-frame video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;display:block;background:#0a0a0a}
+.lc-frame video.mirrored{-webkit-transform:scaleX(-1);transform:scaleX(-1)}
+.lc-hint{position:absolute;top:50%;left:0;right:0;-webkit-transform:translateY(-50%);transform:translateY(-50%);
+  text-align:center;color:var(--text2);font-weight:700;font-size:13px;padding:0 20px}
+.lc-hint .spinner{margin-bottom:8px}
+.lc-flash-btn{position:absolute;top:12px;left:12px;z-index:3;width:36px;height:36px;border-radius:50%;
+  background:rgba(0,0,0,.45);border:none;color:#fff;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;-webkit-appearance:none}
+.lc-flash-btn.on{color:var(--accent)}
+.lc-flash-btn.hidden{display:none}
+.lc-flash-overlay{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;z-index:4}
+.lc-flash-overlay.fire{opacity:.85;transition:opacity .12s ease-out}
+.lc-bar{display:flex;align-items:center;justify-content:center;gap:36px;padding:16px 10px 2px}
+.lc-side{width:46px;height:46px;border-radius:50%;background:var(--surface);border:1px solid var(--border);
+  color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;-webkit-appearance:none;flex-shrink:0}
+.lc-side.spacer{visibility:hidden;pointer-events:none}
+.lc-shutter{width:66px;height:66px;border-radius:50%;border:3px solid var(--accent);background:none;
+  padding:4px;cursor:pointer;-webkit-appearance:none;flex-shrink:0}
+.lc-shutter span{display:block;width:100%;height:100%;border-radius:50%;background:#fff}
+.lc-shutter:active{opacity:.8}
+.lc-shutter:disabled{opacity:.5}
+
+/* ---------- Crop stage ---------- */
+.crop-stage{
+  position:fixed !important;top:0;left:0;right:0;bottom:0;
+  width:100%;height:100%;
+  background:#000;z-index:9999;
+  display:none;flex-direction:column;
+}
+.crop-stage.open{display:-webkit-flex !important;display:flex !important}
+.crop-header{flex-shrink:0;padding:24px 16px 10px;display:flex;align-items:center;
+  justify-content:space-between;border-bottom:1px solid var(--border);background:#000}
+.crop-header span{font-weight:800;font-size:15px}
+.crop-header button{background:none;border:none;color:var(--accent);font-family:inherit;font-weight:800;font-size:15px;cursor:pointer;padding:8px 10px}
+.crop-header button.cancel{color:var(--text2)}
+.crop-area{flex:1;min-height:0;overflow:hidden;background:#000;position:relative}
+.crop-area img{display:block;max-width:100%}
+.cropper-container{max-height:100% !important}
+.cropper-view-box,.cropper-face{border-radius:0}
+.cropper-point{background:var(--accent);width:8px;height:8px}
+.cropper-line{background:var(--accent)}
+.crop-footer{flex-shrink:0;padding:12px 16px 20px;background:#000}
+.viewer{z-index:10000}
+
+/* ---------- Nav ---------- */
+.nav{position:fixed;bottom:0;left:0;right:0;max-width:640px;margin:0 auto;background:rgba(0,0,0,.92);
+  border-top:1px solid var(--border);
+  display:flex;justify-content:space-around;padding:8px 0 12px;z-index:60}
+.nav button{background:none;border:none;font-family:inherit;font-size:10.5px;font-weight:800;color:var(--muted);
+  display:flex;flex-direction:column;align-items:center;cursor:pointer;padding:4px 10px}
+.nav button svg{width:21px;height:21px;margin-bottom:4px}
+.nav button.active{color:var(--accent)}
+
+/* ---------- Toast / spinner ---------- */
+.toast{position:fixed;bottom:96px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--surface);
+  color:var(--text);padding:11px 20px;border-radius:500px;font-size:13px;font-weight:700;opacity:0;
+  transition:all .25s;z-index:300;white-space:nowrap;border:1px solid var(--border);max-width:88vw;
+  overflow:hidden;text-overflow:ellipsis}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.spinner{width:17px;height:17px;border:2.5px solid rgba(0,0,0,.25);border-top-color:rgba(0,0,0,.8);
+  border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:-3px}
+.spinner.light{border:2.5px solid rgba(255,255,255,.15);border-top-color:var(--accent)}
+@keyframes spin{to{transform:rotate(360deg)}}
+.skeleton{border-radius:16px;background:linear-gradient(90deg,#151515 25%,#1f1f1f 50%,#151515 75%);
+  background-size:200% 100%;animation:shimmer 1.3s infinite}
+@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+
+/* Progress pill — moments / friends load status */
+.progress-pill{
+  position:fixed;left:50%;bottom:78px;z-index:90;
+  -webkit-transform:translateX(-50%) translateY(12px);transform:translateX(-50%) translateY(12px);
+  background:rgba(20,20,20,.94);color:var(--text);border:1px solid rgba(255,184,0,.35);
+  border-radius:500px;padding:9px 16px 9px 12px;font-size:12.5px;font-weight:700;
+  display:none;-webkit-box-align:center;-webkit-box-pack:center;align-items:center;
+  box-shadow:0 4px 20px rgba(0,0,0,.45);max-width:92vw;white-space:nowrap;
+  opacity:0;transition:opacity .2s,-webkit-transform .2s,transform .2s;
+  pointer-events:none;
+}
+.progress-pill.show{display:-webkit-box;display:-webkit-flex;display:flex;opacity:1;
+  -webkit-transform:translateX(-50%) translateY(0);transform:translateX(-50%) translateY(0)}
+.progress-pill .pp-spin{width:14px;height:14px;border:2px solid rgba(255,184,0,.25);
+  border-top-color:var(--accent);border-radius:50%;-webkit-animation:spin .7s linear infinite;animation:spin .7s linear infinite;
+  margin-right:8px;flex-shrink:0}
+.progress-pill .pp-text{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.progress-pill .pp-bar{display:block;height:3px;background:rgba(255,255,255,.12);border-radius:2px;margin-top:6px;overflow:hidden}
+.progress-pill .pp-bar > i{display:block;height:100%;width:0%;background:var(--accent);border-radius:2px;
+  -webkit-transition:width .25s ease;transition:width .25s ease}
+@media (max-width:520px){
+  .progress-pill{bottom:76px;font-size:12px;padding:8px 14px 8px 10px}
+}
+
+/* Remember-me row */
+.remember-row{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;font-weight:700;color:var(--text2);cursor:pointer;user-select:none}
+.remember-row input{width:16px;height:16px;accent-color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <div class="brand"><img src="{{ favicon_url }}" alt=""> Locket Mini</div>
+    {% if logged_in %}<div class="pill" onclick="showPage('friends')" title="Bạn bè">
+      <i class="bi bi-people-fill" style="font-size:15px"></i>
+      <span id="friendCountPill">–</span>
+    </div>{% endif %}
+  </div>
+
+  {% if not logged_in %}
+  <div class="page active" id="page-login">
+    <div class="login-hero">
+      <img class="icon" src="{{ favicon_url }}" alt="">
+      <h1>Locket Mini</h1>
+      <p>Pics from your best friends,<br>straight from your login</p>
+    </div>
+    <div class="card">
+      <label class="label">Email</label>
+      <input class="input" id="loginEmail" type="email" placeholder="your@email.com" autocomplete="email" inputmode="email">
+      <label class="label" style="margin-top:12px">Password</label>
+      <input class="input" id="loginPass" type="password" placeholder="Password" autocomplete="current-password">
+      <label class="remember-row"><input type="checkbox" id="loginRemember" checked> Ghi nhớ đăng nhập</label>
+      <button class="btn" style="margin-top:16px" onclick="doLogin()" id="loginBtn">Log In</button>
+    </div>
+  </div>
+  {% else %}
+
+  <div class="page active" id="page-dash">
+    <div class="dash-head">
+      <div id="dashAvatar"></div>
+      <div class="dash-greet">
+        <p class="hi" id="greetLine">Xin chào</p>
+        <p class="name" id="dashName">{{ boot_name or '…' }}</p>
+      </div>
+    </div>
+    <div class="card streak-card">
+      <div style="display:flex;align-items:center;gap:10px">
+        <i class="bi bi-fire" style="font-size:28px;color:#FFB800"></i>
+        <div>
+          <div class="streak-num"><span id="streakNum">–</span></div>
+          <div class="streak-label">Locket Streak</div>
+        </div>
+      </div>
+    </div>
+    <div class="quick-row">
+      <button class="btn" onclick="showPage('upload')">Đăng khoảnh khắc</button>
+    </div>
+    <div class="quick-row" style="margin-top:8px">
+      <button class="btn btn-ghost" onclick="showPage('moments')">Xem Moments</button>
+      <button class="btn btn-ghost" onclick="showPage('friends')">Bạn bè</button>
+    </div>
+    <div class="card contact-card">
+      <div class="label-row">Liên hệ chủ web</div>
+      <div class="contact-links">
+        <a class="contact-link" href="https://www.threads.net/@anhztuan.1710" target="_blank" rel="noopener">
+          <i class="bi bi-threads" style="font-size:22px"></i>
+          <span>Threads</span>
+          <span class="cl-handle">@anhztuan.1710</span>
+        </a>
+        <a class="contact-link" href="https://www.instagram.com/anhztuan.1710" target="_blank" rel="noopener">
+          <i class="bi bi-instagram" style="font-size:22px"></i>
+          <span>Instagram</span>
+          <span class="cl-handle">@anhztuan.1710</span>
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <div class="page" id="page-upload">
+    <h2 style="margin:0 0 14px;font-size:20px;font-weight:800">Khoảnh khắc mới</h2>
+    <div class="offline-banner" id="offlineBanner">
+      <i class="bi bi-wifi-off" style="font-size:16px"></i>
+      Đang offline — ảnh sẽ lưu máy và tự đăng khi có mạng
+    </div>
+    <div class="switch-row">
+      <div>
+        <div class="sw-text">Camera trực tiếp</div>
+        <div class="sw-sub">Thay khung chọn ảnh bằng camera Locket gốc, chụp là xong</div>
+      </div>
+      <label class="switch"><input type="checkbox" id="liveCameraSwitch" onchange="toggleLiveCamera(this.checked)"><span class="slider"></span></label>
+    </div>
+    <div class="switch-row">
+      <div>
+        <div class="sw-text">Tự mở camera khi vào web</div>
+        <div class="sw-sub">Vào trang → tab Đăng → mở camera (iPhone hỗ trợ tốt)</div>
+      </div>
+      <label class="switch"><input type="checkbox" id="autoCameraSwitch" onchange="toggleAutoCamera(this.checked)"><span class="slider"></span></label>
+    </div>
+    <div class="preview-box" id="previewBox" onclick="openCapture()">
+      <div class="preview-hint" id="uploadPlaceholder">
+        <i class="bi bi-camera" style="font-size:40px"></i><br>
+        Chạm để chọn ảnh/video<br><span style="opacity:.7;font-size:11px">hoặc dán ảnh (Ctrl+V)</span>
+      </div>
+      <img id="previewImg" class="hidden" alt="preview">
+      <video id="previewVid" class="hidden" playsinline muted loop autoplay></video>
+    </div>
+    <div class="live-cam hidden" id="liveCam">
+      <div class="lc-frame">
+        <video id="lcVideo" playsinline muted autoplay></video>
+        <div class="lc-hint hidden" id="lcHint"><span class="spinner light"></span><br>Đang mở camera…</div>
+        <div class="lc-flash-overlay" id="lcFlashOverlay"></div>
+        <button type="button" class="lc-flash-btn hidden" id="lcFlashBtn" onclick="toggleTorch(event)" aria-label="Đèn flash"><i class="bi bi-lightning-charge-fill"></i></button>
+      </div>
+      <div class="lc-bar">
+        <div class="lc-side spacer"></div>
+        <button type="button" class="lc-shutter" id="lcShutterBtn" onclick="captureLivePhoto(event)" aria-label="Chụp"><span></span></button>
+        <button type="button" class="lc-side" onclick="flipLiveCamera(event)" aria-label="Đổi camera"><i class="bi bi-arrow-repeat"></i></button>
+      </div>
+    </div>
+    <div class="upload-actions hidden" id="uploadActions">
+      <button class="btn-ghost btn" onclick="openCapture()">Đổi ảnh</button>
+      <button class="btn-ghost btn" onclick="clearUpload()">Xoá</button>
+    </div>
+    <input type="file" id="fileInput" accept="image/*,video/*" onchange="onFilePick(event)">
+    <input type="file" id="cameraInput" accept="image/*" capture="environment" class="hidden" onchange="onFilePick(event)">
+    <label class="label" style="margin-top:14px">Chú thích</label>
+    <input class="input" id="caption" placeholder="Viết gì đó..." maxlength="200">
+    <button class="btn" style="margin-top:14px" onclick="doUpload()" id="uploadBtn">Gửi cho tất cả bạn bè</button>
+    <div class="queue-box hidden" id="queueBox">
+      <div class="qb-head"><span>Hàng đợi đăng</span><span id="queueCount">0</span></div>
+      <div id="queueList"></div>
+    </div>
+  </div>
+
+  <div class="page" id="page-moments">
+    <div class="moments-head"><h2>Moments</h2></div>
+    <div class="moments-grid" id="momentsGrid"></div>
+    <div class="moments-feed" id="momentsFeed"></div>
+    <div id="momentsMoreSentinel" style="height:1px"></div>
+    <div id="momentsMore" class="moments-more hidden">Đang tải thêm…</div>
+    <div class="moments-empty hidden" id="momentsEmpty">
+      <i class="bi bi-collection" style="font-size:44px"></i>
+      <div>Chưa có khoảnh khắc nào</div>
+    </div>
+  </div>
+  <button type="button" class="moments-top-btn" id="momentsTopBtn" onclick="scrollMomentsTop();return false;" ontouchend="scrollMomentsTop();return false;" title="Moments mới nhất" aria-label="Lên đầu">
+    <i class="bi bi-chevron-up" style="font-size:22px"></i>
+  </button>
+
+  <div class="page" id="page-friends">
+    <h2 style="margin:0 0 4px;font-size:20px;font-weight:800">Bạn bè</h2>
+    <div class="friends-count" id="friendsCountLine">Đang tải...</div>
+    <div id="friendsList"></div>
+    <div class="friends-empty hidden" id="friendsEmpty">
+      <i class="bi bi-people" style="font-size:44px"></i>
+      <div>Chưa có bạn bè</div>
+    </div>
+  </div>
+
+  <div class="nav">
+    <button class="active" onclick="showPage('dash')" id="nav-dash">
+      <i class="bi bi-house-door-fill" style="font-size:20px;margin-bottom:4px"></i>Trang chủ</button>
+    <button onclick="showPage('upload')" id="nav-upload">
+      <i class="bi bi-camera-fill" style="font-size:20px;margin-bottom:4px"></i>Đăng</button>
+    <button onclick="showPage('moments')" id="nav-moments">
+      <i class="bi bi-grid-3x3-gap-fill" style="font-size:20px;margin-bottom:4px"></i>Moments</button>
+    <button onclick="showPage('friends')" id="nav-friends">
+      <i class="bi bi-people-fill" style="font-size:20px;margin-bottom:4px"></i>Bạn bè</button>
+    <button onclick="doLogout()">
+      <i class="bi bi-box-arrow-right" style="font-size:20px;margin-bottom:4px"></i>Thoát</button>
+  </div>
+
+  <div class="crop-stage" id="cropStage">
+    <div class="crop-header">
+      <button class="cancel" onclick="cancelCrop()">Huỷ</button>
+      <span>Crop ảnh 1:1</span>
+      <button onclick="confirmCrop()">Xong</button>
+    </div>
+    <div class="crop-area"><img id="cropImg" alt=""></div>
+    <div class="crop-footer"><div style="text-align:center;color:var(--text2);font-size:12px">Kéo, phóng to/nhỏ để căn ảnh vuông</div></div>
+  </div>
+
+  <div class="viewer hidden" id="viewerStage"></div>
+
+  {% endif %}
+</div>
+<div class="toast" id="toast"></div>
+<div class="progress-pill" id="progressPill" aria-live="polite">
+  <span class="pp-spin"></span>
+  <div style="min-width:0;flex:1">
+    <div class="pp-text" id="progressPillText">Đang tải…</div>
+    <div class="pp-bar"><i id="progressPillBar"></i></div>
+  </div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const GOLD_BADGE="{{ gold_badge }}", CELEB_BADGE="{{ celeb_badge }}";
+const BOOT_NAME={{ (boot_name or '')|tojson }};
+const BOOT_PHOTO={{ (boot_photo or '')|tojson }};
+let croppedBlob=null, originalFile=null, isVideo=false, cropper=null;
+let friendsCache=null, momentsLoaded=false, meLoaded=false;
+let momentsCache=[], momentsUpdatedAt=0, momentsPollTimer=null;
+
+/* ---------- iPhone 6 friendly limits ---------- */
+var IS_PHONE = (typeof window !== 'undefined' && window.innerWidth <= 520);
+var IMG_CONCURRENCY = IS_PHONE ? 2 : 4;   // parallel image downloads
+var MOMENT_BATCH = IS_PHONE ? 2 : 8;      // DOM nodes per paint wave
+var PREFETCH_COUNT = IS_PHONE ? 4 : 10;   // eager Image() ahead of scroll
+var THUMB_W = IS_PHONE ? 360 : 480;       // feed thumb max side
+var FEED_THUMB_W = IS_PHONE ? 420 : 540;
+var AVATAR_W = 96;
+var LOCAL_MOMENTS_CAP = IS_PHONE ? 40 : 80;
+var LOCAL_FRIENDS_CAP = 200;
+var TINY_PIXEL = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+
+/* Image load queue — prevents Safari memory death on iPhone 6 */
+var _imgQ = [];
+var _imgActive = 0;
+var _imgDone = 0;
+var _imgTotal = 0;
+var _imgProgTimer = null;
+
+function toast(msg){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),2600)}
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML}
+
+function showProgress(text, done, total){
+  var pill = $('progressPill');
+  if(!pill) return;
+  var txt = $('progressPillText');
+  var bar = $('progressPillBar');
+  if(txt) txt.textContent = text || 'Đang tải…';
+  if(bar && total > 0){
+    var pct = Math.min(100, Math.round((done / total) * 100));
+    bar.style.width = pct + '%';
+  } else if(bar){
+    bar.style.width = '0%';
+  }
+  pill.classList.add('show');
+}
+function hideProgress(delay){
+  var pill = $('progressPill');
+  if(!pill) return;
+  clearTimeout(pill._hide);
+  pill._hide = setTimeout(function(){ pill.classList.remove('show'); }, delay == null ? 400 : delay);
+}
+function bumpImgProgress(){
+  _imgDone++;
+  if(_imgTotal <= 0) return;
+  showProgress('Đang tải ảnh ' + Math.min(_imgDone, _imgTotal) + '/' + _imgTotal, _imgDone, _imgTotal);
+  if(_imgDone >= _imgTotal && _imgActive === 0 && _imgQ.length === 0){
+    showProgress('Xong ' + _imgTotal + ' ảnh', _imgTotal, _imgTotal);
+    hideProgress(900);
+  }
+}
+function enqueueImg(imgEl, src){
+  if(!imgEl || !src) return;
+  // already has real src
+  if(imgEl.getAttribute('data-src-loaded') === src) return;
+  imgEl.setAttribute('data-src-pending', src);
+  _imgQ.push({el: imgEl, src: src});
+  _imgTotal++;
+  pumpImgQueue();
+}
+function pumpImgQueue(){
+  while(_imgActive < IMG_CONCURRENCY && _imgQ.length){
+    var job = _imgQ.shift();
+    if(!job || !job.el) continue;
+    // element may have been removed / recycled
+    if(!job.el.parentNode){ bumpImgProgress(); continue; }
+    _imgActive++;
+    (function(el, src){
+      var done = function(){
+        _imgActive = Math.max(0, _imgActive - 1);
+        bumpImgProgress();
+        pumpImgQueue();
+      };
+      var tmp = new Image();
+      tmp.onload = function(){
+        try{
+          el.src = src;
+          el.setAttribute('data-src-loaded', src);
+          el.removeAttribute('data-src-pending');
+        }catch(e){}
+        done();
+      };
+      tmp.onerror = function(){
+        try{ el.style.opacity = '0.3'; }catch(e){}
+        done();
+      };
+      tmp.src = src;
+    })(job.el, job.src);
+  }
+  if(_imgTotal > 0 && (_imgActive > 0 || _imgQ.length > 0)){
+    showProgress('Đang tải ảnh ' + Math.min(_imgDone, _imgTotal) + '/' + _imgTotal, _imgDone, _imgTotal);
+  }
+}
+function resetImgProgress(){
+  _imgQ = [];
+  _imgActive = 0;
+  _imgDone = 0;
+  _imgTotal = 0;
+}
+
+async function api(url,opts){
+  try{
+    const r=await fetch(url,opts);
+    return await r.json();
+  }catch(err){
+    console.error('api',url,err);
+    throw err;
+  }
+}
+
+{% if not logged_in %}
+/* ===================== Login ===================== */
+function doLogin(){
+  const e=$('loginEmail').value.trim(),p=$('loginPass').value,btn=$('loginBtn');
+  const remember=!!$('loginRemember')&&$('loginRemember').checked;
+  if(!e||!p){toast('Nhập email và mật khẩu');return}
+  btn.innerHTML='<span class="spinner"></span>';btn.disabled=true;
+  api('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e,password:p,remember:remember})})
+  .then(d=>{
+    btn.innerHTML='Log In';btn.disabled=false;
+    if(d.ok){location.reload()}else{toast(d.error||'Đăng nhập thất bại')}
+  }).catch(()=>{btn.innerHTML='Log In';btn.disabled=false;toast('Lỗi mạng')})
+}
+{% else %}
+/* ===================== Nav / paging ===================== */
+function showPage(name){
+  ['dash','upload','moments','friends'].forEach(p=>{
+    $(`page-${p}`).classList.remove('active');
+    const nb=$(`nav-${p}`); if(nb)nb.classList.remove('active');
+  });
+  $(`page-${name}`).classList.add('active');
+  const nb=$(`nav-${name}`); if(nb)nb.classList.add('active');
+  const topBtn=$('momentsTopBtn');
+  if(topBtn) topBtn.classList.toggle('show', name==='moments');
+  if(name==='dash'&&!meLoaded) loadMe();
+  if(name==='moments'){
+    // Always start at top — previous scrollTop causes auto-load of entire feed
+    _momentsBootLock = true;
+    scrollMomentsTop();
+    loadMoments();
+    startMomentsPoll();
+    // release lock after first paint settles (prevents near-bottom cascade)
+    setTimeout(function(){ _momentsBootLock = false; scrollMomentsTop(); }, 220);
+  } else {
+    stopMomentsPoll();
+    if(name !== 'friends') hideProgress(0);
+  }
+  if(name==='friends') loadFriends();
+  if(name==='upload'){
+    if(isLiveCamera() && !croppedBlob){
+      $('previewBox').classList.add('hidden');
+      $('uploadPlaceholder').classList.add('hidden');
+      $('liveCam').classList.remove('hidden');
+      startLiveCamera();
+    }
+  } else {
+    stopLiveCamera();
+  }
+}
+
+/* ===================== Avatar (ring + notch badge) ===================== */
+function getInitials(name){
+  if(!name)return'?';
+  return name.trim().split(/\\s+/).map(s=>s[0]).join('').toUpperCase().slice(0,2);
+}
+function stringToHsl(str,s,l){
+  let hash=0;
+  for(let i=0;i<str.length;i++)hash=str.charCodeAt(i)+((hash<<5)-hash);
+  return `hsl(${Math.abs(hash%360)},${s}%,${l}%)`;
+}
+function renderAvatar(u,size=52){
+  u=u||{};
+  const uid=(u.uid||u.username||Math.random().toString(36).slice(2)).toString().replace(/[^a-zA-Z0-9]/g,'');
+  const hasGold=(u.badge==='locket_gold'||u.badge==='Locket Gold');
+  const isCeleb=!!u.celebrity;
+  const showBadge=hasGold||isCeleb;
+  const ring=showBadge?'#FFB800':'rgba(255,255,255,.18)';
+  const badgeSrc=hasGold?GOLD_BADGE:CELEB_BADGE;
+  const inset=Math.max(2,Math.round(size*0.06));
+  const r=size/2;
+  const initials=getInitials(u.first_name||u.username||'?');
+  const bg=stringToHsl(uid||initials,60,42);
+  const pic=mediaSrc(u.profile_picture_url||'', 128);
+
+  let inner;
+  if(pic){
+    inner=`<img src="${esc(pic)}" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">
+      <div style="display:none;width:100%;height:100%;line-height:${size-inset*2}px;text-align:center;background:${bg};color:#fff;font-weight:800;font-size:${Math.round(size*0.38)}px">${esc(initials)}</div>`;
+  }else{
+    inner=`<div style="width:100%;height:100%;line-height:${size-inset*2}px;text-align:center;background:${bg};color:#fff;font-weight:800;font-size:${Math.round(size*0.38)}px">${esc(initials)}</div>`;
+  }
+
+  return `<div class="avatar-wrap" style="width:${size}px;height:${size}px">
+    <svg class="avatar-ring" viewBox="0 0 ${size} ${size}">
+      <defs><mask id="m-${uid}-${size}">
+        <rect width="${size}" height="${size}" fill="white"/>
+        <circle cx="${size/2}" cy="${size/2}" r="${r-inset-2}" fill="black"/>
+        ${showBadge?`<circle cx="${size*0.82}" cy="${size*0.82}" r="${size*0.16}" fill="black"/>`:''}
+      </mask></defs>
+      <circle cx="${size/2}" cy="${size/2}" r="${r-inset}" fill="${ring}" mask="url(#m-${uid}-${size})"/>
+    </svg>
+    <div class="avatar-img ${showBadge?'fm-contentPunch':''}" style="top:${inset}px;left:${inset}px;right:${inset}px;bottom:${inset}px">${inner}</div>
+    ${showBadge?`<img class="avatar-badge" src="${badgeSrc}" style="width:${size*0.34}px;height:${size*0.34}px" alt="">`:''}
+  </div>`;
+}
+
+/* ===================== Dash ===================== */
+function greetingLine(){
+  const h=new Date().getHours();
+  if(h<11)return'Chào buổi sáng';
+  if(h<14)return'Chào buổi trưa';
+  if(h<18)return'Chào buổi chiều';
+  return'Chào buổi tối';
+}
+function loadMe(){
+  $('greetLine').textContent=greetingLine();
+  // Paint immediately from session bootstrap (login already returned displayName + photo)
+  if(BOOT_NAME) $('dashName').textContent=BOOT_NAME;
+  if(BOOT_PHOTO||BOOT_NAME){
+    $('dashAvatar').innerHTML=renderAvatar({first_name:BOOT_NAME,profile_picture_url:mediaSrc(BOOT_PHOTO,128)},56);
+  }else{
+    $('dashAvatar').innerHTML=renderAvatar({},56);
+  }
+  api('/api/me').then(d=>{
+    if(!d.ok){toast(d.error||'Không tải được thông tin');return}
+    meLoaded=true;
+    const me=d.me||{};
+    const fullName=((me.first_name||'')+' '+(me.last_name||'')).trim()||me.username||BOOT_NAME||'Bạn';
+    $('dashName').textContent=fullName;
+    $('dashAvatar').innerHTML=renderAvatar(me,56);
+    $('streakNum').textContent=(me.streak!=null&&me.streak!=='')?me.streak:'–';
+  }).catch(()=>toast('Lỗi mạng khi tải trang chủ'));
+}
+
+/* ===================== Friends (progressive render) ===================== */
+const FRIENDS_CACHE_KEY='locket_friends_cache_v1';
+const FRIENDS_TTL_MS=6*60*60*1000; // 6 hours — avoid re-fetch every visit
+const MOMENTS_LS_KEY='locket_moments_cache_v1';
+const MOMENTS_TTL_MS=6*60*60*1000; // 6 hours
+let friendsFetchedAt=0;
+/* friends progressive render — smaller batches on weak devices */
+const FRIENDS_BATCH = IS_PHONE ? 8 : 16;
+
+function readFriendsLocal(){
+  try{
+    const raw=localStorage.getItem(FRIENDS_CACHE_KEY);
+    if(!raw) return null;
+    const obj=JSON.parse(raw);
+    if(!obj||!Array.isArray(obj.friends)) return null;
+    return obj;
+  }catch(e){return null}
+}
+function writeFriendsLocal(friends,count){
+  try{
+    localStorage.setItem(FRIENDS_CACHE_KEY, JSON.stringify({friends,count,ts:Date.now()}));
+  }catch(e){}
+}
+function paintFriends(friends,count){
+  friendsCache=friends||[];
+  const list=$('friendsList');
+  if($('friendCountPill')) $('friendCountPill').textContent=count!=null?count:friendsCache.length;
+  if($('friendsCountLine')) $('friendsCountLine').innerHTML=`Tổng cộng <b>${count!=null?count:friendsCache.length}</b> bạn bè`;
+  if(!list) return;
+  list.innerHTML='';
+  if(!friendsCache.length){$('friendsEmpty').classList.remove('hidden');return}
+  $('friendsEmpty').classList.add('hidden');
+  if(friendsCache.length > 30){
+    showProgress('Đang hiện bạn bè 0/' + friendsCache.length, 0, friendsCache.length);
+  }
+  renderFriendBatch(list,friendsCache,0,FRIENDS_BATCH);
+}
+function loadFriends(force){
+  const list=$('friendsList');
+  const local=readFriendsLocal();
+  const fresh=local && (Date.now()-(local.ts||0)<FRIENDS_TTL_MS);
+  // Instant paint from local cache
+  if(local && local.friends && local.friends.length){
+    paintFriends(local.friends, local.count);
+    friendsFetchedAt=local.ts||0;
+    if(!force && fresh) return; // still warm — skip network
+  }else if(list){
+    $('friendsCountLine').textContent='Đang tải...';
+    $('friendsEmpty').classList.add('hidden');
+    list.innerHTML=Array(5).fill('<div class="skeleton" style="height:68px;margin-bottom:10px"></div>').join('');
+  }
+  api('/api/friends').then(d=>{
+    if(!d.ok){
+      if(!friendsCache||!friendsCache.length){
+        toast(d.error||'Không tải được bạn bè');
+        if(list) list.innerHTML='';
+        $('friendsEmpty').classList.remove('hidden');
+        $('friendsCountLine').textContent='';
+      }
+      return;
+    }
+    const friends=d.friends||[];
+    const count=d.count!=null?d.count:friends.length;
+    // Smart skip re-paint if same size and not forced
+    const same=friendsCache && friendsCache.length===friends.length && !force;
+    writeFriendsLocal(friends, count);
+    friendsFetchedAt=Date.now();
+    if(!same) paintFriends(friends, count);
+    else {
+      friendsCache=friends;
+      if($('friendCountPill')) $('friendCountPill').textContent=count;
+    }
+  }).catch(()=>{
+    if(!friendsCache||!friendsCache.length){
+      toast('Lỗi mạng khi tải bạn bè');
+      if(list) list.innerHTML='';
+      $('friendsCountLine').textContent='';
+    }
+  });
+}
+function preloadFriends(){
+  // Background warm on app open — never blocks UI
+  const local=readFriendsLocal();
+  if(local && local.friends){
+    friendsCache=local.friends;
+    if($('friendCountPill')) $('friendCountPill').textContent=local.count!=null?local.count:local.friends.length;
+  }
+  const need=!(local && (Date.now()-(local.ts||0)<FRIENDS_TTL_MS));
+  if(need) loadFriends(false);
+}
+function renderFriendBatch(container,friends,start,batch){
+  const end=Math.min(start+batch,friends.length);
+  var frag=document.createDocumentFragment();
+  for(let i=start;i<end;i++){
+    const u=friends[i];
+    const row=document.createElement('div');
+    row.className='friend-row';
+    const streak=(u.streak&&u.streak>0)?`<div class="friend-streak">${u.streak}<i class="bi bi-fire" style="margin-left:3px;color:#FFB800;font-size:14px"></i></div>`:'';
+    row.innerHTML=`${renderAvatar(u,60)}<div class="friend-info"><div class="friend-name">${esc(u.first_name||'')} ${esc(u.last_name||'')}</div><div class="friend-user">@${esc(u.username||u.uid||'')}</div></div>${streak}`;
+    frag.appendChild(row);
+  }
+  container.appendChild(frag);
+  if(friends.length > 30){
+    showProgress('Đang hiện bạn bè ' + end + '/' + friends.length, end, friends.length);
+  }
+  if(end<friends.length){
+    // yield to keep scroll responsive on iPhone 6
+    setTimeout(function(){ renderFriendBatch(container,friends,end,batch); }, IS_PHONE ? 32 : 16);
+  } else {
+    hideProgress(600);
+  }
+}
+
+/* ===================== Moments (cache + live poll + mobile feed) ===================== */
+function normalizeMediaUrl(u){
+  if(!u)return'';
+  return String(u).replace('firebasestorage.googleapis.com:443','firebasestorage.googleapis.com');
+}
+/* Proxy remote images as JPEG — iOS 12 cannot decode WebP.
+   w = max side in px: 360 avatar, 480 feed thumb (fast), 1080 viewer */
+function mediaSrc(u, w){
+  u=normalizeMediaUrl(u);
+  if(!u)return'';
+  if(u.indexOf('/api/img')===0||u.indexOf('blob:')===0||u.indexOf('data:')===0)return u;
+  var q='/api/img?u='+encodeURIComponent(u);
+  if(w) q+='&w='+w;
+  return q;
+}
+function isPhone(){return window.innerWidth<=520 || IS_PHONE}
+function extractCaption(m){
+  if(m.caption)return m.caption;
+  if(m.overlays&&m.overlays.length){
+    const cap=m.overlays.find(o=>o.overlay_id==='caption:standard')
+      || m.overlays.find(o=>o.overlay_type==='caption'||(o.overlay_id&&String(o.overlay_id).startsWith('caption:')));
+    if(cap)return(cap.data&&cap.data.text)||cap.alt_text||'';
+  }
+  return'';
+}
+function timeAgo(seconds){
+  if(!seconds)return'';
+  const diff=Math.max(0,Math.floor(Date.now()/1000-seconds));
+  if(diff<60)return'vừa xong';
+  if(diff<3600)return Math.floor(diff/60)+' phút';
+  if(diff<86400)return Math.floor(diff/3600)+' giờ';
+  return Math.floor(diff/86400)+' ngày';
+}
+function momentProf(m,friendMap){
+  const uidRaw=(typeof m.user==='string')?m.user:((m.user||{}).uid||m.user_id||'');
+  const prof=friendMap[uidRaw]||{};
+  return {
+    uid:uidRaw,
+    first_name:m.first_name||prof.first_name||'',
+    last_name:m.last_name||prof.last_name||'',
+    username:prof.username||'',
+    profile_picture_url:mediaSrc(m.profile_picture_url||prof.profile_picture_url||'', 128),
+    celebrity:!!(m.from_celebrity||prof.celebrity),
+    badge:prof.badge||'',
+  };
+}
+let momentsRendered=0;
+var _momentsBootLock = false; // true while opening tab — block scroll-triggered append
+function momentsBatchSize(){ return MOMENT_BATCH; }
+
+function buildMomentCard(m, idx, friendMap, eager){
+  const displayProf=momentProf(m,friendMap);
+  const imgUrl=mediaSrc(m.thumbnail_url||m.url||'', THUMB_W);
+  const cap=extractCaption(m);
+  const t=(m.date&&m.date._seconds)||m.timestamp||m.created_at||0;
+  const fullName=((displayProf.first_name||'')+' '+(displayProf.last_name||'')).trim()||displayProf.username||'?';
+  const card=document.createElement('div');
+  card.className='moment-card';
+  card.setAttribute('data-idx', String(idx));
+  card.onclick=function(){ openViewer(idx); };
+  // placeholder first — real src goes through concurrency queue
+  card.innerHTML=
+    '<img src="'+TINY_PIXEL+'" data-real="'+esc(imgUrl)+'" alt="" style="background:#1a1a1a">'+
+    '<div class="moment-overlay"></div>'+
+    '<div class="moment-top">'+renderAvatar(displayProf,20)+'<span class="mname">'+esc(fullName)+'</span><span class="mtime" data-ts="'+t+'">'+timeAgo(t)+'</span></div>'+
+    (cap?'<div class="moment-caption">'+esc(cap)+'</div>':'');
+  var imgEl = card.querySelector('img');
+  if(imgEl && imgUrl){
+    if(eager) enqueueImg(imgEl, imgUrl);
+    else imgEl.setAttribute('data-lazy', imgUrl);
+  }
+  return card;
+}
+function buildFeedSlide(m, idx, friendMap, eager){
+  const displayProf=momentProf(m,friendMap);
+  const imgUrl=mediaSrc(m.thumbnail_url||m.url||'', FEED_THUMB_W);
+  const cap=extractCaption(m);
+  const t=(m.date&&m.date._seconds)||m.timestamp||m.created_at||0;
+  const name=((displayProf.first_name||'')+' '+(displayProf.last_name||'')).trim()||displayProf.username||'?';
+  const slide=document.createElement('div');
+  slide.className='feed-slide';
+  slide.setAttribute('data-idx', String(idx));
+  slide.innerHTML=
+    '<div class="feed-card" onclick="openViewer('+idx+')">'+
+      '<img src="'+TINY_PIXEL+'" data-real="'+esc(imgUrl)+'" alt="" style="background:#1a1a1a">'+
+      '<div class="moment-overlay"></div>'+
+      (cap?'<div class="moment-caption">'+esc(cap)+'</div>':'')+
+    '</div>'+
+    '<div class="feed-meta">'+
+      '<div class="feed-name">'+renderAvatar(displayProf,28)+'<span>'+esc(name)+'</span><span class="mtime" data-ts="'+t+'" style="margin-left:auto;color:var(--muted);font-size:12px;font-weight:700">'+timeAgo(t)+'</span></div>'+
+    '</div>';
+  var imgEl = slide.querySelector('img');
+  if(imgEl && imgUrl){
+    if(eager) enqueueImg(imgEl, imgUrl);
+    else imgEl.setAttribute('data-lazy', imgUrl);
+  }
+  return slide;
+}
+function appendMomentsBatch(){
+  const items=window._momentItems||[];
+  if(momentsRendered>=items.length){
+    const more=$('momentsMore'); if(more) more.classList.add('hidden');
+    if(items.length){
+      showProgress('Moments ' + items.length + '/' + items.length, items.length, items.length);
+      hideProgress(800);
+    }
+    return;
+  }
+  const friendMap={};
+  if(friendsCache)friendsCache.forEach(function(f){ friendMap[f.uid]=f; });
+  const grid=$('momentsGrid'), feed=$('momentsFeed');
+  const batch=momentsBatchSize();
+  const end=Math.min(momentsRendered+batch, items.length);
+  var fragG = grid ? document.createDocumentFragment() : null;
+  var fragF = feed ? document.createDocumentFragment() : null;
+  for(let idx=momentsRendered; idx<end; idx++){
+    // first few: eager so newest shows immediately
+    const eager = idx < (IS_PHONE ? 2 : 4);
+    if(fragG) fragG.appendChild(buildMomentCard(items[idx], idx, friendMap, eager));
+    if(fragF) fragF.appendChild(buildFeedSlide(items[idx], idx, friendMap, eager));
+  }
+  if(grid && fragG) grid.appendChild(fragG);
+  if(feed && fragF) feed.appendChild(fragF);
+  momentsRendered=end;
+  showProgress('Moments ' + momentsRendered + '/' + items.length, momentsRendered, items.length);
+  const more=$('momentsMore');
+  if(more) more.classList.toggle('hidden', momentsRendered>=items.length);
+  // kick lazy load for newly painted nodes near viewport
+  scheduleLazyLoad();
+}
+function renderMomentsUI(items, reset){
+  const grid=$('momentsGrid'), feed=$('momentsFeed');
+  window._momentItems=items;
+  if(reset!==false){
+    if(grid) grid.innerHTML='';
+    if(feed) feed.innerHTML='';
+    momentsRendered=0;
+    resetImgProgress();
+    // Force top — clearing content must not keep old scroll position
+    _momentsBootLock = true;
+    try{
+      var page=$('page-moments');
+      if(page) page.scrollTop = 0;
+      if(feed) feed.scrollTop = 0;
+    }catch(e){}
+  }
+  if(!items.length){$('momentsEmpty').classList.remove('hidden'); hideProgress(0); return}
+  $('momentsEmpty').classList.add('hidden');
+  showProgress('Moments 0/' + items.length, 0, items.length);
+  // Paint ONLY the first batch on open — more loads when user scrolls
+  appendMomentsBatch();
+  bindMomentsScroll();
+  startRelativeTimeTicker();
+  // One small follow-up batch for smoother first screen (still at top)
+  if(momentsRendered<items.length){
+    setTimeout(function(){
+      appendMomentsBatch();
+      scrollMomentsTop();
+      setTimeout(function(){ _momentsBootLock = false; }, 180);
+    }, IS_PHONE ? 100 : 50);
+  } else {
+    hideProgress(700);
+    setTimeout(function(){ _momentsBootLock = false; }, 180);
+  }
+}
+
+/* Lazy-load images only when near viewport; unload far ones to free RAM */
+function scheduleLazyLoad(){
+  if(window._lazyT) return;
+  window._lazyT = setTimeout(function(){
+    window._lazyT = null;
+    runLazyLoad();
+  }, 60);
+}
+function runLazyLoad(){
+  var root = momentsScrollEl() || document;
+  var viewH = (root === document || root === window) ? window.innerHeight : root.clientHeight;
+  var scrollTop = (root === document || root === window) ? (window.pageYOffset || document.documentElement.scrollTop) : root.scrollTop;
+  var margin = viewH * 1.5;
+  var nodes = document.querySelectorAll('#momentsGrid img[data-lazy], #momentsFeed img[data-lazy], #momentsGrid img[data-src-loaded], #momentsFeed img[data-src-loaded]');
+  for(var i=0; i<nodes.length; i++){
+    var img = nodes[i];
+    var card = img.closest ? (img.closest('.moment-card') || img.closest('.feed-slide')) : img.parentNode;
+    if(!card) continue;
+    var rect = card.getBoundingClientRect ? card.getBoundingClientRect() : {top:0,bottom:0};
+    // relative to viewport is fine even inside fixed page
+    var near = rect.bottom > -margin && rect.top < viewH + margin;
+    var lazy = img.getAttribute('data-lazy');
+    var loaded = img.getAttribute('data-src-loaded');
+    if(near){
+      if(lazy && !loaded){
+        img.removeAttribute('data-lazy');
+        enqueueImg(img, lazy);
+      }
+    } else if(loaded && IS_PHONE){
+      // unload far images on weak devices (LinkedIn technique)
+      img.src = TINY_PIXEL;
+      img.setAttribute('data-lazy', loaded);
+      img.removeAttribute('data-src-loaded');
+    }
+  }
+}
+function momentsScrollEl(){
+  // On phone the fixed #page-moments is the scroller; elsewhere feed or window
+  const page=$('page-moments');
+  if(page && page.classList.contains('active') && isPhone()) return page;
+  const feed=$('momentsFeed');
+  if(feed && feed.scrollHeight>feed.clientHeight+20) return feed;
+  return null;
+}
+function bindMomentsScroll(){
+  // scroll listeners here only drive lazy-load of images near the viewport — kept
+  // per-container since that math only needs "is this near visible", not "at the end".
+  const page=$('page-moments');
+  if(page && !page._boundScroll){
+    page._boundScroll=true;
+    page.addEventListener('scroll',function(){
+      if(!page.classList.contains('active'))return;
+      scheduleLazyLoad();
+    },false);
+  }
+  const feed=$('momentsFeed');
+  if(feed && !feed._boundScroll){
+    feed._boundScroll=true;
+    feed.addEventListener('scroll',function(){ scheduleLazyLoad(); },false);
+  }
+  if(!window._momentsWinScroll){
+    window._momentsWinScroll=true;
+    window.addEventListener('scroll',function(){
+      const p=$('page-moments');
+      if(!p||!p.classList.contains('active'))return;
+      scheduleLazyLoad();
+    },false);
+  }
+  // "Load more" trigger: one IntersectionObserver watching a 1px sentinel right above
+  // the "Đang tải thêm…" label. IntersectionObserver measures against the real browser
+  // viewport regardless of *which* ancestor actually scrolls (window on desktop/tablet,
+  // the fixed full-screen #page-moments on phone), so this works everywhere without the
+  // scrollHeight/clientHeight/scrollTop bookkeeping above ever getting out of sync —
+  // that per-container math was the reason "more" could get stuck forever on non-phone
+  // layouts where window, not #page-moments, is the actual scroller.
+  const sentinel=$('momentsMoreSentinel');
+  if(sentinel && !window._momentsMoreObserver){
+    const tryLoadMore=function(){
+      if(_momentsBootLock) return;
+      const items=window._momentItems||[];
+      if(momentsRendered>=items.length) return;
+      appendMomentsBatch();
+    };
+    if(window.IntersectionObserver){
+      window._momentsMoreObserver=new IntersectionObserver(function(entries){
+        if(entries.some(function(e){return e.isIntersecting})) tryLoadMore();
+      },{root:null, rootMargin:'600px 0px', threshold:0});
+      window._momentsMoreObserver.observe(sentinel);
+    } else {
+      // Very old browsers without IntersectionObserver (pre-iOS 12.2 Safari): fall back
+      // to a plain rect check driven off the same scroll listeners already bound above.
+      window._momentsMoreObserver = true; // marker so we don't bind this twice
+      const rectCheck=function(){
+        const r=sentinel.getBoundingClientRect();
+        if(r.top < (window.innerHeight || 800) + 600) tryLoadMore();
+      };
+      if(page) page.addEventListener('scroll', rectCheck, false);
+      if(feed) feed.addEventListener('scroll', rectCheck, false);
+      window.addEventListener('scroll', rectCheck, false);
+    }
+  }
+}
+function scrollMomentsTop(){
+  // iOS 12 does not support scrollTo({behavior:'smooth'}) — use scrollTop=0
+  function jump(el){
+    if(!el) return;
+    try{ el.scrollTop=0; }catch(e){}
+    try{ if(el.scrollTo) el.scrollTo(0,0); }catch(e){}
+  }
+  jump(momentsScrollEl());
+  jump($('page-moments'));
+  jump($('momentsFeed'));
+  jump(document.documentElement);
+  jump(document.body);
+  try{ window.scrollTo(0,0); }catch(e){}
+}
+let _timeTicker=null;
+function startRelativeTimeTicker(){
+  if(_timeTicker)return;
+  _timeTicker=setInterval(()=>{
+    document.querySelectorAll('.mtime[data-ts]').forEach(el=>{
+      const ts=Number(el.getAttribute('data-ts'));
+      if(ts) el.textContent=timeAgo(ts);
+    });
+  },30000);
+}
+function readMomentsLocal(){
+  try{
+    const raw=localStorage.getItem(MOMENTS_LS_KEY);
+    if(!raw) return null;
+    const obj=JSON.parse(raw);
+    if(!obj||!Array.isArray(obj.moments)) return null;
+    return obj;
+  }catch(e){return null}
+}
+function writeMomentsLocal(moments, updatedAt){
+  try{
+    // store lean copy — cap size hard on weak devices
+    const lean=(moments||[]).slice(0, LOCAL_MOMENTS_CAP).map(function(m){
+      return {
+        user:m.user, user_id:m.user_id, thumbnail_url:m.thumbnail_url, url:m.url, video_url:m.video_url,
+        date:m.date, timestamp:m.timestamp, created_at:m.created_at, caption:m.caption, overlays:m.overlays,
+        first_name:m.first_name, last_name:m.last_name, profile_picture_url:m.profile_picture_url,
+        from_celebrity:m.from_celebrity
+      };
+    });
+    localStorage.setItem(MOMENTS_LS_KEY, JSON.stringify({moments:lean, updated_at:updatedAt||(Date.now()/1000), ts:Date.now()}));
+  }catch(e){ console.warn('moments local cache full', e); }
+}
+function prefetchMomentImages(items, count){
+  // Soft prefetch only a few URLs into the concurrency queue — never flood
+  if(!items||!items.length) return;
+  var n = Math.min(count || PREFETCH_COUNT, items.length, PREFETCH_COUNT);
+  for(var i=0;i<n;i++){
+    var m = items[i];
+    var u = mediaSrc(m.thumbnail_url||m.url||'', FEED_THUMB_W);
+    if(!u) continue;
+    // warm browser HTTP cache without attaching to DOM
+    var tmp = new Image();
+    tmp.src = u;
+  }
+}
+function loadMoments(force){
+  var local=readMomentsLocal();
+  var warm=local && (Date.now()-(local.ts||0)<MOMENTS_TTL_MS) && local.moments && local.moments.length;
+  if(!force && momentsCache.length){
+    renderMomentsUI(momentsCache);
+    if(Date.now()/1000 - momentsUpdatedAt < 300) return; // 5 min server soft
+  }else if(!force && warm){
+    momentsCache=local.moments;
+    momentsUpdatedAt=local.updated_at||(local.ts/1000);
+    momentsLoaded=true;
+    renderMomentsUI(momentsCache);
+    prefetchMomentImages(momentsCache, PREFETCH_COUNT);
+    // silent background refresh
+    api('/api/moments').then(function(d){
+      if(!d.ok) return;
+      var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
+      momentsCache=items;
+      momentsUpdatedAt=d.updated_at||(Date.now()/1000);
+      writeMomentsLocal(items, momentsUpdatedAt);
+      if($('page-moments')&&$('page-moments').classList.contains('active')) renderMomentsUI(items);
+      prefetchMomentImages(items, PREFETCH_COUNT);
+    }).catch(function(){});
+    return;
+  }else if(!momentsCache.length){
+    $('momentsEmpty').classList.add('hidden');
+    showProgress('Đang tải Moments…', 0, 1);
+    const grid=$('momentsGrid'), feed=$('momentsFeed');
+    if(grid) grid.innerHTML=Array(IS_PHONE?3:6).fill('<div class="skeleton" style="width:100%;height:0;padding-bottom:100%;border-radius:14px"></div>').join('');
+    if(feed) feed.innerHTML='<div class="feed-skel"><div class="skeleton"></div><div class="skeleton" style="height:18px;width:60%;border-radius:8px;padding-bottom:0"></div></div>';
+  }
+  const q=force?'?force=1':'';
+  api('/api/moments'+q).then(function(d){
+    if(!d.ok){
+      if(!momentsCache.length){
+        toast(d.error||'Không tải được moments');
+        $('momentsGrid').innerHTML='';
+        $('momentsEmpty').classList.remove('hidden');
+        hideProgress(0);
+      }
+      return;
+    }
+    const items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
+    momentsCache=items;
+    momentsUpdatedAt=d.updated_at||(Date.now()/1000);
+    momentsLoaded=true;
+    writeMomentsLocal(items, momentsUpdatedAt);
+    renderMomentsUI(items);
+    prefetchMomentImages(items, PREFETCH_COUNT);
+  }).catch(function(){
+    if(!momentsCache.length){
+      toast('Lỗi mạng khi tải moments');
+      $('momentsGrid').innerHTML='';
+      $('momentsEmpty').classList.remove('hidden');
+      hideProgress(0);
+    }
+  });
+}
+function preloadMoments(){
+  var local=readMomentsLocal();
+  if(local && local.moments && local.moments.length){
+    momentsCache=local.moments;
+    momentsUpdatedAt=local.updated_at||(local.ts/1000)||0;
+    momentsLoaded=true;
+    prefetchMomentImages(local.moments, PREFETCH_COUNT);
+  }
+  var need=!(local && (Date.now()-(local.ts||0)<MOMENTS_TTL_MS));
+  if(need || !local){
+    api('/api/moments').then(function(d){
+      if(!d.ok) return;
+      var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
+      momentsCache=items;
+      momentsUpdatedAt=d.updated_at||(Date.now()/1000);
+      momentsLoaded=true;
+      writeMomentsLocal(items, momentsUpdatedAt);
+      prefetchMomentImages(items, PREFETCH_COUNT);
+    }).catch(function(){});
+  }else{
+    // warm: silent refresh after UI settles
+    setTimeout(function(){
+      api('/api/moments').then(function(d){
+        if(!d.ok) return;
+        var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
+        momentsCache=items;
+        momentsUpdatedAt=d.updated_at||(Date.now()/1000);
+        writeMomentsLocal(items, momentsUpdatedAt);
+        prefetchMomentImages(items, PREFETCH_COUNT);
+      }).catch(function(){});
+    }, 3500);
+  }
+}
+function startMomentsPoll(){
+  stopMomentsPoll();
+  momentsPollTimer=setInterval(()=>{
+    api('/api/moments/poll?since='+encodeURIComponent(momentsUpdatedAt||0)).then(d=>{
+      if(!d.ok||!d.changed)return;
+      const items=(d.moments||[]).filter(m=>m&&(m.thumbnail_url||m.video_url||m.url));
+      if(!items.length)return;
+      momentsCache=items;
+      momentsUpdatedAt=d.updated_at||momentsUpdatedAt;
+      // Only re-render if user is still on moments tab, and only if they're near the
+      // top — a full re-render clears momentsRendered/scroll back to 0, which used to
+      // yank people back to the top mid-scroll every ~15s while they were browsing
+      // older moments. If they're scrolled down, just keep momentsCache warm; the
+      // fresh list is picked up next time they reopen the tab.
+      if($('page-moments')&&$('page-moments').classList.contains('active')){
+        var nearTop=true;
+        try{
+          nearTop = isPhone()
+            ? (!$('page-moments') || $('page-moments').scrollTop < 200)
+            : ((window.pageYOffset||document.documentElement.scrollTop||0) < 200);
+        }catch(e){}
+        if(nearTop) renderMomentsUI(items);
+      }
+    }).catch(()=>{});
+  },15000);
+}
+function stopMomentsPoll(){
+  if(momentsPollTimer){clearInterval(momentsPollTimer);momentsPollTimer=null}
+}
+function openViewer(idx){
+  const m=(window._momentItems||[])[idx]; if(!m)return;
+  const v=$('viewerStage');
+  const isVid=!!m.video_url;
+  const raw=normalizeMediaUrl(m.video_url||m.thumbnail_url||m.url);
+  const src=isVid?raw:mediaSrc(raw, 1080);
+  const cap=extractCaption(m);
+  v.innerHTML=`
+    <div class="viewer-head"><button class="viewer-close" onclick="closeViewer()" aria-label="Đóng">✕</button></div>
+    ${isVid?`<video src="${esc(src)}" controls autoplay playsinline style="max-width:100%;max-height:100%;object-fit:contain"></video>`
+           :`<img src="${esc(src)}" alt="" style="max-width:100%;max-height:100%;object-fit:contain" onerror="this.style.opacity=0.4">`}
+    ${cap?`<div class="viewer-caption">${esc(cap)}</div>`:''}
+  `;
+  v.classList.remove('hidden');
+}
+function closeViewer(){$('viewerStage').classList.add('hidden');$('viewerStage').innerHTML=''}
+
+/* ===================== Upload: pick / paste / crop ===================== */
+function triggerFilePick(){$('fileInput').click()}
+function triggerCamera(){const c=$('cameraInput'); if(c) c.click(); else triggerFilePick()}
+function onFilePick(e){const f=e.target.files[0];if(f)handleIncomingFile(f); e.target.value=''}
+document.addEventListener('paste',(e)=>{
+  if(!$('page-upload')||!$('page-upload').classList.contains('active'))return;
+  const items=(e.clipboardData||{}).items||[];
+  for(const it of items){
+    if(it.type&&it.type.startsWith('image/')){
+      const f=it.getAsFile(); if(f){handleIncomingFile(f);e.preventDefault();break}
+    }
+  }
+});
+function handleIncomingFile(f){
+  originalFile=f; isVideo=f.type.startsWith('video');
+  const url=URL.createObjectURL(f);
+  if(isVideo){
+    $('previewImg').classList.add('hidden');
+    $('previewVid').classList.remove('hidden'); $('previewVid').src=url;
+    $('uploadPlaceholder').classList.add('hidden');
+    $('uploadActions').classList.remove('hidden');
+    croppedBlob=f; return;
+  }
+  $('cropImg').src=url;
+  const stage=$('cropStage');
+  stage.classList.add('open');
+  document.body.style.overflow='hidden';
+  if(cropper){cropper.destroy()}
+  // delay init so layout is fullscreen first (iOS)
+  setTimeout(()=>{
+    cropper=new Cropper($('cropImg'),{
+      aspectRatio:1,viewMode:1,autoCropArea:1,dragMode:'move',
+      guides:true,center:true,highlight:false,background:false,responsive:true,toggleDragModeOnDblclick:false,
+    });
+  },50);
+}
+function cancelCrop(){
+  $('cropStage').classList.remove('open');
+  document.body.style.overflow='';
+  $('fileInput').value='';
+  if($('cameraInput')) $('cameraInput').value='';
+  if(!croppedBlob){$('uploadActions').classList.add('hidden')}
+  if(cropper){cropper.destroy();cropper=null}
+}
+function confirmCrop(){
+  if(!cropper)return;
+  const btn=document.querySelector('#cropStage .crop-header button:last-child');
+  if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner light"></span>'}
+  const canvas=cropper.getCroppedCanvas({width:1080,height:1080,imageSmoothingQuality:'high'});
+  canvas.toBlob(b=>{
+    croppedBlob=b;
+    $('previewImg').src=URL.createObjectURL(b);
+    $('previewImg').classList.remove('hidden');
+    $('previewVid').classList.add('hidden');
+    $('uploadPlaceholder').classList.add('hidden');
+    $('uploadActions').classList.remove('hidden');
+    $('cropStage').classList.remove('open');
+    document.body.style.overflow='';
+    if(btn){btn.disabled=false;btn.textContent='Xong'}
+    cropper.destroy();cropper=null;
+  },'image/jpeg',0.92);
+}
+function clearUpload(){
+  croppedBlob=null;originalFile=null;isVideo=false;
+  $('fileInput').value='';
+  if($('cameraInput')) $('cameraInput').value='';
+  $('previewImg').classList.add('hidden');$('previewVid').classList.add('hidden');
+  $('uploadActions').classList.add('hidden');
+  openCapture();
+}
+
+/* ===================== Live camera (in-page, giống Locket gốc) ===================== */
+let lcStream=null, lcTrack=null, lcFacing='environment', lcTorchOn=false, lcWantActive=false, lcStarting=false;
+
+function isLiveCamera(){
+  try{ return localStorage.getItem('locket_live_camera')==='1'; }catch(e){ return false; }
+}
+function toggleLiveCamera(on){
+  try{ localStorage.setItem('locket_live_camera', on?'1':'0'); }catch(e){}
+  if(!croppedBlob) openCapture();
+}
+// Decide what the "upload spot" should show right now: live camera, file-pick box, or leave the
+// existing preview/caption alone (a photo is already captured and waiting to be sent).
+function openCapture(){
+  if(croppedBlob){
+    $('previewImg').classList.add('hidden');$('previewVid').classList.add('hidden');
+    $('uploadActions').classList.add('hidden');
+    croppedBlob=null;originalFile=null;isVideo=false;
+  }
+  if(isLiveCamera()){
+    $('previewBox').classList.add('hidden');
+    $('uploadPlaceholder').classList.add('hidden');
+    $('liveCam').classList.remove('hidden');
+    startLiveCamera();
+  } else {
+    stopLiveCamera();
+    $('liveCam').classList.add('hidden');
+    $('previewBox').classList.remove('hidden');
+    $('uploadPlaceholder').classList.remove('hidden');
+    triggerFilePick();
+  }
+}
+function stopLiveCamera(){
+  lcWantActive=false;
+  if(lcStream){ lcStream.getTracks().forEach(t=>t.stop()); lcStream=null; }
+  lcTrack=null; lcTorchOn=false;
+  const fb=$('lcFlashBtn'); if(fb){ fb.classList.remove('on'); fb.classList.add('hidden'); }
+  const v=$('lcVideo'); if(v) v.srcObject=null;
+}
+function startLiveCamera(){
+  if(lcStarting) return;
+  stopLiveCamera();
+  lcWantActive=true; lcStarting=true;
+  const hint=$('lcHint'); if(hint) hint.classList.remove('hidden');
+  navigator.mediaDevices.getUserMedia({
+    audio:false,
+    video:{ facingMode:lcFacing, width:{ideal:640}, height:{ideal:640} }
+  }).then(s=>{
+    lcStarting=false;
+    if(!lcWantActive){ s.getTracks().forEach(t=>t.stop()); return; }
+    lcStream=s; lcTrack=s.getVideoTracks()[0];
+    const v=$('lcVideo'); v.srcObject=s; v.classList.toggle('mirrored', lcFacing==='user');
+    if(hint) hint.classList.add('hidden');
+    try{
+      const caps=lcTrack.getCapabilities && lcTrack.getCapabilities();
+      const fb=$('lcFlashBtn');
+      if(fb) fb.classList.toggle('hidden', !(caps && caps.torch));
+    }catch(e){}
+  }).catch(err=>{
+    lcStarting=false;
+    if(hint) hint.classList.add('hidden');
+    toast('Không mở được camera: '+(err&&err.message?err.message:'bị từ chối quyền'));
+    $('liveCameraSwitch').checked=false;
+    toggleLiveCamera(false);
+  });
+}
+function flipLiveCamera(e){
+  if(e)e.preventDefault();
+  lcFacing = lcFacing==='environment' ? 'user' : 'environment';
+  startLiveCamera();
+}
+function toggleTorch(e){
+  if(e)e.preventDefault();
+  if(!lcTrack) return;
+  lcTorchOn=!lcTorchOn;
+  $('lcFlashBtn').classList.toggle('on', lcTorchOn);
+  try{ lcTrack.applyConstraints({advanced:[{torch:lcTorchOn}]}); }catch(err){}
+}
+function captureLivePhoto(e){
+  if(e)e.preventDefault();
+  const v=$('lcVideo');
+  if(!v || !v.videoWidth) return;
+  const btn=$('lcShutterBtn'); btn.disabled=true;
+  const overlay=$('lcFlashOverlay');
+  overlay.classList.add('fire'); setTimeout(()=>overlay.classList.remove('fire'),120);
+
+  const vw=v.videoWidth, vh=v.videoHeight, size=Math.min(vw,vh);
+  const sx=(vw-size)/2, sy=(vh-size)/2;
+  const canvas=document.createElement('canvas');
+  canvas.width=1080; canvas.height=1080;
+  const ctx=canvas.getContext('2d');
+  if(lcFacing==='user'){ ctx.translate(canvas.width,0); ctx.scale(-1,1); }
+  ctx.drawImage(v, sx, sy, size, size, 0, 0, 1080, 1080);
+
+  canvas.toBlob(b=>{
+    btn.disabled=false;
+    if(!b) return;
+    croppedBlob=b; isVideo=false; originalFile=null;
+    $('previewImg').src=URL.createObjectURL(b);
+    $('previewImg').classList.remove('hidden');
+    $('previewVid').classList.add('hidden');
+    $('uploadActions').classList.remove('hidden');
+    stopLiveCamera();
+    $('liveCam').classList.add('hidden');
+    $('previewBox').classList.remove('hidden');
+  }, 'image/jpeg', 0.92);
+}
+
+/* ===================== Offline upload queue (IndexedDB) ===================== */
+const QDB_NAME='locket_upload_queue_v1', QDB_STORE='jobs';
+let _qdb=null, _queueFlushing=false;
+function openQdb(){
+  return new Promise((resolve,reject)=>{
+    if(_qdb){resolve(_qdb);return}
+    const req=indexedDB.open(QDB_NAME,1);
+    req.onupgradeneeded=()=>{const db=req.result; if(!db.objectStoreNames.contains(QDB_STORE)) db.createObjectStore(QDB_STORE,{keyPath:'id'});};
+    req.onsuccess=()=>{_qdb=req.result; resolve(_qdb)};
+    req.onerror=()=>reject(req.error);
+  });
+}
+function qAll(){
+  return openQdb().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(QDB_STORE,'readonly');
+    const req=tx.objectStore(QDB_STORE).getAll();
+    req.onsuccess=()=>resolve((req.result||[]).sort((a,b)=>a.created-b.created));
+    req.onerror=()=>reject(req.error);
+  }));
+}
+function qPut(job){
+  return openQdb().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(QDB_STORE,'readwrite');
+    tx.objectStore(QDB_STORE).put(job);
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  }));
+}
+function qDel(id){
+  return openQdb().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(QDB_STORE,'readwrite');
+    tx.objectStore(QDB_STORE).delete(id);
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  }));
+}
+function blobToDataUrl(blob){
+  return new Promise((resolve,reject)=>{
+    const r=new FileReader();
+    r.onload=()=>resolve(r.result);
+    r.onerror=()=>reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+function dataUrlToBlob(dataUrl){
+  const parts=String(dataUrl).split(',');
+  const mime=(parts[0].match(/:(.*?);/)||[])[1]||'image/jpeg';
+  const bin=atob(parts[1]);
+  const arr=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+  return new Blob([arr],{type:mime});
+}
+function statusLabel(st){
+  if(st==='pending') return 'Chờ mạng…';
+  if(st==='uploading') return 'Đang đăng…';
+  if(st==='error') return 'Lỗi — sẽ thử lại';
+  if(st==='done') return 'Đã đăng';
+  return st||'';
+}
+async function renderQueue(){
+  const box=$('queueBox'), list=$('queueList'), count=$('queueCount');
+  if(!box) return;
+  let jobs=[];
+  try{ jobs=await qAll(); }catch(e){ console.warn(e); }
+  // hide completed after a while conceptually — we delete on success
+  if(!jobs.length){ box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  if(count) count.textContent=jobs.length;
+  list.innerHTML='';
+  jobs.forEach(j=>{
+    const row=document.createElement('div');
+    row.className='queue-item';
+    const thumb=j.preview||'';
+    row.innerHTML=`
+      ${thumb?`<img src="${esc(thumb)}" alt="">`:`<div style="width:44px;height:44px;border-radius:10px;background:#222"></div>`}
+      <div class="qi-info">
+        <div class="qi-title">${esc(j.caption||'(không chú thích)')}</div>
+        <div class="qi-status ${esc(j.status)}">${esc(statusLabel(j.status))}${j.error?': '+esc(j.error):''}</div>
+      </div>`;
+    list.appendChild(row);
+  });
+}
+async function enqueueUpload(blob, caption, filename, contentType){
+  const id='j_'+Date.now()+'_'+Math.random().toString(36).slice(2,8);
+  let preview='';
+  try{ if(blob.type&&blob.type.startsWith('image')) preview=await blobToDataUrl(blob); }catch(e){}
+  let dataUrl='';
+  try{ dataUrl=await blobToDataUrl(blob); }catch(e){ toast('Không lưu được ảnh offline'); throw e; }
+  const job={id, created:Date.now(), caption:caption||'', filename, contentType, dataUrl, preview, status:'pending', error:''};
+  await qPut(job);
+  await renderQueue();
+  return job;
+}
+async function postJob(job){
+  job.status='uploading'; job.error='';
+  await qPut(job); await renderQueue();
+  const blob=dataUrlToBlob(job.dataUrl);
+  const fd=new FormData();
+  fd.append('file', blob, job.filename||'moment.jpg');
+  fd.append('caption', job.caption||'');
+  try{
+    const d=await api('/api/upload',{method:'POST',body:fd});
+    if(d&&d.ok){
+      await qDel(job.id);
+      momentsLoaded=false; momentsCache=[]; momentsUpdatedAt=0;
+      await renderQueue();
+      return true;
+    }
+    job.status='error'; job.error=(d&&d.error)||'Đăng thất bại';
+    await qPut(job); await renderQueue();
+    return false;
+  }catch(err){
+    job.status='pending'; job.error='';
+    await qPut(job); await renderQueue();
+    return false;
+  }
+}
+async function flushQueue(){
+  if(_queueFlushing) return;
+  if(!navigator.onLine) return;
+  _queueFlushing=true;
+  try{
+    const jobs=await qAll();
+    for(const j of jobs){
+      if(!navigator.onLine) break;
+      if(j.status==='done'){ await qDel(j.id); continue; }
+      const ok=await postJob(j);
+      if(!ok && j.status==='error') continue; // try next; errors stay for retry
+    }
+  }finally{
+    _queueFlushing=false;
+    await renderQueue();
+  }
+}
+function updateOnlineUI(){
+  const b=$('offlineBanner');
+  if(b) b.classList.toggle('show', !navigator.onLine);
+}
+function toggleAutoCamera(on){
+  try{ localStorage.setItem('locket_auto_camera', on?'1':'0'); }catch(e){}
+}
+function isAutoCamera(){
+  try{ return localStorage.getItem('locket_auto_camera')==='1'; }catch(e){ return false; }
+}
+function maybeAutoCamera(){
+  if(!isAutoCamera()) return;
+  if(isLiveCamera()) return;
+  // slight delay so page paints, then open upload + camera
+  setTimeout(()=>{
+    showPage('upload');
+    setTimeout(()=>triggerCamera(), 350);
+  }, 400);
+}
+
+/* ===================== Upload: send ===================== */
+function doUpload(){
+  if(!croppedBlob){toast('Chọn ảnh hoặc video trước đã');return}
+  const cap=$('caption').value,btn=$('uploadBtn');
+  const filename=isVideo?(originalFile?originalFile.name:'video.mp4'):'moment.jpg';
+  const ct=(croppedBlob.type)||(isVideo?'video/mp4':'image/jpeg');
+  btn.innerHTML='<span class="spinner"></span> Đang xử lý...';btn.disabled=true;
+
+  const finishOk=()=>{
+    btn.innerHTML='Gửi cho tất cả bạn bè';btn.disabled=false;
+    toast(navigator.onLine?'Đã đăng!':'Đã lưu — sẽ tự đăng khi có mạng');
+    $('caption').value=''; clearUpload();
+  };
+  const finishFail=(msg)=>{
+    btn.innerHTML='Gửi cho tất cả bạn bè';btn.disabled=false;
+    toast(msg||'Đăng thất bại');
+  };
+
+  // Always enqueue for durability; if online, flush immediately in order
+  enqueueUpload(croppedBlob, cap, filename, ct).then(job=>{
+    if(!navigator.onLine){
+      finishOk();
+      return;
+    }
+    return postJob(job).then(ok=>{
+      if(ok) finishOk();
+      else finishFail(job.error||'Đăng thất bại — đã giữ trong hàng đợi');
+    });
+  }).catch(err=>{
+    console.error(err);
+    // fallback: try direct upload if queue failed (e.g. private mode no IDB)
+    if(!navigator.onLine){ finishFail('Không lưu offline được trên trình duyệt này'); return; }
+    const fd=new FormData();
+    fd.append('file',croppedBlob,filename);
+    fd.append('caption',cap);
+    api('/api/upload',{method:'POST',body:fd}).then(d=>{
+      if(d.ok){ finishOk(); momentsLoaded=false;momentsCache=[];momentsUpdatedAt=0; }
+      else finishFail(d.error||'Đăng thất bại');
+    }).catch(()=>finishFail('Lỗi mạng khi đăng'));
+  });
+}
+
+function doLogout(){api('/api/logout').then(()=>location.reload())}
+
+/* boot */
+loadMe();
+preloadFriends();
+preloadMoments();
+updateOnlineUI();
+renderQueue().then(()=>flushQueue());
+window.addEventListener('online',()=>{ updateOnlineUI(); toast('Đã có mạng — đang đăng hàng đợi'); flushQueue(); });
+window.addEventListener('offline',()=>{ updateOnlineUI(); toast('Mất mạng — ảnh mới sẽ lưu máy'); });
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible'){
+    const local=readFriendsLocal();
+    if(!local || Date.now()-(local.ts||0)>FRIENDS_TTL_MS) loadFriends(false);
+    const ml=readMomentsLocal();
+    if(!ml || Date.now()-(ml.ts||0)>MOMENTS_TTL_MS) preloadMoments();
+    if($('page-upload').classList.contains('active') && isLiveCamera() && !croppedBlob && !lcStream){
+      startLiveCamera();
+    }
+  } else {
+    stopLiveCamera();
+  }
+});
+window.addEventListener('pagehide', stopLiveCamera);
+(function initAutoCamera(){
+  const sw=$('autoCameraSwitch');
+  if(sw) sw.checked=isAutoCamera();
+  maybeAutoCamera();
+})();
+(function initLiveCamera(){
+  const sw=$('liveCameraSwitch');
+  if(sw) sw.checked=isLiveCamera();
+})();
+if('serviceWorker' in navigator){
+  setTimeout(function(){
+    navigator.serviceWorker.register('/sw.js').catch(function(){});
+  }, 1500);
+}
+{% endif %}
+</script>
+</body>
+</html>
+"""
+
+
+# ============================================================
+# Flask app + routes
+# ============================================================
+
+from datetime import timedelta
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(24)
+app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
+
+
+def get_session() -> Optional[LocketSession]:
+    tok = session.get("token")
+    lid = session.get("local_id")
+    if not tok or not lid:
+        return None
+    return LocketSession(
+        id_token=tok, refresh_token=session.get("refresh_token"), local_id=lid,
+        email=session.get("email", ""), display_name=session.get("display_name", ""),
+        photo_url=session.get("photo_url", ""), ua=session.get("ua") or WEB_UA_POOL[0],
+    )
+
+
+@app.route("/")
+def index():
+    s = get_session()
+    return render_template_string(
+        HTML,
+        logged_in=bool(s),
+        gold_badge=GOLD_BADGE, celeb_badge=CELEB_BADGE,
+        font_url=FONT_URL, favicon_url=FAVICON_URL,
+        boot_name=(s.display_name if s else ""),
+        boot_photo=(s.photo_url if s else ""),
+        boot_email=(s.email if s else ""),
+    )
+
+
+@app.route("/manifest.webmanifest")
+def web_manifest():
+    from flask import Response
+    import json as _json
+    data = {
+        "name": "Locket Mini",
+        "short_name": "Locket Mini",
+        "description": "Xem và đăng khoảnh khắc với bạn bè",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#000000",
+        "theme_color": "#000000",
+        "orientation": "portrait",
+        "icons": [
+            {"src": FAVICON_URL, "sizes": "180x180", "type": "image/png", "purpose": "any maskable"},
+        ],
+    }
+    return Response(_json.dumps(data), mimetype="application/manifest+json")
+
+
+@app.route("/sw.js")
+def service_worker():
+    from flask import Response
+    # Offline shell + cache API images / static CDN for repeat visits
+    js = r"""
+const CACHE='locket-mini-v1';
+const PRE=[
+  '/',
+  'https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css',
+  'https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.css',
+  'https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js'
+];
+self.addEventListener('install',e=>{
+  e.waitUntil(caches.open(CACHE).then(c=>c.addAll(PRE)).then(()=>self.skipWaiting()));
+});
+self.addEventListener('activate',e=>{
+  e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()));
+});
+self.addEventListener('fetch',e=>{
+  const req=e.request;
+  const url=new URL(req.url);
+  if(req.method!=='GET') return;
+  // Cache-first for proxied images (offline-friendly after first view)
+  if(url.pathname==='/api/img'){
+    e.respondWith(
+      caches.open(CACHE).then(async c=>{
+        const hit=await c.match(req);
+        if(hit) return hit;
+        try{
+          const res=await fetch(req);
+          if(res && res.ok) c.put(req, res.clone());
+          return res;
+        }catch(err){
+          return hit || Response.error();
+        }
+      })
+    );
+    return;
+  }
+  // Network-first for app shell / API JSON; fall back to cache offline
+  if(url.origin===self.location.origin){
+    e.respondWith(
+      fetch(req).then(res=>{
+        if(res && res.ok && (url.pathname==='/' || url.pathname.endsWith('.css') || url.pathname.endsWith('.js'))){
+          const copy=res.clone();
+          caches.open(CACHE).then(c=>c.put(req, copy));
+        }
+        return res;
+      }).catch(()=>caches.match(req).then(r=>r||caches.match('/')))
+    );
+  }
+});
+"""
+    resp = Response(js, mimetype="application/javascript")
+    resp.headers["Service-Worker-Allowed"] = "/"
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+    remember = bool(data.get("remember"))
+    if not email or not password:
+        return jsonify({"ok": False, "error": "Nhập email và mật khẩu"})
+    try:
+        s, _dbg = login(email, password)
+        session.permanent = remember
+        session["token"] = s.id_token
+        session["local_id"] = s.local_id
+        session["refresh_token"] = s.refresh_token
+        session["email"] = s.email
+        session["display_name"] = s.display_name
+        session["photo_url"] = s.photo_url
+        session["ua"] = s.ua
+        session["token_issued_at"] = time.time()
+        session["remember"] = remember
+        return jsonify({
+            "ok": True,
+            "me": {
+                "display_name": s.display_name,
+                "photo_url": s.photo_url,
+                "email": s.email,
+                "local_id": s.local_id,
+            },
+        })
+    except LoginError as e:
+        logger.error("LOGIN failed: %s", e.friendly)
+        return jsonify({"ok": False, "error": e.friendly})
+    except Exception as e:
+        logger.error("LOGIN unexpected error: %s", e)
+        return jsonify({"ok": False, "error": f"Lỗi không xác định: {e}"})
+
+
+@app.route("/api/logout", methods=["GET", "POST"])
+def api_logout():
+    lid = session.get("local_id")
+    if lid:
+        stop_moments_live(lid)
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/me")
+def api_me():
+    s = get_session()
+    if not s:
+        return jsonify({"ok": False, "error": "Not logged in"})
+    try:
+        s = ensure_fresh_token(s)
+        info, _dbg = get_self_info(s)
+        info["email"] = s.email
+        # Prefer the richer display name we already got at login when getInfo is sparse
+        if not info.get("first_name") and s.display_name:
+            info["first_name"] = s.display_name
+        if not info.get("profile_picture_url") and s.photo_url:
+            info["profile_picture_url"] = s.photo_url
+        return jsonify({"ok": True, "me": info})
+    except Exception as e:
+        logger.error("ME error: %s", e)
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/friends")
+def api_friends():
+    s = get_session()
+    if not s:
+        return jsonify({"ok": False, "error": "Not logged in"})
+    try:
+        s = ensure_fresh_token(s)
+        friends, _dbg = get_friends(s)
+        return jsonify({"ok": True, "friends": friends, "count": len(friends)})
+    except Exception as e:
+        logger.error("FRIENDS error: %s", e)
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/moments")
+def api_moments():
+    s = get_session()
+    if not s:
+        return jsonify({"ok": False, "error": "Not logged in"})
+    try:
+        s = ensure_fresh_token(s)
+        force = request.args.get("force") == "1"
+        items = get_moments_cached(s, force=force)
+        st = _MOMENTS_CACHE.get(s.local_id) or {}
+        return jsonify({
+            "ok": True,
+            "moments": items,
+            "updated_at": st.get("updated_at") or time.time(),
+            "cached": not force and bool(st.get("bootstrapped")),
+        })
+    except Exception as e:
+        logger.error("MOMENTS error: %s", e)
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/moments/poll")
+def api_moments_poll():
+    """Lightweight live poll — returns full list only when cache was updated after `since`."""
+    s = get_session()
+    if not s:
+        return jsonify({"ok": False, "error": "Not logged in"})
+    try:
+        since = float(request.args.get("since") or 0)
+        items, updated = poll_new_moments(s, since=since)
+        return jsonify({
+            "ok": True,
+            "moments": items,
+            "updated_at": updated,
+            "changed": bool(items) and updated > since,
+        })
+    except Exception as e:
+        logger.error("MOMENTS POLL error: %s", e)
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/img")
+def api_img():
+    """Proxy + JPEG convert so iPhone 6 / iOS 12 can display friend photos (no WebP)."""
+    from flask import Response
+    from urllib.parse import unquote, urlsplit, urlunsplit, quote
+    # Flask already percent-decodes query args once. Firebase object paths need %2F kept.
+    url = (request.args.get("u") or "").strip()
+    if "%252F" in url or "%253F" in url or "%2526" in url:
+        url = unquote(url)
+    if not url.startswith("https://"):
+        return jsonify({"ok": False, "error": "bad url"}), 400
+    try:
+        max_side = int(request.args.get("w") or 720)
+    except Exception:
+        max_side = 720
+    max_side = max(64, min(max_side, 1280))
+    # Re-encode path if something already turned %2F into raw /
+    try:
+        parts = urlsplit(url)
+        path = parts.path or ""
+        marker = "/o/"
+        if marker in path:
+            pre, obj = path.split(marker, 1)
+            if "/" in obj and "%2F" not in obj.upper():
+                obj = quote(obj, safe="")
+            path = pre + marker + obj
+            url = urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+    except Exception:
+        pass
+    try:
+        data, mime = fetch_image_as_jpeg(url, max_side=max_side)
+        resp = Response(data, mimetype=mime)
+        resp.headers["Cache-Control"] = "public, max-age=900"
+        return resp
+    except Exception as e:
+        logger.warning("IMG PROXY fail %s: %s", url[:120], e)
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
+@app.route("/api/upload", methods=["POST"])
+def api_upload():
+    s = get_session()
+    if not s:
+        return jsonify({"ok": False, "error": "Not logged in"})
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "No file"})
+    f = request.files["file"]
+    caption = request.form.get("caption", "")
+    if f.filename == "":
+        return jsonify({"ok": False, "error": "Empty filename"})
+    try:
+        s = ensure_fresh_token(s)
+        raw = f.read()
+        ct = f.content_type or "application/octet-stream"
+        is_video = "video" in ct
+        if is_video:
+            ext = f.filename.rsplit(".", 1)[-1] if "." in f.filename else "mp4"
+            filename = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}.{ext}"
+            result, _dbg = upload_media(s, raw, filename, ct, caption=caption)
+        else:
+            data, filename = compress_image(raw)
+            result, _dbg = upload_media(s, data, filename, "image/jpeg", caption=caption)
+        # Invalidate moments cache so next open picks up the new post
+        with _MOMENTS_LOCK:
+            st = _MOMENTS_CACHE.get(s.local_id)
+            if st:
+                st["bootstrapped"] = False
+        return jsonify({"ok": True, "result": result})
+    except requests.HTTPError as e:
+        logger.error("UPLOAD http error: %s", e)
+        return jsonify({"ok": False, "error": f"Upload bị từ chối ({e})"})
+    except Exception as e:
+        logger.error("UPLOAD error: %s", e)
+        return jsonify({"ok": False, "error": str(e)})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    logger.info("Starting Locket Mini on http://0.0.0.0:%d", port)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
