@@ -1282,11 +1282,24 @@ body{
 
 /* ---------- Live camera (in-page, giống Locket gốc) ---------- */
 /* Explicit square size via JS (_sizeLcFrame) — padding-bottom alone can stretch
-   the video stream on iOS 12 / iPhone 6 Safari. */
+   the video stream on iOS 12 / iPhone 6 Safari.
+   On phone: bleed past .page 16px padding so the square touches both screen edges. */
 .live-cam{width:100%;margin:0 0 4px}
-.lc-frame{width:100%;position:relative;border-radius:24px;overflow:hidden;background:#0a0a0a;
+@media (max-width:520px){
+  .live-cam{
+    width:calc(100% + 32px);
+    max-width:none;
+    margin-left:-16px;
+    margin-right:-16px;
+    margin-bottom:4px;
+  }
+}
+.lc-frame{width:100%;position:relative;border-radius:18px;overflow:hidden;background:#0a0a0a;
   -webkit-transform:translateZ(0);transform:translateZ(0);
   height:0;padding-bottom:100%}
+@media (max-width:520px){
+  .lc-frame{border-radius:0} /* edge-to-edge on phone */
+}
 .lc-frame.sized{height:auto;padding-bottom:0}
 .lc-frame video{
   position:absolute;top:0;left:0;right:0;bottom:0;
@@ -2516,20 +2529,34 @@ function toggleLiveCamera(on){
   if(!croppedBlob) openCapture();
   if(on) setTimeout(function(){ scrollUploadCameraIntoView(); }, 80);
 }
-/** Force .lc-frame to true 1:1 using measured width — fixes stretch on iPhone 6 / iOS 12. */
+/** Force .lc-frame to true 1:1 at full parent width — iPhone 6 / iOS 12 safe.
+ *  Always measure #liveCam (parent), NEVER the frame itself — after the first
+ *  shrink, frame.clientWidth would be the shrunk value and lock us at ~220px.
+ */
 function _sizeLcFrame(){
   try{
-    var frame = document.querySelector('#liveCam .lc-frame');
-    if(!frame || frame.offsetParent===null) return;
-    var w = frame.clientWidth || frame.offsetWidth;
-    if(!w) return;
-    // Cap so shutter bar + switches stay on screen (iPhone 6 = 667h)
-    var maxSide = Math.min(w, Math.max(220, (window.innerHeight || 500) - 260));
-    frame.style.width = maxSide + 'px';
-    frame.style.height = maxSide + 'px';
+    var cam = $('liveCam');
+    var frame = cam && cam.querySelector ? cam.querySelector('.lc-frame') : document.querySelector('#liveCam .lc-frame');
+    if(!frame || !cam || cam.classList.contains('hidden')) return;
+    // Parent is full bleed on phone (CSS width calc 100%+32px). Prefer that.
+    var w = cam.clientWidth || cam.offsetWidth || 0;
+    if(!w){
+      // fallback: page content width
+      var page = $('page-upload');
+      w = (page && (page.clientWidth || page.offsetWidth)) || (window.innerWidth || 320);
+      // if still inside padded page and not bleed, approximate screen
+      if(w < (window.innerWidth || 0) - 8) w = window.innerWidth || w;
+    }
+    w = Math.floor(w);
+    if(w < 160) return;
+    // Full width square — do NOT cap by viewport height (that was making iPhone 6
+    // with Safari chrome stick at ~220px). User can scroll; shutter stays below.
+    frame.style.width = w + 'px';
+    frame.style.height = w + 'px';
+    frame.style.maxWidth = '100%';
     frame.style.paddingBottom = '0';
-    frame.style.marginLeft = 'auto';
-    frame.style.marginRight = 'auto';
+    frame.style.marginLeft = '0';
+    frame.style.marginRight = '0';
     frame.classList.add('sized');
   }catch(e){}
 }
