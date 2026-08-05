@@ -1130,6 +1130,18 @@ body{
 /* Moments: desktop = square grid; phone = vertical snap feed (1 per screen) */
 .moments-head{display:flex;align-items:center;justify-content:space-between;padding:0 16px 12px}
 .moments-head h2{margin:0;font-size:20px;font-weight:800}
+.moments-refresh-btn{background:none;border:none;color:var(--text);font-size:19px;padding:7px;
+  cursor:pointer;-webkit-tap-highlight-color:transparent;display:flex;align-items:center;
+  justify-content:center;border-radius:50%}
+.moments-refresh-btn:active{background:rgba(255,255,255,.08)}
+.icon-spin{animation:spin .7s linear infinite}
+.moments-new-pill{position:fixed;top:64px;left:50%;z-index:85;
+  transform:translateX(-50%) translateY(-10px);
+  background:#FFB800;color:#111;border:none;border-radius:500px;padding:9px 18px;
+  font-size:13px;font-weight:800;display:none;align-items:center;gap:6px;cursor:pointer;
+  box-shadow:0 4px 16px rgba(255,184,0,.45);-webkit-tap-highlight-color:transparent;
+  opacity:0;transition:opacity .2s,-webkit-transform .2s;transition:opacity .2s,transform .2s}
+.moments-new-pill.show{display:-webkit-box;display:-webkit-flex;display:flex;opacity:1;transform:translateX(-50%) translateY(0)}
 /* Floating "newest" button — all devices, large hit target (iOS 12 safe) */
 .moments-top-btn{position:fixed;right:14px;bottom:78px;z-index:80;
   width:56px;height:56px;border-radius:50%;border:none;background:#FFB800;color:#111;
@@ -1531,7 +1543,13 @@ body{
   </div>
 
   <div class="page" id="page-moments">
-    <div class="moments-head"><h2>Moments</h2></div>
+    <div class="moments-head">
+      <h2>Moments</h2>
+      <button type="button" class="moments-refresh-btn" id="momentsRefreshBtn" onclick="refreshMomentsNow();return false;" title="Làm mới Moments" aria-label="Làm mới Moments">
+        <i class="bi bi-arrow-clockwise" id="momentsRefreshIcon"></i>
+      </button>
+    </div>
+    <button type="button" class="moments-new-pill" id="momentsNewPill" onclick="applyPendingMoments();return false;"></button>
     <div class="moments-grid" id="momentsGrid"></div>
     <div class="moments-feed" id="momentsFeed"></div>
     <div id="momentsMoreSentinel" style="height:1px"></div>
@@ -2011,6 +2029,18 @@ function momentProf(m,friendMap){
 let momentsRendered=0;
 var _momentsBootLock = false; // true while opening tab — block scroll-triggered append
 function momentsBatchSize(){ return MOMENT_BATCH; }
+function momentKey(m){ return (m&&(m.thumbnail_url||m.url||m.video_url))||''; }
+function bindMomentsClickDelegation(){
+  var grid=$('momentsGrid'), feed=$('momentsFeed');
+  function onClick(e){
+    var el = e.target.closest ? e.target.closest('[data-idx]') : null;
+    if(!el) return;
+    var idx = parseInt(el.getAttribute('data-idx'), 10);
+    if(!isNaN(idx)) openViewer(idx);
+  }
+  if(grid) grid.addEventListener('click', onClick);
+  if(feed) feed.addEventListener('click', onClick);
+}
 
 function buildMomentCard(m, idx, friendMap, eager){
   const displayProf=momentProf(m,friendMap);
@@ -2021,7 +2051,6 @@ function buildMomentCard(m, idx, friendMap, eager){
   const card=document.createElement('div');
   card.className='moment-card';
   card.setAttribute('data-idx', String(idx));
-  card.onclick=function(){ openViewer(idx); };
   // placeholder first — real src goes through concurrency queue
   card.innerHTML=
     '<img src="'+TINY_PIXEL+'" data-real="'+esc(imgUrl)+'" alt="" style="background:#1a1a1a">'+
@@ -2045,7 +2074,7 @@ function buildFeedSlide(m, idx, friendMap, eager){
   slide.className='feed-slide';
   slide.setAttribute('data-idx', String(idx));
   slide.innerHTML=
-    '<div class="feed-card" onclick="openViewer('+idx+')">'+
+    '<div class="feed-card">'+
       '<img src="'+TINY_PIXEL+'" data-real="'+esc(imgUrl)+'" alt="" style="background:#1a1a1a">'+
       '<div class="moment-overlay"></div>'+
       (cap?'<div class="moment-caption">'+esc(cap)+'</div>':'')+
@@ -2096,6 +2125,7 @@ function renderMomentsUI(items, reset){
   const grid=$('momentsGrid'), feed=$('momentsFeed');
   window._momentItems=items;
   if(reset!==false){
+    hideNewMomentsPill();
     if(grid) grid.innerHTML='';
     if(feed) feed.innerHTML='';
     momentsRendered=0;
@@ -2126,6 +2156,88 @@ function renderMomentsUI(items, reset){
     hideProgress(700);
     setTimeout(function(){ _momentsBootLock = false; }, 180);
   }
+}
+
+/* Count fresh items ahead of the currently-rendered top (contiguous new run) */
+function countNewMoments(freshItems){
+  var oldItems=window._momentItems||[];
+  var oldKeys={};
+  for(var i=0;i<oldItems.length;i++) oldKeys[momentKey(oldItems[i])]=true;
+  var n=0;
+  for(var j=0;j<freshItems.length;j++){
+    if(oldKeys[momentKey(freshItems[j])]) break;
+    n++;
+  }
+  return n;
+}
+/* Insert only the new cards at the top instead of tearing down the whole
+   grid/feed — avoids re-decoding already-painted images and keeps scroll
+   position untouched. Falls back to caller doing a full render if nothing
+   new is found. */
+function prependNewMoments(freshItems){
+  var n=countNewMoments(freshItems);
+  if(n<=0){ window._momentItems=freshItems; return false; }
+  var newOnes=freshItems.slice(0, n);
+  var friendMap={};
+  if(friendsCache)friendsCache.forEach(function(f){ friendMap[f.uid]=f; });
+  var nodes=document.querySelectorAll('#momentsGrid [data-idx], #momentsFeed [data-idx]');
+  for(var x=0;x<nodes.length;x++){
+    var old=parseInt(nodes[x].getAttribute('data-idx'),10);
+    nodes[x].setAttribute('data-idx', String(old+n));
+  }
+  var grid=$('momentsGrid'), feed=$('momentsFeed');
+  var fragG=grid?document.createDocumentFragment():null;
+  var fragF=feed?document.createDocumentFragment():null;
+  for(var idx=0; idx<n; idx++){
+    if(fragG) fragG.appendChild(buildMomentCard(newOnes[idx], idx, friendMap, true));
+    if(fragF) fragF.appendChild(buildFeedSlide(newOnes[idx], idx, friendMap, true));
+  }
+  if(grid && fragG) grid.insertBefore(fragG, grid.firstChild);
+  if(feed && fragF) feed.insertBefore(fragF, feed.firstChild);
+  window._momentItems=freshItems;
+  momentsRendered+=n;
+  scheduleLazyLoad();
+  return true;
+}
+var _pendingMoments=null;
+function showNewMomentsPill(freshItems){
+  var n=countNewMoments(freshItems);
+  var pill=$('momentsNewPill');
+  if(n<=0 || !pill){ hideNewMomentsPill(); return; }
+  _pendingMoments=freshItems;
+  pill.textContent=(n===1?'1 khoảnh khắc mới':n+' khoảnh khắc mới')+' \u2191';
+  pill.classList.add('show');
+}
+function hideNewMomentsPill(){
+  _pendingMoments=null;
+  var pill=$('momentsNewPill');
+  if(pill) pill.classList.remove('show');
+}
+function applyPendingMoments(){
+  if(!_pendingMoments) return;
+  var items=_pendingMoments;
+  hideNewMomentsPill();
+  scrollMomentsTop();
+  if(!prependNewMoments(items)) renderMomentsUI(items);
+}
+function refreshMomentsNow(){
+  var icon=$('momentsRefreshIcon');
+  if(icon) icon.classList.add('icon-spin');
+  api('/api/moments?force=1').then(function(d){
+    if(icon) icon.classList.remove('icon-spin');
+    if(!d.ok){ toast(d.error||'Không làm mới được Moments'); return; }
+    var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
+    momentsCache=items;
+    momentsUpdatedAt=d.updated_at||(Date.now()/1000);
+    writeMomentsLocal(items, momentsUpdatedAt);
+    hideNewMomentsPill();
+    scrollMomentsTop();
+    renderMomentsUI(items);
+    prefetchMomentImages(items, PREFETCH_COUNT);
+  }).catch(function(){
+    if(icon) icon.classList.remove('icon-spin');
+    toast('Lỗi mạng khi làm mới Moments');
+  });
 }
 
 /* Lazy-load images only when near viewport; unload far ones to free RAM */
@@ -2396,39 +2508,36 @@ function preloadMoments(){
     }, 3500);
   }
 }
+function pollMomentsOnce(){
+  api('/api/moments/poll?since='+encodeURIComponent(momentsUpdatedAt||0)).then(function(d){
+    if(!d.ok||!d.changed)return;
+    const items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
+    if(!items.length)return;
+    momentsCache=items;
+    momentsUpdatedAt=d.updated_at||momentsUpdatedAt;
+    try{ writeMomentsLocal(items, momentsUpdatedAt); }catch(e){}
+    if(!($('page-moments')&&$('page-moments').classList.contains('active'))) return;
+    // Near the top: splice the new cards in without tearing down the grid —
+    // cheap and doesn't disturb scroll. Scrolled down browsing older moments:
+    // surface a tappable pill instead of silently swallowing the update (the
+    // old behaviour — user had to reload the page to ever see them).
+    var nearTop=true;
+    try{
+      nearTop = isPhone()
+        ? (!$('page-moments') || $('page-moments').scrollTop < 200)
+        : ((window.pageYOffset||document.documentElement.scrollTop||0) < 200);
+    }catch(e){}
+    if(nearTop) prependNewMoments(items);
+    else showNewMomentsPill(items);
+  }).catch(function(){});
+}
 function startMomentsPoll(){
   stopMomentsPoll();
-  momentsPollTimer=setInterval(function(){
-    api('/api/moments/poll?since='+encodeURIComponent(momentsUpdatedAt||0)).then(function(d){
-      if(!d.ok||!d.changed)return;
-      const items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
-      if(!items.length)return;
-      var prevTop = momentsCache[0] && (momentsCache[0].thumbnail_url||momentsCache[0].url||'');
-      var nextTop = items[0] && (items[0].thumbnail_url||items[0].url||'');
-      momentsCache=items;
-      momentsUpdatedAt=d.updated_at||momentsUpdatedAt;
-      try{ writeMomentsLocal(items, momentsUpdatedAt); }catch(e){}
-      // Only re-render if user is still on moments tab, and only if they're near the
-      // top — a full re-render clears momentsRendered/scroll back to 0, which used to
-      // yank people back to the top mid-scroll every ~15s while they were browsing
-      // older moments. If they're scrolled down, just keep momentsCache warm; the
-      // fresh list is picked up next time they reopen the tab.
-      if($('page-moments')&&$('page-moments').classList.contains('active')){
-        var nearTop=true;
-        try{
-          nearTop = isPhone()
-            ? (!$('page-moments') || $('page-moments').scrollTop < 200)
-            : ((window.pageYOffset||document.documentElement.scrollTop||0) < 200);
-        }catch(e){}
-        if(nearTop && (items.length!==(window._momentItems||[]).length || nextTop!==prevTop)){
-          renderMomentsUI(items);
-        }
-      }
-    }).catch(function(){});
-  }, 8000); // 8s — was 15s; pairs with server poll that refreshes when cache >40s old
+  momentsPollTimer=setInterval(pollMomentsOnce, 8000); // 8s — pairs with server poll that refreshes when cache >40s old
 }
 function stopMomentsPoll(){
   if(momentsPollTimer){clearInterval(momentsPollTimer);momentsPollTimer=null}
+  hideNewMomentsPill();
 }
 function openViewer(idx){
   const m=(window._momentItems||[])[idx]; if(!m)return;
@@ -2916,6 +3025,7 @@ function doLogout(){api('/api/logout').then(()=>location.reload())}
 loadMe();
 preloadFriends();
 preloadMoments();
+bindMomentsClickDelegation();
 updateOnlineUI();
 renderQueue().then(()=>flushQueue());
 window.addEventListener('online',()=>{ updateOnlineUI(); toast('Đã có mạng — đang đăng hàng đợi'); flushQueue(); });
@@ -2926,6 +3036,9 @@ document.addEventListener('visibilitychange',()=>{
     if(!local || Date.now()-(local.ts||0)>FRIENDS_TTL_MS) loadFriends(false);
     const ml=readMomentsLocal();
     if(!ml || Date.now()-(ml.ts||0)>MOMENTS_TTL_MS) preloadMoments();
+    // Background tabs get their setInterval throttled/paused by the browser —
+    // catch up immediately instead of waiting for the next 8s tick.
+    if($('page-moments')&&$('page-moments').classList.contains('active')) pollMomentsOnce();
     if($('page-upload').classList.contains('active') && isLiveCamera() && !croppedBlob && !lcStream){
       startLiveCamera();
     }
