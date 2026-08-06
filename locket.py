@@ -2047,6 +2047,7 @@ function momentProf(m,friendMap){
 }
 let momentsRendered=0;
 var _momentsBootLock = false; // true while opening tab — block scroll-triggered append
+var _momentsHiddenAt = 0;
 function momentsBatchSize(){ return MOMENT_BATCH; }
 function momentKey(m){ return (m&&(m.thumbnail_url||m.url||m.video_url))||''; }
 function bindMomentsClickDelegation(){
@@ -2347,7 +2348,11 @@ function bindMomentsScroll(){
   // that per-container math was the reason "more" could get stuck forever on non-phone
   // layouts where window, not #page-moments, is the actual scroller.
   const sentinel=$('momentsMoreSentinel');
-  if(sentinel && !window._momentsMoreObserver){
+  if(sentinel){
+    if(window._momentsMoreObserver && window._momentsMoreObserver.disconnect){
+      window._momentsMoreObserver.disconnect();
+    }
+    window._momentsMoreObserver=null;
     const tryLoadMore=function(){
       if(_momentsBootLock) return;
       const items=window._momentItems||[];
@@ -3088,18 +3093,38 @@ window.addEventListener('online',()=>{ updateOnlineUI(); toast('Đã có mạng 
 window.addEventListener('offline',()=>{ updateOnlineUI(); toast('Mất mạng — ảnh mới sẽ lưu máy'); });
 document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible'){
+    const gap = _momentsHiddenAt ? (Date.now() - _momentsHiddenAt) : 0;
     const local=readFriendsLocal();
     if(!local || Date.now()-(local.ts||0)>FRIENDS_TTL_MS) loadFriends(false);
     const ml=readMomentsLocal();
     if(!ml || Date.now()-(ml.ts||0)>MOMENTS_TTL_MS) preloadMoments();
-    // Background tabs get their setInterval throttled/paused by the browser —
-    // catch up immediately instead of waiting for the next 8s tick.
-    if($('page-moments')&&$('page-moments').classList.contains('active')) pollMomentsOnce();
+    const momentsActive = $('page-moments') && $('page-moments').classList.contains('active');
+    if(momentsActive){
+      if(gap > 20000 || $('momentsGrid').children.length===0){
+        const fallback=(readMomentsLocal()||{moments:[]}).moments;
+        renderMomentsUI(momentsCache.length ? momentsCache : fallback);
+        loadMoments(true);
+        bindMomentsScroll();
+      }
+      pollMomentsOnce();
+    }
     if($('page-upload').classList.contains('active') && isLiveCamera() && !croppedBlob && !lcStream){
       startLiveCamera();
     }
   } else {
+    _momentsHiddenAt = Date.now();
     stopLiveCamera();
+  }
+});
+window.addEventListener('pageshow', function(e){
+  if(e.persisted){
+    const momentsActive = $('page-moments') && $('page-moments').classList.contains('active');
+    if(momentsActive){
+      const fallback=(readMomentsLocal()||{moments:[]}).moments;
+      renderMomentsUI(momentsCache.length ? momentsCache : fallback);
+      loadMoments(true);
+      bindMomentsScroll();
+    }
   }
 });
 window.addEventListener('pagehide', stopLiveCamera);
