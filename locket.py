@@ -1639,13 +1639,13 @@ let momentsCache=[], momentsUpdatedAt=0, momentsPollTimer=null;
 
 /* ---------- iPhone 6 friendly limits ---------- */
 var IS_PHONE = (typeof window !== 'undefined' && window.innerWidth <= 520);
-var IMG_CONCURRENCY = IS_PHONE ? 2 : 4;   // parallel image downloads
+var IMG_CONCURRENCY = IS_PHONE ? 1 : 4;   // iPhone 6: 1 concurrent decode — avoid Safari kill
 var MOMENT_BATCH = IS_PHONE ? 2 : 8;      // DOM nodes per paint wave
-var PREFETCH_COUNT = IS_PHONE ? 4 : 10;   // eager Image() ahead of scroll
-var THUMB_W = IS_PHONE ? 360 : 480;       // feed thumb max side
-var FEED_THUMB_W = IS_PHONE ? 420 : 540;
+var PREFETCH_COUNT = IS_PHONE ? 2 : 10;   // eager Image() ahead of scroll
+var THUMB_W = IS_PHONE ? 320 : 480;       // feed thumb max side (grid)
+var FEED_THUMB_W = IS_PHONE ? 360 : 540;  // vertical feed card
 var AVATAR_W = 96;
-var LOCAL_MOMENTS_CAP = IS_PHONE ? 40 : 80;
+var LOCAL_MOMENTS_CAP = IS_PHONE ? 30 : 80;
 var LOCAL_FRIENDS_CAP = 200;
 var TINY_PIXEL = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
@@ -1776,13 +1776,14 @@ function showPage(name){
     // Always start at top — previous scrollTop causes auto-load of entire feed
     _momentsBootLock = true;
     scrollMomentsTop();
-    // Re-entering the tab: force upstream refresh if data is older than 20s so
-    // new friend posts show without a full page reload.
+    // Restore from memory/localStorage first so iPhone 6 never sees empty flash.
+    // Network refresh runs in background; new items are prepended, not full wipe.
+    ensureMomentsFromCache();
     var age = (Date.now()/1000) - (momentsUpdatedAt || 0);
-    loadMoments(age > 20 || !momentsCache.length);
+    loadMoments(true); // always soft-force upstream, but UI already painted
     startMomentsPoll();
     // release lock after first paint settles (prevents near-bottom cascade)
-    setTimeout(function(){ _momentsBootLock = false; scrollMomentsTop(); }, 220);
+    setTimeout(function(){ _momentsBootLock = false; scrollMomentsTop(); }, 280);
   } else {
     stopMomentsPoll();
     if(name !== 'friends') hideProgress(0);
@@ -2259,13 +2260,13 @@ function refreshMomentsNow(){
     if(icon) icon.classList.remove('icon-spin');
     if(!d.ok){ toast(d.error||'Không làm mới được Moments'); return; }
     var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
-    momentsCache=items;
-    momentsUpdatedAt=d.updated_at||(Date.now()/1000);
-    writeMomentsLocal(items, momentsUpdatedAt);
+    if(!items.length && momentsCache.length){
+      toast('Không có Moments mới');
+      return;
+    }
     hideNewMomentsPill();
     scrollMomentsTop();
-    renderMomentsUI(items);
-    prefetchMomentImages(items, PREFETCH_COUNT);
+    applyMomentsNetworkResult(items, d.updated_at, false);
   }).catch(function(){
     if(icon) icon.classList.remove('icon-spin');
     toast('Lỗi mạng khi làm mới Moments');
@@ -2412,9 +2413,8 @@ function readMomentsLocal(){
   }catch(e){return null}
 }
 function writeMomentsLocal(moments, updatedAt){
-  try{
-    // store lean copy — cap size hard on weak devices
-    const lean=(moments||[]).slice(0, LOCAL_MOMENTS_CAP).map(function(m){
+  function leanMap(list, cap){
+    return (list||[]).slice(0, cap).map(function(m){
       return {
         user:m.user, user_id:m.user_id, thumbnail_url:m.thumbnail_url, url:m.url, video_url:m.video_url,
         date:m.date, timestamp:m.timestamp, created_at:m.created_at, caption:m.caption, overlays:m.overlays,
@@ -2422,8 +2422,21 @@ function writeMomentsLocal(moments, updatedAt){
         from_celebrity:m.from_celebrity
       };
     });
-    localStorage.setItem(MOMENTS_LS_KEY, JSON.stringify({moments:lean, updated_at:updatedAt||(Date.now()/1000), ts:Date.now()}));
-  }catch(e){ console.warn('moments local cache full', e); }
+  }
+  var caps = [LOCAL_MOMENTS_CAP, 24, 12, 6];
+  for(var i=0;i<caps.length;i++){
+    try{
+      localStorage.setItem(MOMENTS_LS_KEY, JSON.stringify({
+        moments: leanMap(moments, caps[i]),
+        updated_at: updatedAt||(Date.now()/1000),
+        ts: Date.now()
+      }));
+      return;
+    }catch(e){
+      try{ localStorage.removeItem(MOMENTS_LS_KEY); }catch(e2){}
+    }
+  }
+  try{ console.warn('moments local cache unavailable'); }catch(e){}
 }
 function prefetchMomentImages(items, count){
   // Soft prefetch only a few URLs into the concurrency queue — never flood
@@ -2438,110 +2451,167 @@ function prefetchMomentImages(items, count){
     tmp.src = u;
   }
 }
-function loadMoments(force){
-  var local=readMomentsLocal();
-  var warm=local && (Date.now()-(local.ts||0)<MOMENTS_TTL_MS) && local.moments && local.moments.length;
-  // Soft path: paint cache immediately, refresh in background.
-  // Soft window shortened from 5 min → 20s so re-opening the tab pulls new posts.
-  if(!force && momentsCache.length){
-    renderMomentsUI(momentsCache);
-    if(Date.now()/1000 - momentsUpdatedAt < 20) return;
-    // stale soft cache — fall through to network (force upstream)
-    force = true;
-  }else if(!force && warm){
-    momentsCache=local.moments;
-    momentsUpdatedAt=local.updated_at||(local.ts/1000);
-    momentsLoaded=true;
-    renderMomentsUI(momentsCache);
-    prefetchMomentImages(momentsCache, PREFETCH_COUNT);
-    // Always force upstream on localStorage warm path so new posts arrive
-    api('/api/moments?force=1').then(function(d){
-      if(!d.ok) return;
-      var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
-      var prevLen = momentsCache.length;
-      var prevTop = momentsCache[0] && (momentsCache[0].thumbnail_url||momentsCache[0].url||'');
-      momentsCache=items;
-      momentsUpdatedAt=d.updated_at||(Date.now()/1000);
-      writeMomentsLocal(items, momentsUpdatedAt);
-      var top = items[0] && (items[0].thumbnail_url||items[0].url||'');
-      if($('page-moments')&&$('page-moments').classList.contains('active') &&
-         (items.length!==prevLen || top!==prevTop)){
-        renderMomentsUI(items);
-      }
-      prefetchMomentImages(items, PREFETCH_COUNT);
-    }).catch(function(){});
-    return;
-  }else if(!momentsCache.length){
-    $('momentsEmpty').classList.add('hidden');
-    showProgress('Đang tải Moments…', 0, 1);
-    const grid=$('momentsGrid'), feed=$('momentsFeed');
-    if(grid) grid.innerHTML=Array(IS_PHONE?3:6).fill('<div class="skeleton" style="width:100%;height:0;padding-bottom:100%;border-radius:14px"></div>').join('');
-    if(feed) feed.innerHTML='<div class="feed-skel"><div class="skeleton"></div><div class="skeleton" style="height:18px;width:60%;border-radius:8px;padding-bottom:0"></div></div>';
+/* Paint memory or localStorage without network. Never clears existing DOM if we have data. */
+function ensureMomentsFromCache(){
+  if(momentsCache && momentsCache.length){
+    // Already in memory — only re-paint if grid/feed is empty (tab was left and DOM wiped)
+    var grid=$('momentsGrid'), feed=$('momentsFeed');
+    var hasDom = (grid && grid.children.length) || (feed && feed.children.length);
+    if(!hasDom){
+      renderMomentsUI(momentsCache, true);
+      prefetchMomentImages(momentsCache, PREFETCH_COUNT);
+    }
+    return true;
   }
-  // Default to force when caller asked OR we fell through from stale memory cache
-  const q = (force ? '?force=1' : '?force=1');
-  api('/api/moments'+q).then(function(d){
-    if(!d.ok){
-      if(!momentsCache.length){
-        toast(d.error||'Không tải được moments');
-        $('momentsGrid').innerHTML='';
-        showMomentsEmpty(true);
-        hideProgress(0);
-      } else {
-        // keep showing old cache; soft notice
-        toast(d.error||'Không làm mới được Moments');
-      }
-      return;
-    }
-    const items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
-    momentsCache=items;
-    momentsUpdatedAt=d.updated_at||(Date.now()/1000);
-    momentsLoaded=true;
-    writeMomentsLocal(items, momentsUpdatedAt);
-    renderMomentsUI(items);
-    prefetchMomentImages(items, PREFETCH_COUNT);
-  }).catch(function(){
-    if(!momentsCache.length){
-      toast('Lỗi mạng khi tải moments');
-      $('momentsGrid').innerHTML='';
-      showMomentsEmpty(true);
-      hideProgress(0);
-    } else {
-      toast('Lỗi mạng — đang hiện Moments đã lưu');
-    }
-  });
-}
-function preloadMoments(){
   var local=readMomentsLocal();
   if(local && local.moments && local.moments.length){
     momentsCache=local.moments;
     momentsUpdatedAt=local.updated_at||(local.ts/1000)||0;
     momentsLoaded=true;
-    prefetchMomentImages(local.moments, PREFETCH_COUNT);
+    renderMomentsUI(momentsCache, true);
+    prefetchMomentImages(momentsCache, PREFETCH_COUNT);
+    return true;
   }
-  var need=!(local && (Date.now()-(local.ts||0)<MOMENTS_TTL_MS));
-  if(need || !local){
-    api('/api/moments').then(function(d){
+  return false;
+}
+
+var _momentsFetchInFlight = false;
+var _momentsFetchQueued = false;
+
+function applyMomentsNetworkResult(items, updatedAt, preferPrepend){
+  if(!items || !items.length){
+    // Empty network response must NEVER wipe a healthy local cache (binhake glitch / timeout)
+    if(momentsCache && momentsCache.length){
+      loggerSoft('Moments network returned empty — keeping local cache of ' + momentsCache.length);
+      return;
+    }
+    showMomentsEmpty(false);
+    hideProgress(0);
+    return;
+  }
+  var prevTop = momentsCache[0] && momentKey(momentsCache[0]);
+  var newTop = items[0] && momentKey(items[0]);
+  var hadCache = momentsCache && momentsCache.length > 0;
+  momentsCache = items;
+  momentsUpdatedAt = updatedAt || (Date.now()/1000);
+  momentsLoaded = true;
+  writeMomentsLocal(items, momentsUpdatedAt);
+
+  var onMomentsPage = $('page-moments') && $('page-moments').classList.contains('active');
+  if(!onMomentsPage){
+    prefetchMomentImages(items, PREFETCH_COUNT);
+    return;
+  }
+
+  // Same top + same-ish length → skip full re-render (iPhone 6: avoid decode thrash)
+  if(hadCache && prevTop && prevTop === newTop && Math.abs((window._momentItems||[]).length - items.length) <= 2){
+    // Still update in-memory list for poll/count; leave painted nodes alone
+    window._momentItems = items;
+    prefetchMomentImages(items, PREFETCH_COUNT);
+    return;
+  }
+
+  if(preferPrepend && hadCache && prependNewMoments(items)){
+    prefetchMomentImages(items, PREFETCH_COUNT);
+    return;
+  }
+  // Full paint only when structure actually changed or first load
+  renderMomentsUI(items, true);
+  prefetchMomentImages(items, PREFETCH_COUNT);
+}
+
+function loggerSoft(msg){ try{ console.log('[moments]', msg); }catch(e){} }
+
+function loadMoments(force){
+  // 1) Always try to show something immediately
+  var painted = ensureMomentsFromCache();
+
+  // Skeleton ONLY when we truly have nothing
+  if(!painted && !(momentsCache && momentsCache.length)){
+    $('momentsEmpty').classList.add('hidden');
+    showProgress('Đang tải Moments…', 0, 1);
+    var grid=$('momentsGrid'), feed=$('momentsFeed');
+    if(grid && !grid.children.length){
+      grid.innerHTML=Array(IS_PHONE?2:4).fill('<div class="skeleton" style="width:100%;height:0;padding-bottom:100%;border-radius:14px"></div>').join('');
+    }
+    if(feed && !feed.children.length){
+      feed.innerHTML='<div class="feed-skel"><div class="skeleton"></div><div class="skeleton" style="height:18px;width:60%;border-radius:8px;padding-bottom:0"></div></div>';
+    }
+  }
+
+  // Soft memory is fresh (<25s) and caller didn't force → skip network
+  if(!force && momentsCache.length && (Date.now()/1000 - (momentsUpdatedAt||0)) < 25){
+    return;
+  }
+
+  // Single-flight: don't stack parallel force fetches on slow iPhone 6
+  if(_momentsFetchInFlight){
+    _momentsFetchQueued = true;
+    return;
+  }
+  _momentsFetchInFlight = true;
+
+  var q = '?force=1';
+  api('/api/moments'+q).then(function(d){
+    _momentsFetchInFlight = false;
+    var queued = _momentsFetchQueued;
+    _momentsFetchQueued = false;
+    if(!d.ok){
+      if(!momentsCache.length){
+        toast(d.error||'Không tải được moments');
+        showMomentsEmpty(true);
+        hideProgress(0);
+      } else {
+        // Keep old UI — never clear
+        toast(d.error||'Không làm mới được Moments');
+      }
+      if(queued) loadMoments(true);
+      return;
+    }
+    var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
+    applyMomentsNetworkResult(items, d.updated_at, true);
+    if(queued) loadMoments(true);
+  }).catch(function(){
+    _momentsFetchInFlight = false;
+    var queued = _momentsFetchQueued;
+    _momentsFetchQueued = false;
+    if(!momentsCache.length){
+      toast('Lỗi mạng khi tải moments');
+      showMomentsEmpty(true);
+      hideProgress(0);
+    } else {
+      toast('Lỗi mạng — đang hiện Moments đã lưu');
+    }
+    if(queued) setTimeout(function(){ loadMoments(true); }, 1200);
+  });
+}
+function preloadMoments(){
+  ensureMomentsFromCache();
+  var local=readMomentsLocal();
+  var need=!(local && (Date.now()-(local.ts||0)<MOMENTS_TTL_MS) && local.moments && local.moments.length);
+  var run = function(){
+    if(_momentsFetchInFlight) return;
+    api('/api/moments?force=1').then(function(d){
       if(!d.ok) return;
       var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
-      momentsCache=items;
-      momentsUpdatedAt=d.updated_at||(Date.now()/1000);
-      momentsLoaded=true;
-      writeMomentsLocal(items, momentsUpdatedAt);
-      prefetchMomentImages(items, PREFETCH_COUNT);
-    }).catch(function(){});
-  }else{
-    // warm: silent refresh after UI settles
-    setTimeout(function(){
-      api('/api/moments').then(function(d){
-        if(!d.ok) return;
-        var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
-        momentsCache=items;
+      // Silent: only update memory/localStorage; do not force full UI re-render unless on page
+      if(!items.length && momentsCache.length) return;
+      momentsCache=items.length ? items : momentsCache;
+      if(items.length){
         momentsUpdatedAt=d.updated_at||(Date.now()/1000);
+        momentsLoaded=true;
         writeMomentsLocal(items, momentsUpdatedAt);
         prefetchMomentImages(items, PREFETCH_COUNT);
-      }).catch(function(){});
-    }, 3500);
+        if($('page-moments') && $('page-moments').classList.contains('active')){
+          applyMomentsNetworkResult(items, momentsUpdatedAt, true);
+        }
+      }
+    }).catch(function(){});
+  };
+  if(need || !local){
+    run();
+  }else{
+    setTimeout(run, 2800);
   }
 }
 function pollMomentsOnce(){
@@ -2549,6 +2619,7 @@ function pollMomentsOnce(){
     if(!d.ok||!d.changed)return;
     const items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
     if(!items.length)return;
+    // Never accept empty wipe from poll
     momentsCache=items;
     momentsUpdatedAt=d.updated_at||momentsUpdatedAt;
     try{ writeMomentsLocal(items, momentsUpdatedAt); }catch(e){}
@@ -2961,7 +3032,9 @@ async function postJob(job){
     const d=await api('/api/upload',{method:'POST',body:fd});
     if(d&&d.ok){
       await qDel(job.id);
-      momentsLoaded=false; momentsCache=[]; momentsUpdatedAt=0;
+      // Do NOT wipe momentsCache — mark stale so next open merges, old posts stay visible
+      momentsUpdatedAt=0;
+      momentsLoaded=false;
       await renderQueue();
       return true;
     }
@@ -3051,7 +3124,7 @@ function doUpload(){
     fd.append('file',croppedBlob,filename);
     fd.append('caption',cap);
     api('/api/upload',{method:'POST',body:fd}).then(d=>{
-      if(d.ok){ finishOk(); momentsLoaded=false;momentsCache=[];momentsUpdatedAt=0; }
+      if(d.ok){ finishOk(); momentsLoaded=false; momentsUpdatedAt=0; /* keep momentsCache — avoid empty flash on iPhone 6 */ }
       else finishFail(d.error||'Đăng thất bại');
     }).catch(()=>finishFail('Lỗi mạng khi đăng'));
   };
@@ -3100,13 +3173,13 @@ document.addEventListener('visibilitychange',()=>{
     if(!ml || Date.now()-(ml.ts||0)>MOMENTS_TTL_MS) preloadMoments();
     const momentsActive = $('page-moments') && $('page-moments').classList.contains('active');
     if(momentsActive){
-      if(gap > 20000 || $('momentsGrid').children.length===0){
-        const fallback=(readMomentsLocal()||{moments:[]}).moments;
-        renderMomentsUI(momentsCache.length ? momentsCache : fallback);
+      ensureMomentsFromCache();
+      if(gap > 15000 || !($('momentsGrid') && $('momentsGrid').children.length)){
         loadMoments(true);
         bindMomentsScroll();
+      } else {
+        pollMomentsOnce();
       }
-      pollMomentsOnce();
     }
     if($('page-upload').classList.contains('active') && isLiveCamera() && !croppedBlob && !lcStream){
       startLiveCamera();
@@ -3120,10 +3193,11 @@ window.addEventListener('pageshow', function(e){
   if(e.persisted){
     const momentsActive = $('page-moments') && $('page-moments').classList.contains('active');
     if(momentsActive){
-      const fallback=(readMomentsLocal()||{moments:[]}).moments;
-      renderMomentsUI(momentsCache.length ? momentsCache : fallback);
+      ensureMomentsFromCache();
       loadMoments(true);
       bindMomentsScroll();
+    } else {
+      ensureMomentsFromCache();
     }
   }
 });
@@ -3461,12 +3535,12 @@ def api_upload():
         else:
             data, filename = compress_image(raw)
             result, _dbg = upload_media(s, data, filename, "image/jpeg", caption=caption)
-        # Invalidate moments cache so next open picks up the new post
+        # Mark cache stale but KEEP items — client paints old posts while force-fetch merges new one
         with _MOMENTS_LOCK:
             st = _MOMENTS_CACHE.get(s.local_id)
             if st:
-                st["bootstrapped"] = False
                 st["last_fetch_at"] = 0
+                # bootstrapped stays True so soft path can still serve until force merge
         return jsonify({"ok": True, "result": result})
     except requests.HTTPError as e:
         logger.error("UPLOAD http error: %s", e)
