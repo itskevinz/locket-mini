@@ -2440,47 +2440,29 @@ function prefetchMomentImages(items, count){
 }
 function loadMoments(force){
   var local=readMomentsLocal();
-  var warm=local && (Date.now()-(local.ts||0)<MOMENTS_TTL_MS) && local.moments && local.moments.length;
-  // Soft path: paint cache immediately, refresh in background.
-  // Soft window shortened from 5 min → 20s so re-opening the tab pulls new posts.
-  if(!force && momentsCache.length){
-    renderMomentsUI(momentsCache);
-    if(Date.now()/1000 - momentsUpdatedAt < 20) return;
-    // stale soft cache — fall through to network (force upstream)
-    force = true;
-  }else if(!force && warm){
+
+  if(!momentsCache.length && local && local.moments && local.moments.length){
     momentsCache=local.moments;
-    momentsUpdatedAt=local.updated_at||(local.ts/1000);
+    momentsUpdatedAt=local.updated_at||(local.ts/1000)||0;
     momentsLoaded=true;
+  }
+
+  var paintedFromCache=false;
+  if(momentsCache.length){
     renderMomentsUI(momentsCache);
     prefetchMomentImages(momentsCache, PREFETCH_COUNT);
-    // Always force upstream on localStorage warm path so new posts arrive
-    api('/api/moments?force=1').then(function(d){
-      if(!d.ok) return;
-      var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
-      var prevLen = momentsCache.length;
-      var prevTop = momentsCache[0] && (momentsCache[0].thumbnail_url||momentsCache[0].url||'');
-      momentsCache=items;
-      momentsUpdatedAt=d.updated_at||(Date.now()/1000);
-      writeMomentsLocal(items, momentsUpdatedAt);
-      var top = items[0] && (items[0].thumbnail_url||items[0].url||'');
-      if($('page-moments')&&$('page-moments').classList.contains('active') &&
-         (items.length!==prevLen || top!==prevTop)){
-        renderMomentsUI(items);
-      }
-      prefetchMomentImages(items, PREFETCH_COUNT);
-    }).catch(function(){});
-    return;
-  }else if(!momentsCache.length){
+    paintedFromCache=true;
+  }else{
     $('momentsEmpty').classList.add('hidden');
     showProgress('Đang tải Moments…', 0, 1);
     const grid=$('momentsGrid'), feed=$('momentsFeed');
     if(grid) grid.innerHTML=Array(IS_PHONE?3:6).fill('<div class="skeleton" style="width:100%;height:0;padding-bottom:100%;border-radius:14px"></div>').join('');
     if(feed) feed.innerHTML='<div class="feed-skel"><div class="skeleton"></div><div class="skeleton" style="height:18px;width:60%;border-radius:8px;padding-bottom:0"></div></div>';
   }
-  // Default to force when caller asked OR we fell through from stale memory cache
-  const q = (force ? '?force=1' : '?force=1');
-  api('/api/moments'+q).then(function(d){
+
+  if(!force && paintedFromCache && (Date.now()/1000 - momentsUpdatedAt < 20)) return;
+
+  api('/api/moments?force=1').then(function(d){
     if(!d.ok){
       if(!momentsCache.length){
         toast(d.error||'Không tải được moments');
@@ -2488,17 +2470,21 @@ function loadMoments(force){
         showMomentsEmpty(true);
         hideProgress(0);
       } else {
-        // keep showing old cache; soft notice
         toast(d.error||'Không làm mới được Moments');
       }
       return;
     }
     const items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
-    momentsCache=items;
+    const prevTop = paintedFromCache ? momentKey(momentsCache[0]) : null;
     momentsUpdatedAt=d.updated_at||(Date.now()/1000);
     momentsLoaded=true;
     writeMomentsLocal(items, momentsUpdatedAt);
-    renderMomentsUI(items);
+    if(!paintedFromCache){
+      renderMomentsUI(items);
+    }else if(momentKey(items[0])!==prevTop || items.length!==momentsCache.length){
+      if(!prependNewMoments(items)) renderMomentsUI(items);
+    }
+    momentsCache=items;
     prefetchMomentImages(items, PREFETCH_COUNT);
   }).catch(function(){
     if(!momentsCache.length){
