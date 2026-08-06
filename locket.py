@@ -595,7 +595,16 @@ def get_moments_ws(s: LocketSession, page_token=None, client_target="all", timeo
 
 
 def _moment_key(m: Dict[str, Any]) -> str:
-    return str(m.get("canonical_uid") or m.get("md5") or m.get("thumbnail_url") or id(m))
+    key = m.get("canonical_uid") or m.get("md5") or m.get("thumbnail_url") or m.get("url") or m.get("video_url")
+    if key:
+        return str(key)
+    # Last-resort deterministic fallback — never id(m): that's a per-process
+    # object id that changes on every WS fetch, so it can never match itself
+    # again and silently duplicates the moment on every merge/poll.
+    d = m.get("date") or {}
+    ts = (d.get("_seconds") if isinstance(d, dict) else None) or m.get("timestamp") or m.get("created_at") or ""
+    uid = m.get("user") if isinstance(m.get("user"), str) else (m.get("user") or {}).get("uid") or m.get("user_id") or ""
+    return f"{uid}:{ts}"
 
 
 def _merge_moments(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1159,6 +1168,10 @@ body{
 /* Square via padding-bottom — aspect-ratio unsupported on iOS 12 */
 .moment-card{position:relative;border-radius:14px;overflow:hidden;background:var(--surface);cursor:pointer;width:100%;height:0;padding-bottom:100%}
 .moment-card img,.moment-card video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover}
+.moment-video-badge{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:2;
+  width:34px;height:34px;border-radius:50%;background:rgba(0,0,0,.45);backdrop-filter:blur(2px);
+  display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px;pointer-events:none}
+.feed-slide .moment-video-badge{width:52px;height:52px;font-size:22px}
 .moment-overlay{position:absolute;top:0;left:0;width:100%;height:100%;background:linear-gradient(180deg,rgba(0,0,0,.4) 0%,transparent 30%,transparent 55%,rgba(0,0,0,.72) 100%);pointer-events:none}
 .moment-top{position:absolute;top:6px;left:6px;right:6px;z-index:3;display:flex;align-items:center;
   background:rgba(0,0,0,.55);border-radius:500px;padding:3px 8px 3px 3px;max-width:calc(100% - 12px)}
@@ -1171,6 +1184,8 @@ body{
   max-height:4.2em;overflow:hidden;display:inline-block;box-sizing:border-box}
 .moments-empty,.friends-empty{text-align:center;padding:50px 20px;color:var(--muted)}
 .moments-empty i,.friends-empty i{opacity:.5;margin-bottom:10px;display:inline-block}
+.moments-empty-retry{margin-top:14px;padding:8px 20px;border-radius:20px;border:1px solid var(--border);
+  background:var(--surface);color:var(--text);font-size:13px;font-weight:700;cursor:pointer}
 
 /* Mobile feed — iOS 12 safe (no aspect-ratio / no flex gap / no inset) */
 .moments-feed{display:none;overflow-y:auto;-webkit-overflow-scrolling:touch}
@@ -1555,8 +1570,9 @@ body{
     <div id="momentsMoreSentinel" style="height:1px"></div>
     <div id="momentsMore" class="moments-more hidden">Đang tải thêm…</div>
     <div class="moments-empty hidden" id="momentsEmpty">
-      <i class="bi bi-collection" style="font-size:44px"></i>
-      <div>Chưa có khoảnh khắc nào</div>
+      <i class="bi bi-collection" style="font-size:44px" id="momentsEmptyIcon"></i>
+      <div id="momentsEmptyText">Chưa có khoảnh khắc nào</div>
+      <button type="button" class="moments-empty-retry hidden" id="momentsEmptyRetry" onclick="loadMoments(true);return false;">Thử lại</button>
     </div>
   </div>
   <button type="button" class="moments-top-btn" id="momentsTopBtn" onclick="scrollMomentsTop();return false;" ontouchend="scrollMomentsTop();return false;" title="Moments mới nhất" aria-label="Lên đầu">
@@ -2048,6 +2064,7 @@ function buildMomentCard(m, idx, friendMap, eager){
   const cap=extractCaption(m);
   const t=(m.date&&m.date._seconds)||m.timestamp||m.created_at||0;
   const fullName=((displayProf.first_name||'')+' '+(displayProf.last_name||'')).trim()||displayProf.username||'?';
+  const isVid=!!m.video_url;
   const card=document.createElement('div');
   card.className='moment-card';
   card.setAttribute('data-idx', String(idx));
@@ -2055,6 +2072,7 @@ function buildMomentCard(m, idx, friendMap, eager){
   card.innerHTML=
     '<img src="'+TINY_PIXEL+'" data-real="'+esc(imgUrl)+'" alt="" style="background:#1a1a1a">'+
     '<div class="moment-overlay"></div>'+
+    (isVid?'<div class="moment-video-badge"><i class="bi bi-play-fill"></i></div>':'')+
     '<div class="moment-top">'+renderAvatar(displayProf,20)+'<span class="mname">'+esc(fullName)+'</span><span class="mtime" data-ts="'+t+'">'+timeAgo(t)+'</span></div>'+
     (cap?'<div class="moment-caption">'+esc(cap)+'</div>':'');
   var imgEl = card.querySelector('img');
@@ -2070,6 +2088,7 @@ function buildFeedSlide(m, idx, friendMap, eager){
   const cap=extractCaption(m);
   const t=(m.date&&m.date._seconds)||m.timestamp||m.created_at||0;
   const name=((displayProf.first_name||'')+' '+(displayProf.last_name||'')).trim()||displayProf.username||'?';
+  const isVid=!!m.video_url;
   const slide=document.createElement('div');
   slide.className='feed-slide';
   slide.setAttribute('data-idx', String(idx));
@@ -2077,6 +2096,7 @@ function buildFeedSlide(m, idx, friendMap, eager){
     '<div class="feed-card">'+
       '<img src="'+TINY_PIXEL+'" data-real="'+esc(imgUrl)+'" alt="" style="background:#1a1a1a">'+
       '<div class="moment-overlay"></div>'+
+      (isVid?'<div class="moment-video-badge"><i class="bi bi-play-fill"></i></div>':'')+
       (cap?'<div class="moment-caption">'+esc(cap)+'</div>':'')+
     '</div>'+
     '<div class="feed-meta">'+
@@ -2121,6 +2141,14 @@ function appendMomentsBatch(){
   // kick lazy load for newly painted nodes near viewport
   scheduleLazyLoad();
 }
+function showMomentsEmpty(isError){
+  var box=$('momentsEmpty'); if(!box) return;
+  box.classList.remove('hidden');
+  var icon=$('momentsEmptyIcon'), text=$('momentsEmptyText'), retry=$('momentsEmptyRetry');
+  if(icon) icon.className='bi '+(isError?'bi-wifi-off':'bi-collection');
+  if(text) text.textContent=isError?'Không tải được Moments':'Chưa có khoảnh khắc nào';
+  if(retry) retry.classList.toggle('hidden', !isError);
+}
 function renderMomentsUI(items, reset){
   const grid=$('momentsGrid'), feed=$('momentsFeed');
   window._momentItems=items;
@@ -2138,7 +2166,7 @@ function renderMomentsUI(items, reset){
       if(feed) feed.scrollTop = 0;
     }catch(e){}
   }
-  if(!items.length){$('momentsEmpty').classList.remove('hidden'); hideProgress(0); return}
+  if(!items.length){showMomentsEmpty(false); hideProgress(0); return}
   $('momentsEmpty').classList.add('hidden');
   showProgress('Moments 0/' + items.length, 0, items.length);
   // Paint ONLY the first batch on open — more loads when user scrolls
@@ -2449,7 +2477,7 @@ function loadMoments(force){
       if(!momentsCache.length){
         toast(d.error||'Không tải được moments');
         $('momentsGrid').innerHTML='';
-        $('momentsEmpty').classList.remove('hidden');
+        showMomentsEmpty(true);
         hideProgress(0);
       } else {
         // keep showing old cache; soft notice
@@ -2468,7 +2496,7 @@ function loadMoments(force){
     if(!momentsCache.length){
       toast('Lỗi mạng khi tải moments');
       $('momentsGrid').innerHTML='';
-      $('momentsEmpty').classList.remove('hidden');
+      showMomentsEmpty(true);
       hideProgress(0);
     } else {
       toast('Lỗi mạng — đang hiện Moments đã lưu');
@@ -2539,17 +2567,28 @@ function stopMomentsPoll(){
   if(momentsPollTimer){clearInterval(momentsPollTimer);momentsPollTimer=null}
   hideNewMomentsPill();
 }
+function viewerMediaError(el, msg){
+  try{
+    el.style.display='none';
+    if(!el.parentNode.querySelector('.viewer-error')){
+      el.insertAdjacentHTML('afterend',
+        '<div class="viewer-error moments-empty" style="position:static">'+
+        '<i class="bi bi-exclamation-triangle" style="font-size:36px"></i><div>'+esc(msg)+'</div></div>');
+    }
+  }catch(e){}
+}
 function openViewer(idx){
   const m=(window._momentItems||[])[idx]; if(!m)return;
   const v=$('viewerStage');
   const isVid=!!m.video_url;
   const raw=normalizeMediaUrl(m.video_url||m.thumbnail_url||m.url);
   const src=isVid?raw:mediaSrc(raw, 1080);
+  const poster=(isVid&&m.thumbnail_url)?mediaSrc(m.thumbnail_url,1080):'';
   const cap=extractCaption(m);
   v.innerHTML=`
     <div class="viewer-head"><button class="viewer-close" onclick="closeViewer()" aria-label="Đóng">✕</button></div>
-    ${isVid?`<video src="${esc(src)}" controls autoplay playsinline style="max-width:100%;max-height:100%;object-fit:contain"></video>`
-           :`<img src="${esc(src)}" alt="" style="max-width:100%;max-height:100%;object-fit:contain" onerror="this.style.opacity=0.4">`}
+    ${isVid?`<video src="${esc(src)}" ${poster?`poster="${esc(poster)}"`:''} controls autoplay playsinline style="max-width:100%;max-height:100%;object-fit:contain" onerror="viewerMediaError(this,'Không phát được video')"></video>`
+           :`<img src="${esc(src)}" alt="" style="max-width:100%;max-height:100%;object-fit:contain" onerror="viewerMediaError(this,'Không tải được ảnh')">`}
     ${cap?`<div class="viewer-caption">${esc(cap)}</div>`:''}
   `;
   v.classList.remove('hidden');
@@ -3304,6 +3343,7 @@ def api_moments_poll():
     if not s:
         return jsonify({"ok": False, "error": "Not logged in"})
     try:
+        s = ensure_fresh_token(s)
         since = float(request.args.get("since") or 0)
         items, updated = poll_new_moments(s, since=since)
         return jsonify({
