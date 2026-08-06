@@ -1094,12 +1094,13 @@ body{
   .app{max-width:640px}
   .moments-grid{grid-template-columns:repeat(4,1fr)}
 }
-.topbar{position:sticky;top:0;z-index:50;background:rgba(0,0,0,.94);
+.topbar{position:-webkit-sticky;position:sticky;top:0;z-index:50;background:rgba(0,0,0,.94);
   padding:calc(10px + env(safe-area-inset-top)) 16px 10px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border)}
-.topbar .brand{font-weight:800;font-size:16px;letter-spacing:.2px;display:flex;align-items:center;gap:8px}
-.topbar .brand img{width:22px;height:22px;border-radius:6px}
+.topbar .brand{font-weight:800;font-size:16px;letter-spacing:.2px;display:flex;align-items:center}
+.topbar .brand img{width:22px;height:22px;border-radius:6px;margin-right:8px}
 .pill{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:500px;padding:7px 14px;
-  font-size:13px;font-weight:700;display:inline-flex;align-items:center;gap:6px;cursor:pointer;transition:transform .15s}
+  font-size:13px;font-weight:700;display:inline-flex;align-items:center;cursor:pointer;transition:transform .15s}
+.pill > * + *{margin-left:6px}
 .pill:active{transform:scale(.95)}
 .page{padding:16px;display:none}
 .page.active{display:block;animation:fadeIn .25s ease both}
@@ -1124,15 +1125,16 @@ body{
 .login-hero p{color:var(--text2);margin:0;font-size:15px;font-weight:700;max-width:240px;margin:0 auto}
 
 /* ---------- Dash ---------- */
-.dash-head{display:flex;align-items:center;gap:14px;margin-bottom:18px}
-.dash-greet{flex:1;min-width:0}
+.dash-head{display:flex;align-items:center;margin-bottom:18px}
+.dash-greet{flex:1;min-width:0;margin-left:14px}
 .dash-greet .hi{font-size:13px;color:var(--text2);font-weight:700;margin:0 0 2px}
 .dash-greet .name{font-size:21px;font-weight:800;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .streak-card{display:flex;align-items:center;gap:12px;background:linear-gradient(135deg,rgba(255,184,0,.16),rgba(255,184,0,.04));
   border:1px solid rgba(255,184,0,.25)}
 .streak-num{font-size:30px;font-weight:800;color:var(--accent);line-height:1}
 .streak-label{font-size:12px;color:var(--text2);font-weight:700;text-transform:uppercase;letter-spacing:.5px}
-.quick-row{display:flex;gap:10px;margin-top:4px}
+.quick-row{display:flex;margin-top:4px}
+.quick-row > * + *{margin-left:10px}
 .quick-row .btn{padding:13px}
 
 /* ---------- Moments grid 2x3 ---------- */
@@ -1169,7 +1171,7 @@ body{
 .moment-card{position:relative;border-radius:14px;overflow:hidden;background:var(--surface);cursor:pointer;width:100%;height:0;padding-bottom:100%}
 .moment-card img,.moment-card video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover}
 .moment-video-badge{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:2;
-  width:34px;height:34px;border-radius:50%;background:rgba(0,0,0,.45);backdrop-filter:blur(2px);
+  width:34px;height:34px;border-radius:50%;background:rgba(0,0,0,.45);-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px);
   display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px;pointer-events:none}
 .feed-slide .moment-video-badge{width:52px;height:52px;font-size:22px}
 .moment-overlay{position:absolute;top:0;left:0;width:100%;height:100%;background:linear-gradient(180deg,rgba(0,0,0,.4) 0%,transparent 30%,transparent 55%,rgba(0,0,0,.72) 100%);pointer-events:none}
@@ -1348,7 +1350,8 @@ body{
 .lc-flash-btn.hidden{display:none}
 .lc-flash-overlay{position:absolute;top:0;left:0;right:0;bottom:0;background:#fff;opacity:0;pointer-events:none;z-index:4}
 .lc-flash-overlay.fire{opacity:.85;transition:opacity .12s ease-out}
-.lc-bar{display:flex;align-items:center;justify-content:center;gap:36px;padding:16px 10px 2px}
+.lc-bar{display:flex;align-items:center;justify-content:center;padding:16px 10px 2px}
+.lc-bar > * + *{margin-left:36px}
 .lc-side{width:46px;height:46px;border-radius:50%;background:var(--surface);border:1px solid var(--border);
   color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;-webkit-appearance:none;flex-shrink:0}
 .lc-side.spacer{visibility:hidden;pointer-events:none}
@@ -1428,8 +1431,8 @@ body{
 }
 
 /* Remember-me row */
-.remember-row{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;font-weight:700;color:var(--text2);cursor:pointer;user-select:none}
-.remember-row input{width:16px;height:16px;accent-color:var(--accent)}
+.remember-row{display:flex;align-items:center;margin-top:12px;font-size:13px;font-weight:700;color:var(--text2);cursor:pointer;user-select:none}
+.remember-row input{width:16px;height:16px;accent-color:var(--accent);margin-right:8px}
 </style>
 </head>
 <body>
@@ -1469,8 +1472,8 @@ body{
       </div>
     </div>
     <div class="card streak-card">
-      <div style="display:flex;align-items:center;gap:10px">
-        <i class="bi bi-fire" style="font-size:28px;color:#FFB800"></i>
+      <div style="display:flex;align-items:center">
+        <i class="bi bi-fire" style="font-size:28px;color:#FFB800;margin-right:10px"></i>
         <div>
           <div class="streak-num"><span id="streakNum">–</span></div>
           <div class="streak-label">Locket Streak</div>
@@ -3034,6 +3037,26 @@ function doUpload(){
     toast(msg||'Đăng thất bại');
   };
 
+  const directUpload=()=>{
+    // Videos skip the base64/IndexedDB queue entirely: atob()-ing a multi-MB
+    // video into memory is exactly the kind of allocation that kills the tab
+    // on an iPhone 6. Photos are already small (compressed before this point)
+    // so the offline queue stays safe for them.
+    const fd=new FormData();
+    fd.append('file',croppedBlob,filename);
+    fd.append('caption',cap);
+    api('/api/upload',{method:'POST',body:fd}).then(d=>{
+      if(d.ok){ finishOk(); momentsLoaded=false;momentsCache=[];momentsUpdatedAt=0; }
+      else finishFail(d.error||'Đăng thất bại');
+    }).catch(()=>finishFail('Lỗi mạng khi đăng'));
+  };
+
+  if(isVideo){
+    if(!navigator.onLine){ finishFail('Mất mạng — video không thể lưu offline, thử lại khi có mạng'); return; }
+    directUpload();
+    return;
+  }
+
   // Always enqueue for durability; if online, flush immediately in order
   enqueueUpload(croppedBlob, cap, filename, ct).then(job=>{
     if(!navigator.onLine){
@@ -3048,13 +3071,7 @@ function doUpload(){
     console.error(err);
     // fallback: try direct upload if queue failed (e.g. private mode no IDB)
     if(!navigator.onLine){ finishFail('Không lưu offline được trên trình duyệt này'); return; }
-    const fd=new FormData();
-    fd.append('file',croppedBlob,filename);
-    fd.append('caption',cap);
-    api('/api/upload',{method:'POST',body:fd}).then(d=>{
-      if(d.ok){ finishOk(); momentsLoaded=false;momentsCache=[];momentsUpdatedAt=0; }
-      else finishFail(d.error||'Đăng thất bại');
-    }).catch(()=>finishFail('Lỗi mạng khi đăng'));
+    directUpload();
   });
 }
 
