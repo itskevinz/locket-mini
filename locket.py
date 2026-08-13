@@ -1350,6 +1350,14 @@ body{
 .lc-flash-btn.hidden{display:none}
 .lc-flash-overlay{position:absolute;top:0;left:0;right:0;bottom:0;background:#fff;opacity:0;pointer-events:none;z-index:4}
 .lc-flash-overlay.fire{opacity:.85;transition:opacity .12s ease-out}
+.lc-zoom-row{position:absolute;left:0;right:0;bottom:10px;z-index:3;display:none;
+  align-items:center;justify-content:center;pointer-events:none}
+.lc-zoom-row.show{display:-webkit-box;display:-webkit-flex;display:flex}
+.lc-zoom-btn{pointer-events:auto;-webkit-appearance:none;border:none;cursor:pointer;
+  background:rgba(0,0,0,.45);color:#fff;font-size:12px;font-weight:800;
+  width:30px;height:30px;border-radius:50%;margin:0 4px;
+  display:flex;align-items:center;justify-content:center;transition:background .12s,color .12s,width .12s}
+.lc-zoom-btn.active{background:var(--accent);color:#111;width:34px;height:34px;font-size:12.5px}
 .lc-bar{display:flex;align-items:center;justify-content:center;padding:16px 10px 2px}
 .lc-bar > * + *{margin-left:36px}
 .lc-side{width:46px;height:46px;border-radius:50%;background:var(--surface);border:1px solid var(--border);
@@ -1538,6 +1546,7 @@ body{
         <div class="lc-hint hidden" id="lcHint"><span class="spinner light"></span><br>Đang mở camera…</div>
         <div class="lc-flash-overlay" id="lcFlashOverlay"></div>
         <button type="button" class="lc-flash-btn hidden" id="lcFlashBtn" onclick="toggleTorch(event)" aria-label="Đèn flash"><i class="bi bi-lightning-charge-fill"></i></button>
+        <div class="lc-zoom-row" id="lcZoomRow"></div>
       </div>
       <div class="lc-bar">
         <div class="lc-side spacer"></div>
@@ -2050,6 +2059,18 @@ let momentsRendered=0;
 var _momentsBootLock = false; // true while opening tab — block scroll-triggered append
 var _momentsHiddenAt = 0;
 function momentsBatchSize(){ return MOMENT_BATCH; }
+// The grid (desktop) and feed (phone) are mutually exclusive per the @media(max-width:520px)
+// breakpoint in the CSS — only one is ever visible. Previously both were always built for every
+// moment, silently doubling DOM nodes, image decodes and network requests on every device,
+// which is a big part of why Moments felt heavy on iPhone 6. IS_PHONE mirrors that same 520px
+// cutoff, so we now build only the node that will actually be shown.
+var MOMENTS_GRID_MODE = !IS_PHONE;
+function buildMomentNode(m, idx, friendMap, eager){
+  return MOMENTS_GRID_MODE ? buildMomentCard(m, idx, friendMap, eager) : buildFeedSlide(m, idx, friendMap, eager);
+}
+function momentsActiveContainer(){
+  return $(MOMENTS_GRID_MODE ? 'momentsGrid' : 'momentsFeed');
+}
 function momentKey(m){ return (m&&(m.thumbnail_url||m.url||m.video_url))||''; }
 function bindMomentsClickDelegation(){
   var grid=$('momentsGrid'), feed=$('momentsFeed');
@@ -2126,19 +2147,16 @@ function appendMomentsBatch(){
   }
   const friendMap={};
   if(friendsCache)friendsCache.forEach(function(f){ friendMap[f.uid]=f; });
-  const grid=$('momentsGrid'), feed=$('momentsFeed');
+  const target=momentsActiveContainer();
   const batch=momentsBatchSize();
   const end=Math.min(momentsRendered+batch, items.length);
-  var fragG = grid ? document.createDocumentFragment() : null;
-  var fragF = feed ? document.createDocumentFragment() : null;
+  var frag = target ? document.createDocumentFragment() : null;
   for(let idx=momentsRendered; idx<end; idx++){
     // first few: eager so newest shows immediately
     const eager = idx < (IS_PHONE ? 2 : 4);
-    if(fragG) fragG.appendChild(buildMomentCard(items[idx], idx, friendMap, eager));
-    if(fragF) fragF.appendChild(buildFeedSlide(items[idx], idx, friendMap, eager));
+    if(frag) frag.appendChild(buildMomentNode(items[idx], idx, friendMap, eager));
   }
-  if(grid && fragG) grid.appendChild(fragG);
-  if(feed && fragF) feed.appendChild(fragF);
+  if(target && frag) target.appendChild(frag);
   momentsRendered=end;
   showProgress('Moments ' + momentsRendered + '/' + items.length, momentsRendered, items.length);
   const more=$('momentsMore');
@@ -2213,20 +2231,17 @@ function prependNewMoments(freshItems){
   var newOnes=freshItems.slice(0, n);
   var friendMap={};
   if(friendsCache)friendsCache.forEach(function(f){ friendMap[f.uid]=f; });
-  var nodes=document.querySelectorAll('#momentsGrid [data-idx], #momentsFeed [data-idx]');
+  var target=momentsActiveContainer();
+  var nodes=target?target.querySelectorAll('[data-idx]'):[];
   for(var x=0;x<nodes.length;x++){
     var old=parseInt(nodes[x].getAttribute('data-idx'),10);
     nodes[x].setAttribute('data-idx', String(old+n));
   }
-  var grid=$('momentsGrid'), feed=$('momentsFeed');
-  var fragG=grid?document.createDocumentFragment():null;
-  var fragF=feed?document.createDocumentFragment():null;
+  var frag=target?document.createDocumentFragment():null;
   for(var idx=0; idx<n; idx++){
-    if(fragG) fragG.appendChild(buildMomentCard(newOnes[idx], idx, friendMap, true));
-    if(fragF) fragF.appendChild(buildFeedSlide(newOnes[idx], idx, friendMap, true));
+    if(frag) frag.appendChild(buildMomentNode(newOnes[idx], idx, friendMap, true));
   }
-  if(grid && fragG) grid.insertBefore(fragG, grid.firstChild);
-  if(feed && fragF) feed.insertBefore(fragF, feed.firstChild);
+  if(target && frag) target.insertBefore(frag, target.firstChild);
   window._momentItems=freshItems;
   momentsRendered+=n;
   scheduleLazyLoad();
@@ -2747,6 +2762,7 @@ function clearUpload(){
 
 /* ===================== Live camera (in-page, giống Locket gốc) ===================== */
 let lcStream=null, lcTrack=null, lcFacing='environment', lcTorchOn=false, lcWantActive=false, lcStarting=false;
+let lcZoomCaps=null, lcZoomCurrent=1, lcPinchStartDist=0, lcPinchStartZoom=1;
 
 function isLiveCamera(){
   try{ return localStorage.getItem('locket_live_camera')==='1'; }catch(e){ return false; }
@@ -2832,8 +2848,9 @@ function openCapture(){
 function stopLiveCamera(){
   lcWantActive=false;
   if(lcStream){ lcStream.getTracks().forEach(t=>t.stop()); lcStream=null; }
-  lcTrack=null; lcTorchOn=false;
+  lcTrack=null; lcTorchOn=false; lcZoomCaps=null; lcZoomCurrent=1;
   const fb=$('lcFlashBtn'); if(fb){ fb.classList.remove('on'); fb.classList.add('hidden'); }
+  const zr=$('lcZoomRow'); if(zr){ zr.classList.remove('show'); zr.innerHTML=''; }
   const v=$('lcVideo'); if(v) v.srcObject=null;
 }
 function startLiveCamera(){
@@ -2877,6 +2894,11 @@ function startLiveCamera(){
       const caps=lcTrack.getCapabilities && lcTrack.getCapabilities();
       const fb=$('lcFlashBtn');
       if(fb) fb.classList.toggle('hidden', !(caps && caps.torch));
+      // iPhone with fused back camera (11 Pro+) exposes one video device whose optical
+      // zoom range starts at 0.5 — WebKit initializes the stream AT that minimum instead
+      // of defaulting to 1x, which is the "camera opens at 0.5x" bug. Force it back to 1x
+      // and, when the lens truly supports multiple steps, show quick-tap pills + pinch zoom.
+      setupLcZoom(caps);
     }catch(e){}
   }).catch(err=>{
     lcStarting=false;
@@ -2898,6 +2920,69 @@ function toggleTorch(e){
   $('lcFlashBtn').classList.toggle('on', lcTorchOn);
   try{ lcTrack.applyConstraints({advanced:[{torch:lcTorchOn}]}); }catch(err){}
 }
+/* Reset the fused back camera to 1x and build a lens picker (0.5/1/2...) when the
+   track actually exposes an optical zoom range. Runs every time the stream (re)starts,
+   since flipping front/back gets a fresh track with its own capabilities. */
+function setupLcZoom(caps){
+  const row=$('lcZoomRow');
+  lcZoomCaps=null; lcZoomCurrent=1;
+  if(row){ row.classList.remove('show'); row.innerHTML=''; }
+  if(!caps || typeof caps.zoom!=='object' || caps.zoom===null) return;
+  const min=caps.zoom.min, max=caps.zoom.max, step=caps.zoom.step||0.1;
+  if(typeof min!=='number' || typeof max!=='number' || max<=min) return;
+  lcZoomCaps={min:min,max:max,step:step};
+  const target=Math.min(Math.max(1,min),max);
+  applyLcZoom(target, false);
+  // Only worth showing a picker when the lens actually spans below/above 1x
+  if(min>=1 && max<=1) return;
+  const levels=[];
+  if(min<1) levels.push(Number(min.toFixed(2)));
+  levels.push(1);
+  if(max>1) levels.push(max>=2 ? 2 : Number(max.toFixed(2)));
+  if(max>=3 && levels.indexOf(3)===-1) levels.push(3);
+  if(row){
+    row.innerHTML=levels.map(function(z){
+      var label=(z===Math.round(z))?z+'x':z+'x';
+      return '<button type="button" class="lc-zoom-btn'+(z===1?' active':'')+'" data-z="'+z+'" onclick="setLcZoom('+z+');return false;">'+label+'</button>';
+    }).join('');
+    row.classList.add('show');
+  }
+}
+function applyLcZoom(z, updateUI){
+  if(!lcTrack || !lcZoomCaps) return;
+  const clamped=Math.min(Math.max(z, lcZoomCaps.min), lcZoomCaps.max);
+  lcZoomCurrent=clamped;
+  try{ lcTrack.applyConstraints({advanced:[{zoom:clamped}]}); }catch(err){}
+  if(updateUI!==false){
+    const row=$('lcZoomRow');
+    if(row){
+      var btns=row.querySelectorAll('.lc-zoom-btn');
+      for(var i=0;i<btns.length;i++){
+        btns[i].classList.toggle('active', Math.abs(parseFloat(btns[i].getAttribute('data-z'))-clamped)<0.01);
+      }
+    }
+  }
+}
+function setLcZoom(z){ applyLcZoom(z, true); }
+/* Pinch-to-zoom on the live frame — two-finger distance ratio mapped onto the
+   lens's real zoom range. No-op (both handlers bail early) when the device only
+   has one lens, so it costs nothing on older phones. */
+function lcTouchDist(t){
+  var dx=t[0].clientX-t[1].clientX, dy=t[0].clientY-t[1].clientY;
+  return Math.sqrt(dx*dx+dy*dy);
+}
+function lcPinchStart(e){
+  if(!lcZoomCaps || !e.touches || e.touches.length!==2) return;
+  lcPinchStartDist=lcTouchDist(e.touches);
+  lcPinchStartZoom=lcZoomCurrent;
+}
+function lcPinchMove(e){
+  if(!lcZoomCaps || !e.touches || e.touches.length!==2 || !lcPinchStartDist) return;
+  e.preventDefault();
+  var ratio=lcTouchDist(e.touches)/lcPinchStartDist;
+  applyLcZoom(lcPinchStartZoom*ratio, true);
+}
+function lcPinchEnd(){ lcPinchStartDist=0; }
 function captureLivePhoto(e){
   if(e)e.preventDefault();
   const v=$('lcVideo');
@@ -3160,6 +3245,14 @@ loadMe();
 preloadFriends();
 preloadMoments();
 bindMomentsClickDelegation();
+(function bindLcPinchZoom(){
+  var frame=document.querySelector('#liveCam .lc-frame');
+  if(!frame) return;
+  frame.addEventListener('touchstart', lcPinchStart, {passive:true});
+  frame.addEventListener('touchmove', lcPinchMove, {passive:false});
+  frame.addEventListener('touchend', lcPinchEnd, {passive:true});
+  frame.addEventListener('touchcancel', lcPinchEnd, {passive:true});
+})();
 updateOnlineUI();
 renderQueue().then(()=>flushQueue());
 window.addEventListener('online',()=>{ updateOnlineUI(); toast('Đã có mạng — đang đăng hàng đợi'); flushQueue(); });
