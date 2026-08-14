@@ -1589,13 +1589,7 @@ body{
 }
 
 /* Exposure */
-.lc-exposure-col{position:absolute;top:54px;bottom:54px;right:8px;z-index:3;display:none;
-  align-items:center;pointer-events:none}
-.lc-exposure-col.show{display:-webkit-box;display:-webkit-flex;display:flex}
-.lc-exposure-col{flex-direction:column}
-.lc-exposure-col i{color:#fff;font-size:12px;opacity:.85;text-shadow:0 1px 3px rgba(0,0,0,.5)}
-.lc-exposure-range{pointer-events:auto;-webkit-appearance:none;appearance:none;
-  writing-mode:vertical-lr;direction:rtl;width:22px;flex:1;background:transparent;margin:6px 0}
+.lc-exposure-col{display:none !important} /* removed — unreliable + ugly on most browsers */
 
 /* Bottom bar — 3-column grid keeps shutter perfectly centered */
 .lc-bar{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:18px 16px 6px;gap:0}
@@ -3301,9 +3295,9 @@ function toggleTorch(e){
   $('lcFlashBtn').classList.toggle('on', lcTorchOn);
   try{ lcTrack.applyConstraints({advanced:[{torch:lcTorchOn}]}); }catch(err){}
 }
-/* Reset the fused back camera to 1x and build a lens picker (0.5/1/2...) when the
-   track actually exposes an optical zoom range. Runs every time the stream (re)starts,
-   since flipping front/back gets a fresh track with its own capabilities. */
+/* Zoom: browser zoom units = FOV relative to main lens on most Android Chrome builds
+   (0.5 ultrawide, 1.0 main, 2.0 tele). We ALWAYS snap open to main (1.0) and verify
+   via getSettings() — otherwise the stream stays on ultrawide while UI says "1x". */
 function setupLcZoom(caps){
   const row=$('lcZoomRow');
   lcZoomCaps=null; lcZoomCurrent=1;
@@ -3311,67 +3305,101 @@ function setupLcZoom(caps){
   if(!caps || typeof caps.zoom!=='object' || caps.zoom===null) return;
   const min=caps.zoom.min, max=caps.zoom.max, step=caps.zoom.step||0.1;
   if(typeof min!=='number' || typeof max!=='number' || max<=min) return;
+  // Front camera zoom is usually digital-only and misleading — skip picker
+  if(lcFacing==='user') return;
+
   lcZoomCaps={min:min,max:max,step:step};
-  const target=Math.min(Math.max(1,min),max);
-  applyLcZoom(target, false);
-  // Only worth showing a picker when the lens actually spans below/above 1x
-  if(min>=1 && max<=1) return;
-  const levels=[];
-  if(min<1) levels.push(Number(min.toFixed(2)));
-  levels.push(1);
-  if(max>1) levels.push(max>=2 ? 2 : Number(max.toFixed(2)));
-  if(max>=3 && levels.indexOf(3)===-1) levels.push(3);
-  if(row){
-    row.innerHTML=levels.map(function(z){
-      var label=(z===Math.round(z))?z+'x':z+'x';
-      return '<button type="button" class="lc-zoom-btn'+(z===1?' active':'')+'" data-z="'+z+'" onclick="setLcZoom('+z+');return false;">'+label+'</button>';
+
+  // Main lens = zoom 1.0 when in range; else device default mid/min
+  var main = (min <= 1 && max >= 1) ? 1 : (min <= 1.0 ? Math.min(max, Math.max(min, 1)) : min);
+
+  // Discrete levels that match native Camera labels
+  var levels=[];
+  function addLevel(z){
+    z = Math.min(max, Math.max(min, z));
+    // snap to step grid lightly
+    if(step > 0) z = Math.round(z / step) * step;
+    z = Number(z.toFixed(2));
+    if(levels.indexOf(z) === -1) levels.push(z);
+  }
+  if(min < 0.95) addLevel(min);          // ultrawide (0.5x)
+  addLevel(main);                         // main (1x)
+  if(max >= 1.8) addLevel(Math.min(max, 2));
+  if(max >= 2.8) addLevel(Math.min(max, 3));
+
+  if(row && levels.length >= 2){
+    row.innerHTML = levels.map(function(z){
+      var label;
+      if(Math.abs(z - main) < 0.05) label = '1x';
+      else if(z < main) label = (Math.round((z / main) * 10) / 10) + 'x';
+      else label = (Math.abs(z - Math.round(z)) < 0.05 ? Math.round(z) : z) + 'x';
+      // For ultrawide show 0.5x not 0.5 when main is 1
+      if(z < main && min < 0.95 && Math.abs(z - min) < 0.08) label = '0.5x';
+      return '<button type="button" class="lc-zoom-btn" data-z="'+z+'" onclick="setLcZoom('+z+');return false;">'+label+'</button>';
     }).join('');
     row.classList.add('show');
   }
+
+  // Force main lens, then re-read actual zoom (apply can fail silently)
+  applyLcZoom(main, true);
+  setTimeout(function(){ syncLcZoomFromTrack(); }, 120);
+  setTimeout(function(){ syncLcZoomFromTrack(); }, 400);
+}
+function syncLcZoomFromTrack(){
+  if(!lcTrack || !lcTrack.getSettings) return;
+  try{
+    var st = lcTrack.getSettings();
+    if(typeof st.zoom === 'number'){
+      lcZoomCurrent = st.zoom;
+      updateLcZoomButtons(st.zoom);
+    }
+  }catch(e){}
+}
+function updateLcZoomButtons(actual){
+  const row=$('lcZoomRow');
+  if(!row) return;
+  var btns=row.querySelectorAll('.lc-zoom-btn');
+  var best=-1, bestDist=1e9;
+  for(var i=0;i<btns.length;i++){
+    var z=parseFloat(btns[i].getAttribute('data-z'));
+    var d=Math.abs(z-actual);
+    if(d<bestDist){ bestDist=d; best=i; }
+  }
+  for(var j=0;j<btns.length;j++) btns[j].classList.toggle('active', j===best);
 }
 function applyLcZoom(z, updateUI){
   if(!lcTrack || !lcZoomCaps) return;
-  const clamped=Math.min(Math.max(z, lcZoomCaps.min), lcZoomCaps.max);
+  const clamped=Math.min(Math.max(Number(z), lcZoomCaps.min), lcZoomCaps.max);
   lcZoomCurrent=clamped;
-  try{ lcTrack.applyConstraints({advanced:[{zoom:clamped}]}); }catch(err){}
-  if(updateUI!==false){
-    const row=$('lcZoomRow');
-    if(row){
-      var btns=row.querySelectorAll('.lc-zoom-btn');
-      for(var i=0;i<btns.length;i++){
-        btns[i].classList.toggle('active', Math.abs(parseFloat(btns[i].getAttribute('data-z'))-clamped)<0.01);
-      }
+  // Prefer plain constraint (Chrome); fall back to advanced (older)
+  var applied=false;
+  try{
+    var p = lcTrack.applyConstraints({ zoom: clamped });
+    if(p && p.then){
+      p.then(function(){ applied=true; syncLcZoomFromTrack(); })
+       .catch(function(){
+         lcTrack.applyConstraints({ advanced: [{ zoom: clamped }] })
+           .then(function(){ syncLcZoomFromTrack(); })
+           .catch(function(){ syncLcZoomFromTrack(); });
+       });
+    } else {
+      applied=true;
     }
+  }catch(err){
+    try{ lcTrack.applyConstraints({ advanced: [{ zoom: clamped }] }); }catch(e2){}
   }
+  if(updateUI!==false) updateLcZoomButtons(clamped);
+  // Verify after hardware settles
+  setTimeout(function(){ syncLcZoomFromTrack(); }, 180);
 }
 function setLcZoom(z){ applyLcZoom(z, true); }
-/* Exposure/brightness — mirrors the sun-icon control in the native Camera app.
-   Only shown when the track truly exposes exposureCompensation (most browsers) or the
-   older `brightness` capability. Neither is implemented by WebKit today, so this stays
-   hidden on iOS — better than showing a slider that silently does nothing. */
 function setupLcExposure(caps){
-  const col=$('lcExposureCol'), range=$('lcExposureRange');
+  // Intentionally disabled — vertical range control looked broken and rarely worked on iOS/WebKit.
   lcExposureCaps=null;
+  var col=$('lcExposureCol');
   if(col) col.classList.remove('show');
-  if(!caps) return;
-  var key = (caps.exposureCompensation && typeof caps.exposureCompensation==='object') ? 'exposureCompensation'
-          : (caps.brightness && typeof caps.brightness==='object') ? 'brightness' : null;
-  if(!key) return;
-  var c=caps[key];
-  if(typeof c.min!=='number' || typeof c.max!=='number' || c.max<=c.min) return;
-  var step=c.step || ((c.max-c.min)/100);
-  lcExposureCaps={key:key, min:c.min, max:c.max};
-  if(range){
-    range.min=c.min; range.max=c.max; range.step=step;
-    range.value=(c.min+c.max)/2;
-  }
-  if(col) col.classList.add('show');
 }
-function onLcExposureInput(v){
-  if(!lcTrack || !lcExposureCaps) return;
-  var c={}; c[lcExposureCaps.key]=parseFloat(v);
-  try{ lcTrack.applyConstraints({advanced:[c]}); }catch(e){}
-}
+function onLcExposureInput(v){ /* no-op */ }
 /* Tap-to-focus — shows the same focus square/pulse as a native camera app on every tap,
    and additionally nudges the real focus point when the browser exposes that control
    (mainly Chrome/Android; WebKit doesn't support it, so on iPhone this is visual-only,
@@ -3490,25 +3518,19 @@ function finishLiveStill(blob){
   $('previewBox').classList.remove('hidden');
 }
 function canvasCaptureFromVideo(v){
+  /* Crop the SAME region object-fit:cover shows in the square frame — WYSIWYG.
+     Square frame + cover ⇒ center crop of the shorter video axis. */
   var vw=v.videoWidth, vh=v.videoHeight;
   if(!vw || !vh) return null;
   var size=Math.min(vw,vh);
   var sx=(vw-size)/2, sy=(vh-size)/2;
-  // Capture at source resolution then downscale once — sharper than drawing straight to 1080
-  var srcCanvas=document.createElement('canvas');
-  srcCanvas.width=size; srcCanvas.height=size;
-  var sctx=srcCanvas.getContext('2d');
-  if(lcFacing==='user'){ sctx.translate(size,0); sctx.scale(-1,1); }
-  sctx.imageSmoothingEnabled=true;
-  try{ sctx.imageSmoothingQuality='high'; }catch(e){}
-  sctx.drawImage(v, sx, sy, size, size, 0, 0, size, size);
-
   var out=document.createElement('canvas');
   out.width=1080; out.height=1080;
-  var octx=out.getContext('2d');
-  octx.imageSmoothingEnabled=true;
-  try{ octx.imageSmoothingQuality='high'; }catch(e){}
-  octx.drawImage(srcCanvas, 0, 0, 1080, 1080);
+  var ctx=out.getContext('2d');
+  if(lcFacing==='user'){ ctx.translate(1080,0); ctx.scale(-1,1); }
+  ctx.imageSmoothingEnabled=true;
+  try{ ctx.imageSmoothingQuality='high'; }catch(e){}
+  ctx.drawImage(v, sx, sy, size, size, 0, 0, 1080, 1080);
   return out;
 }
 function captureLivePhoto(e){
@@ -3519,7 +3541,6 @@ function captureLivePhoto(e){
   const overlay=$('lcFlashOverlay');
   if(overlay){ overlay.classList.add('fire'); setTimeout(function(){ overlay.classList.remove('fire'); },120); }
 
-  // Nudge single-shot AF when the browser exposes it (mostly Android/Chrome)
   if(lcTrack && lcTrack.applyConstraints){
     try{
       lcTrack.applyConstraints({ advanced: [{ focusMode: 'single-shot' }] }).catch(function(){
@@ -3528,17 +3549,18 @@ function captureLivePhoto(e){
     }catch(e){}
   }
 
-  var settleMs = 220; // slightly longer than before so AF can settle
+  // Always capture from the live video element so the photo matches what the user sees.
+  // ImageCapture.takePhoto() often returns a different FOV/lens than the preview track
+  // (especially with multi-cam zoom), which caused "preview one way, photo another".
+  var settleMs = 160;
   setTimeout(function(){
-    // Path A: ImageCapture.takePhoto — full still pipeline (best sharpness when supported)
-    if(window.ImageCapture && lcTrack){
-      try{
-        var ic = new ImageCapture(lcTrack);
-        if(ic.takePhoto){
-          ic.takePhoto().then(function(blob){
-            if(!blob){ fallbackCanvas(); return; }
-            // Crop center-square to 1080 JPEG
-            createImageBitmap(blob).then(function(bmp){
+    try{
+      // Prefer grabFrame when available — same track frames as preview, full res
+      if(window.ImageCapture && lcTrack){
+        try{
+          var ic = new ImageCapture(lcTrack);
+          if(ic.grabFrame){
+            ic.grabFrame().then(function(bmp){
               var side=Math.min(bmp.width, bmp.height);
               var sx=(bmp.width-side)/2, sy=(bmp.height-side)/2;
               var c=document.createElement('canvas');
@@ -3549,17 +3571,20 @@ function captureLivePhoto(e){
               if(lcFacing==='user'){ ctx.translate(1080,0); ctx.scale(-1,1); }
               ctx.drawImage(bmp, sx, sy, side, side, 0, 0, 1080, 1080);
               try{ bmp.close(); }catch(e){}
-              c.toBlob(function(b){ finishLiveStill(b || blob); }, 'image/jpeg', 0.93);
-            }).catch(function(){ fallbackCanvas(); });
-          }).catch(function(){ fallbackCanvas(); });
-          return;
-        }
-      }catch(e){}
+              c.toBlob(function(b){ finishLiveStill(b); }, 'image/jpeg', 0.93);
+            }).catch(function(){ fromVideoEl(); });
+            return;
+          }
+        }catch(e){}
+      }
+      fromVideoEl();
+    }catch(err){
+      btn.disabled=false;
+      toast('Không chụp được ảnh');
     }
-    fallbackCanvas();
   }, settleMs);
 
-  function fallbackCanvas(){
+  function fromVideoEl(){
     try{
       var canvas=canvasCaptureFromVideo(v);
       if(!canvas){ btn.disabled=false; toast('Camera chưa sẵn sàng'); return; }
