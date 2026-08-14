@@ -955,12 +955,36 @@ _img_cache: Dict[Tuple[str, int], Tuple[float, bytes, str]] = {}
 _IMG_CACHE_TTL = 900
 _IMG_CACHE_MAX = 160
 
+def _client_needs_jpeg(request) -> bool:
+    """Detect browsers that cannot decode WebP (mainly Safari < 14 / iOS < 14)."""
+    ua = (request.headers.get("User-Agent") or "").lower()
+    accept = (request.headers.get("Accept") or "").lower()
+    if "image/webp" in accept:
+        return False
+    if "safari/" in ua and "chrome/" not in ua and "crios/" not in ua:
+        import re
+        m = re.search(r"version/(\d+)", ua)
+        if m and int(m.group(1)) >= 14:
+            return False
+        return True
+    if "iphone os " in ua:
+        import re
+        m = re.search(r"iphone os (\d+)_", ua)
+        if m and int(m.group(1)) >= 14:
+            return False
+        return True
+    if "chrome/" in ua or "crios/" in ua or "firefox/" in ua or "edg/" in ua:
+        return False
+    return True
 
-def fetch_image_as_jpeg(url: str, max_side: int = 720, timeout: int = 15) -> Tuple[bytes, str]:
-    """Download remote media and re-encode as JPEG so iOS 12 Safari (no WebP) can show it.
-    max_side controls resize — use 480 for feed thumbs, 1080 for viewer."""
+
+def fetch_image_as_jpeg(url: str, max_side: int = 720, timeout: int = 15, force_convert: bool = False) -> Tuple[bytes, str]:
+    """Download remote media. Smart convert: only re-encode to JPEG when the
+    browser cannot display the original format (WebP on old Safari) or when
+    resize is needed. Otherwise pass through untouched — saves CPU, bandwidth,
+    and preserves original quality."""
     max_side = max(64, min(int(max_side or 720), 1280))
-    cache_key = (url, max_side)
+    cache_key = (url, max_side, force_convert)
     now = time.time()
     hit = _img_cache.get(cache_key)
     if hit and now - hit[0] < _IMG_CACHE_TTL:
@@ -979,52 +1003,55 @@ def fetch_image_as_jpeg(url: str, max_side: int = 720, timeout: int = 15) -> Tup
     if ctype.startswith("video/"):
         raise LocketError("video not proxyable as image")
 
-    # Fast path: already JPEG/PNG under size budget — skip re-encode when possible
     is_jpeg = ctype in ("image/jpeg", "image/jpg") or url.lower().endswith((".jpg", ".jpeg"))
+    is_png = ctype == "image/png" or url.lower().endswith(".png")
+    is_webp = ctype == "image/webp" or url.lower().endswith(".webp")
+
+    # Fast path: no resize needed AND format is already JPEG/PNG AND no force → pass through
+    if not force_convert and not is_webp:
+        try:
+            img = Image.open(io.BytesIO(raw))
+            w0, h0 = img.size
+            needs_resize = max(w0, h0) > max_side
+            if not needs_resize:
+                _img_cache[cache_key] = (now, raw, ctype)
+                return raw, ctype
+        except Exception:
+            pass
+
+    # Decode and optionally resize + convert
     try:
         img = Image.open(io.BytesIO(raw))
-        # Header-only at this point (no decode yet) — size/mode/format are cheap for JPEG.
         if getattr(img, "is_animated", False):
             img.seek(0)
         w0, h0 = img.size
         needs_resize = max(w0, h0) > max_side
-        needs_convert = img.mode not in ("RGB",) or not is_jpeg or ctype == "image/webp" or url.lower().endswith(".webp")
 
-        if not needs_resize and is_jpeg and img.mode == "RGB":
-            data, out_mime = raw, "image/jpeg"
-        else:
-            # JPEG draft decode: ask libjpeg to decode at a reduced DCT scale close to the
-            # target instead of full resolution — this is the dominant cost for big source
-            # photos, and skipping it is the single biggest win for slow/old devices.
-            if needs_resize and img.format == "JPEG":
-                try:
-                    img.draft("RGB", (max_side, max_side))
-                except Exception:
-                    pass
-            img.load()
-            if img.mode in ("RGBA", "LA", "P"):
-                bg = Image.new("RGB", img.size, (0, 0, 0))
-                rgba = img.convert("RGBA")
-                bg.paste(rgba, mask=rgba.split()[-1])
-                img = bg
-            elif img.mode != "RGB":
-                img = img.convert("RGB")
-            if needs_resize:
-                w, h = img.size
-                if max(w, h) > max_side:
-                    # Draft already did most of the shrinking (to within ~2x of target), so a
-                    # LANCZOS pass here is nearly as cheap as BILINEAR was on the full image,
-                    # and sharper. Plain LANCZOS (no reducing_gap) — full quality, no softening.
-                    if w >= h:
-                        img = img.resize((max_side, max(1, int(h * max_side / w))), Image.LANCZOS)
-                    else:
-                        img = img.resize((max(1, int(w * max_side / h)), max_side), Image.LANCZOS)
-            # thumbs: lower quality + no optimize (optimize is slow) — iPhone 6 friendly
-            quality = 65 if max_side <= 400 else (72 if max_side <= 540 else (78 if max_side <= 800 else 85))
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=quality, optimize=False)
-            data = buf.getvalue()
-            out_mime = "image/jpeg"
+        if needs_resize and img.format == "JPEG":
+            try:
+                img.draft("RGB", (max_side, max_side))
+            except Exception:
+                pass
+        img.load()
+        if img.mode in ("RGBA", "LA", "P"):
+            bg = Image.new("RGB", img.size, (0, 0, 0))
+            rgba = img.convert("RGBA")
+            bg.paste(rgba, mask=rgba.split()[-1])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        if needs_resize:
+            w, h = img.size
+            if max(w, h) > max_side:
+                if w >= h:
+                    img = img.resize((max_side, max(1, int(h * max_side / w))), Image.LANCZOS)
+                else:
+                    img = img.resize((max(1, int(w * max_side / h)), max_side), Image.LANCZOS)
+        quality = 65 if max_side <= 400 else (72 if max_side <= 540 else (78 if max_side <= 800 else 85))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=False)
+        data = buf.getvalue()
+        out_mime = "image/jpeg"
     except Exception as e:
         logger.warning("JPEG convert fail (%s): %s — serving original", ctype, e)
         if ctype in ("image/jpeg", "image/jpg", "image/png", "image/gif"):
@@ -1314,64 +1341,62 @@ body{
 .upload-actions{display:flex;margin-top:10px}
 .upload-actions .btn-ghost{flex:1;font-size:13px;padding:10px;margin:0 4px}
 
-/* ---------- Live camera (in-page, giống Locket gốc) ---------- */
-/* Explicit square size via JS (_sizeLcFrame) — padding-bottom alone can stretch
-   the video stream on iOS 12 / iPhone 6 Safari.
-   On phone: bleed past .page 16px padding so the square touches both screen edges. */
+/* ---------- Live camera — redesigned, native feel ---------- */
 .live-cam{width:100%;margin:0 0 4px}
 @media (max-width:520px){
-  .live-cam{
-    width:calc(100% + 32px);
-    max-width:none;
-    margin-left:-16px;
-    margin-right:-16px;
-    margin-bottom:4px;
-  }
+  .live-cam{width:calc(100% + 32px);max-width:none;margin-left:-16px;margin-right:-16px;margin-bottom:4px}
 }
 .lc-frame{width:100%;position:relative;border-radius:18px;overflow:hidden;background:#0a0a0a;
-  -webkit-transform:translateZ(0);transform:translateZ(0);
-  height:0;padding-bottom:100%}
-@media (max-width:520px){
-  .lc-frame{border-radius:0} /* edge-to-edge on phone */
-}
+  -webkit-transform:translateZ(0);transform:translateZ(0);height:0;padding-bottom:100%}
+@media (max-width:520px){.lc-frame{border-radius:0}}
 .lc-frame.sized{height:auto;padding-bottom:0}
-.lc-frame video{
-  position:absolute;top:0;left:0;right:0;bottom:0;
-  width:100%;height:100%;
-  max-width:none;max-height:none;
-  object-fit:cover;-webkit-object-fit:cover;
-  object-position:center center;
-  display:block;background:#0a0a0a;
-  -webkit-transform:translateZ(0)
-}
+.lc-frame video{position:absolute;top:0;left:0;right:0;bottom:0;width:100%;height:100%;
+  max-width:none;max-height:none;object-fit:cover;-webkit-object-fit:cover;
+  object-position:center center;display:block;background:#0a0a0a;-webkit-transform:translateZ(0)}
 .lc-frame video.mirrored{-webkit-transform:scaleX(-1) translateZ(0);transform:scaleX(-1) translateZ(0)}
 .lc-hint{position:absolute;top:50%;left:0;right:0;-webkit-transform:translateY(-50%);transform:translateY(-50%);
   text-align:center;color:var(--text2);font-weight:700;font-size:13px;padding:0 20px;z-index:2}
 .lc-hint .spinner{margin-bottom:8px}
-.lc-flash-btn{position:absolute;top:12px;left:12px;z-index:3;width:36px;height:36px;border-radius:50%;
-  background:rgba(0,0,0,.45);border:none;color:#fff;display:flex;align-items:center;justify-content:center;
-  cursor:pointer;-webkit-appearance:none}
-.lc-flash-btn.on{color:var(--accent)}
+
+/* Flash — top right, glass */
+.lc-flash-btn{position:absolute;top:12px;right:12px;z-index:3;width:38px;height:38px;border-radius:50%;
+  background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.12);color:#fff;
+  display:flex;align-items:center;justify-content:center;cursor:pointer;-webkit-appearance:none;
+  -webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);font-size:15px;
+  transition:background .15s,color .15s,transform .1s}
+.lc-flash-btn.on{color:var(--accent);background:rgba(255,184,0,.18);border-color:rgba(255,184,0,.45)}
+.lc-flash-btn:active{-webkit-transform:scale(.92);transform:scale(.92)}
 .lc-flash-btn.hidden{display:none}
 .lc-flash-overlay{position:absolute;top:0;left:0;right:0;bottom:0;background:#fff;opacity:0;pointer-events:none;z-index:4}
 .lc-flash-overlay.fire{opacity:.85;transition:opacity .12s ease-out}
+
+/* Zoom pills — clean, even */
 .lc-zoom-row{position:absolute;left:0;right:0;bottom:10px;z-index:3;display:none;
-  align-items:center;justify-content:center;pointer-events:none}
+  align-items:center;justify-content:center;pointer-events:none;gap:8px}
 .lc-zoom-row.show{display:-webkit-box;display:-webkit-flex;display:flex}
 .lc-zoom-btn{pointer-events:auto;-webkit-appearance:none;border:none;cursor:pointer;
   background:rgba(0,0,0,.45);color:#fff;font-size:12px;font-weight:800;
-  width:30px;height:30px;border-radius:50%;margin:0 4px;
-  display:flex;align-items:center;justify-content:center;transition:background .12s,color .12s,width .12s}
-.lc-zoom-btn.active{background:var(--accent);color:#111;width:34px;height:34px;font-size:12.5px}
-.lc-focus-ring{position:absolute;width:66px;height:66px;margin:-33px 0 0 -33px;z-index:5;
-  border:1.5px solid #ffd60a;border-radius:6px;pointer-events:none;opacity:0;transform:scale(1.3)}
-.lc-focus-ring.pulse{animation:lcFocusPulse .6s cubic-bezier(.2,.8,.3,1) forwards}
+  min-width:38px;height:32px;border-radius:500px;padding:0 10px;
+  display:flex;align-items:center;justify-content:center;
+  transition:background .15s,color .15s,transform .1s;
+  -webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);
+  border:1px solid rgba(255,255,255,.08)}
+.lc-zoom-btn.active{background:var(--accent);color:#111;border-color:var(--accent);font-weight:900}
+.lc-zoom-btn:active{-webkit-transform:scale(.92);transform:scale(.92)}
+
+/* Focus ring — native iOS */
+.lc-focus-ring{position:absolute;width:72px;height:72px;margin:-36px 0 0 -36px;z-index:5;
+  border:2px solid #ffd60a;border-radius:4px;pointer-events:none;opacity:0;transform:scale(1.25);
+  box-shadow:0 0 0 1px rgba(0,0,0,.35), 0 0 12px rgba(255,214,10,.35)}
+.lc-focus-ring.pulse{animation:lcFocusPulse .7s cubic-bezier(.2,.8,.3,1) forwards}
 @keyframes lcFocusPulse{
-  0%{opacity:0;transform:scale(1.3)}
-  15%{opacity:1;transform:scale(1)}
-  75%{opacity:1;transform:scale(1)}
+  0%{opacity:0;transform:scale(1.25)}
+  12%{opacity:1;transform:scale(1)}
+  80%{opacity:1;transform:scale(1)}
   100%{opacity:0;transform:scale(1)}
 }
+
+/* Exposure */
 .lc-exposure-col{position:absolute;top:54px;bottom:54px;right:8px;z-index:3;display:none;
   align-items:center;pointer-events:none}
 .lc-exposure-col.show{display:-webkit-box;display:-webkit-flex;display:flex}
@@ -1379,25 +1404,36 @@ body{
 .lc-exposure-col i{color:#fff;font-size:12px;opacity:.85;text-shadow:0 1px 3px rgba(0,0,0,.5)}
 .lc-exposure-range{pointer-events:auto;-webkit-appearance:slider-vertical;appearance:slider-vertical;
   writing-mode:vertical-lr;direction:rtl;width:22px;flex:1;background:transparent;margin:6px 0}
+
+/* Bottom bar — shutter redesigned */
 .lc-bar{display:flex;align-items:center;justify-content:center;padding:16px 10px 2px}
 .lc-bar > * + *{margin-left:36px}
-.lc-side{width:46px;height:46px;border-radius:50%;background:var(--surface);border:1px solid var(--border);
-  color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;-webkit-appearance:none;flex-shrink:0}
+.lc-side{width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);
+  color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;-webkit-appearance:none;flex-shrink:0;
+  -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);font-size:18px;
+  transition:background .15s,transform .1s}
+.lc-side:active{-webkit-transform:scale(.92);transform:scale(.92)}
 .lc-side.spacer{visibility:hidden;pointer-events:none}
-.lc-shutter{width:66px;height:66px;border-radius:50%;border:3px solid var(--accent);background:none;
-  padding:4px;cursor:pointer;-webkit-appearance:none;flex-shrink:0}
-.lc-shutter span{display:block;width:100%;height:100%;border-radius:50%;background:#fff}
-.lc-shutter:active{opacity:.8}
+
+/* Shutter — native iOS: white ring + solid white inner */
+.lc-shutter{width:72px;height:72px;border-radius:50%;border:4px solid #fff;background:none;
+  padding:4px;cursor:pointer;-webkit-appearance:none;flex-shrink:0;
+  box-shadow:0 2px 12px rgba(0,0,0,.35);transition:transform .1s,opacity .1s}
+.lc-shutter span{display:block;width:100%;height:100%;border-radius:50%;background:#fff;
+  transition:background .15s,border-radius .15s,width .15s,height .15s}
+.lc-shutter:active{-webkit-transform:scale(.94);transform:scale(.94)}
 .lc-shutter:disabled{opacity:.5}
+
+/* Recording state: red ring + red square */
+.lc-shutter.recording{border-color:#ff3b30}
+.lc-shutter.recording span{border-radius:6px;width:52%;height:52%;background:#ff3b30;margin:0 auto}
+
 .lc-mode-row{display:flex;align-items:center;justify-content:center;gap:22px;padding:8px 0 0}
 .lc-mode-row.hidden{display:none}
 .lc-mode-btn{background:none;border:none;cursor:pointer;color:rgba(255,255,255,.55);
   font-size:12px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;padding:4px 2px;
   border-bottom:2px solid transparent;transition:color .15s,border-color .15s}
 .lc-mode-btn.active{color:var(--accent);border-color:var(--accent)}
-.lc-shutter.recording{border-color:#ff3b30}
-.lc-shutter.recording span{border-radius:8px;width:56%;height:56%;background:#ff3b30;
-  transition:border-radius .15s,width .15s,height .15s}
 .lc-record-time{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:4;
   display:none;align-items:center;gap:6px;background:rgba(0,0,0,.5);color:#fff;
   font-size:12px;font-weight:700;padding:4px 10px;border-radius:999px}
@@ -1716,6 +1752,32 @@ var FEED_THUMB_W = IS_PHONE ? 360 : 540;  // vertical feed card
 var AVATAR_W = 96;
 var LOCAL_MOMENTS_CAP = IS_PHONE ? 30 : 80;
 var LOCAL_FRIENDS_CAP = 200;
+/* WebP support detection — chỉ convert sang JPEG khi thực sự cần */
+var WEBP_SUPPORTED = false;
+(function(){
+  var img = new Image();
+  img.onload = function(){ WEBP_SUPPORTED = true; };
+  img.onerror = function(){ WEBP_SUPPORTED = false; };
+  img.src = 'data:image/webp;base64,UklGRi4AAABXRUJQVlA4TCEAAAAvAUAAEB8wAiMwAgSSNtse/cXjxyCCmrYNrpwmfXgJzU3f';
+})();
+
+/* Khi xây URL ảnh: nếu browser hỗ trợ WebP và ảnh gốc là WebP, 
+   bỏ qua proxy JPEG để giữ chất lượng gốc + tiết kiệm CPU */
+function mediaSrc(u, w){
+  u=normalizeMediaUrl(u);
+  if(!u)return'';
+  if(u.indexOf('/api/img')===0||u.indexOf('blob:')===0||u.indexOf('data:')===0)return u;
+  var isWebp = /\\.webp$/i.test(u);
+  // Nếu browser support WebP và ảnh là WebP → serve trực tiếp, không qua proxy JPEG
+  if(WEBP_SUPPORTED && isWebp && (!w || w <= 1080)){
+    return u;
+  }
+  var q='/api/img?u='+encodeURIComponent(u);
+  if(w) q+='&w='+w;
+  // Gửi flag cho server biết browser có hỗ trợ WebP không
+  if(WEBP_SUPPORTED) q += '&webp=1';
+  return q;
+}
 var TINY_PIXEL = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
 /* Image load queue — prevents Safari memory death on iPhone 6 */
@@ -1853,16 +1915,17 @@ function showPage(name){
   if(topBtn) topBtn.classList.toggle('show', name==='moments');
   if(name==='dash'&&!meLoaded) loadMe();
   if(name==='moments'){
-    // Always start at top — previous scrollTop causes auto-load of entire feed
     _momentsBootLock = true;
     scrollMomentsTop();
-    // Restore from memory/localStorage first so iPhone 6 never sees empty flash.
-    // Network refresh runs in background; new items are prepended, not full wipe.
     ensureMomentsFromCache();
     var age = (Date.now()/1000) - (momentsUpdatedAt || 0);
-    loadMoments(true); // always soft-force upstream, but UI already painted
+    // Nếu online và cache cũ > 2 phút → force fetch ngay
+    if(navigator.onLine && age > 120){
+      loadMoments(true);
+    } else {
+      loadMoments(false);
+    }
     startMomentsPoll();
-    // release lock after first paint settles (prevents near-bottom cascade)
     setTimeout(function(){ _momentsBootLock = false; scrollMomentsTop(); }, 280);
   } else {
     stopMomentsPoll();
@@ -1971,7 +2034,7 @@ function loadMe(){
 const FRIENDS_CACHE_KEY='locket_friends_cache_v1';
 const FRIENDS_TTL_MS=6*60*60*1000; // 6 hours — avoid re-fetch every visit
 const MOMENTS_LS_KEY='locket_moments_cache_v1';
-const MOMENTS_TTL_MS=6*60*60*1000; // 6 hours
+const MOMENTS_TTL_MS=2*60*1000; // 2 phút khi online (thay vì 6 giờ)
 let friendsFetchedAt=0;
 /* friends progressive render — smaller batches on weak devices */
 const FRIENDS_BATCH = IS_PHONE ? 8 : 16;
@@ -2950,28 +3013,29 @@ function startLiveCamera(){
   lcWantActive=true; lcStarting=true;
   const hint=$('lcHint'); if(hint) hint.classList.remove('hidden');
   _sizeLcFrame();
-  // Do NOT force square capture resolution — old iOS often ignores ideal 640x640 and
-  // returns a stretched stream. Ask for facingMode only; CSS object-fit:cover + square
-  // frame crops to 1:1 visually. Capture still center-crops to 1080².
+
+  // YÊU CẦU độ phân giải cao nhất có thể — đây là chìa khóa chống vỡ nét
   var constraints = {
     audio:false,
-    video:{ facingMode: { ideal: lcFacing } }
-  };
-  // Fallback for very old webkit that only understands string facingMode
-  try{
-    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
-      throw new Error('getUserMedia không hỗ trợ');
+    video:{
+      facingMode: { ideal: lcFacing },
+      width: { min: 1280, ideal: 1920, max: 4096 },
+      height: { min: 720, ideal: 1080, max: 2160 },
+      advanced: [{ width: 1920, height: 1080 }, { width: 1280, height: 720 }]
     }
-  }catch(e0){}
+  };
+
   navigator.mediaDevices.getUserMedia(constraints).catch(function(){
-    // retry with plain string facingMode (iOS 11/12 quirk)
-    return navigator.mediaDevices.getUserMedia({audio:false, video:{facingMode: lcFacing}});
+    // Fallback: nếu high-res bị từ chối, thử medium
+    return navigator.mediaDevices.getUserMedia({
+      audio:false,
+      video:{ facingMode: lcFacing, width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
   }).then(s=>{
     lcStarting=false;
     if(!lcWantActive){ s.getTracks().forEach(t=>t.stop()); return; }
     lcStream=s; lcTrack=s.getVideoTracks()[0];
     const v=$('lcVideo');
-    // iPhone 6: explicit playsinline attrs + muted required before play()
     try{ v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline',''); v.muted=true; v.playsInline=true; }catch(e){}
     v.srcObject=s;
     v.classList.toggle('mirrored', lcFacing==='user');
@@ -2981,14 +3045,21 @@ function startLiveCamera(){
     if(hint) hint.classList.add('hidden');
     _sizeLcFrame();
     setTimeout(function(){ _sizeLcFrame(); scrollUploadCameraIntoView(); }, 120);
+
+    // Cấu hình camera nâng cao: focus liên tục + chống rung
     try{
       const caps=lcTrack.getCapabilities && lcTrack.getCapabilities();
       const fb=$('lcFlashBtn');
       if(fb) fb.classList.toggle('hidden', !(caps && caps.torch));
-      // iPhone with fused back camera (11 Pro+) exposes one video device whose optical
-      // zoom range starts at 0.5 — WebKit initializes the stream AT that minimum instead
-      // of defaulting to 1x, which is the "camera opens at 0.5x" bug. Force it back to 1x
-      // and, when the lens truly supports multiple steps, show quick-tap pills + pinch zoom.
+
+      // Bật continuous focus ngay từ đầu nếu được
+      if(caps && caps.focusMode && Array.isArray(caps.focusMode)){
+        var modes = caps.focusMode;
+        var want = modes.indexOf('continuous') >= 0 ? 'continuous'
+                  : modes.indexOf('single-shot') >= 0 ? 'single-shot' : null;
+        if(want) lcTrack.applyConstraints({advanced:[{focusMode: want}]}).catch(function(){});
+      }
+
       setupLcZoom(caps);
       setupLcExposure(caps);
       setupLcModeSwitch();
@@ -3097,15 +3168,31 @@ function lcDoFocusAt(clientX, clientY){
   var relX=Math.min(Math.max((clientX-rect.left)/rect.width,0),1);
   var relY=Math.min(Math.max((clientY-rect.top)/rect.height,0),1);
   showLcFocusRing(clientX-rect.left, clientY-rect.top);
+
   if(!lcTrack) return;
   try{
     var caps=lcTrack.getCapabilities && lcTrack.getCapabilities();
-    if(!caps || !caps.focusMode) return;
-    var modes=caps.focusMode, advanced={};
-    if(caps.pointsOfInterest) advanced.pointsOfInterest=[{x:relX,y:relY}];
-    if(modes.indexOf && modes.indexOf('single-shot')>=0) advanced.focusMode='single-shot';
-    else if(modes.indexOf && modes.indexOf('continuous')>=0) advanced.focusMode='continuous';
-    if(Object.keys(advanced).length) lcTrack.applyConstraints({advanced:[advanced]}).catch(function(){});
+    if(!caps) return;
+
+    var advanced=[];
+    // Ưu tiên: focusMode + pointsOfInterest (Chrome/Android)
+    if(caps.focusMode){
+      var modes=Array.isArray(caps.focusMode)?caps.focusMode:[caps.focusMode];
+      var mode = modes.indexOf('single-shot')>=0 ? 'single-shot'
+               : modes.indexOf('continuous')>=0 ? 'continuous' : null;
+      if(mode) advanced.push({focusMode: mode});
+    }
+    if(caps.pointsOfInterest){
+      advanced.push({pointsOfInterest: [{x:relX, y:relY}]} );
+    }
+    // Fallback: exposure compensation theo vùng chạm (nếu có)
+    if(caps.exposureCompensation){
+      advanced.push({exposureCompensation: 0});
+    }
+
+    if(advanced.length){
+      lcTrack.applyConstraints({advanced: advanced}).catch(function(){});
+    }
   }catch(e){}
 }
 function showLcFocusRing(x,y){
@@ -3182,26 +3269,37 @@ function captureLivePhoto(e){
   const overlay=$('lcFlashOverlay');
   overlay.classList.add('fire'); setTimeout(()=>overlay.classList.remove('fire'),120);
 
-  const vw=v.videoWidth, vh=v.videoHeight, size=Math.min(vw,vh);
-  const sx=(vw-size)/2, sy=(vh-size)/2;
-  const canvas=document.createElement('canvas');
-  canvas.width=1080; canvas.height=1080;
-  const ctx=canvas.getContext('2d');
-  if(lcFacing==='user'){ ctx.translate(canvas.width,0); ctx.scale(-1,1); }
-  ctx.drawImage(v, sx, sy, size, size, 0, 0, 1080, 1080);
+  // Trigger auto-focus trước khi capture (giảm mờ do sai lấy nét)
+  if(lcTrack && lcTrack.applyConstraints){
+    try{
+      lcTrack.applyConstraints({advanced:[{focusMode:'single-shot'}]}).catch(function(){});
+    }catch(e){}
+  }
 
-  canvas.toBlob(b=>{
-    btn.disabled=false;
-    if(!b) return;
-    croppedBlob=b; isVideo=false; originalFile=null;
-    $('previewImg').src=URL.createObjectURL(b);
-    $('previewImg').classList.remove('hidden');
-    $('previewVid').classList.add('hidden');
-    $('uploadActions').classList.remove('hidden');
-    stopLiveCamera();
-    $('liveCam').classList.add('hidden');
-    $('previewBox').classList.remove('hidden');
-  }, 'image/jpeg', 0.92);
+  // Đợi 150ms cho focus settle rồi mới capture
+  setTimeout(function(){
+    const vw=v.videoWidth, vh=v.videoHeight, size=Math.min(vw,vh);
+    const sx=(vw-size)/2, sy=(vh-size)/2;
+    const canvas=document.createElement('canvas');
+    canvas.width=1080; canvas.height=1080;
+    const ctx=canvas.getContext('2d');
+    if(lcFacing==='user'){ ctx.translate(canvas.width,0); ctx.scale(-1,1); }
+    // Vẽ từ video gốc (đã high-res), crop center square
+    ctx.drawImage(v, sx, sy, size, size, 0, 0, 1080, 1080);
+
+    canvas.toBlob(b=>{
+      btn.disabled=false;
+      if(!b) return;
+      croppedBlob=b; isVideo=false; originalFile=null;
+      $('previewImg').src=URL.createObjectURL(b);
+      $('previewImg').classList.remove('hidden');
+      $('previewVid').classList.add('hidden');
+      $('uploadActions').classList.remove('hidden');
+      stopLiveCamera();
+      $('liveCam').classList.add('hidden');
+      $('previewBox').classList.remove('hidden');
+    }, 'image/jpeg', 0.92);
+  }, 150);
 }
 
 /* ===================== Live camera: Photo/Video mode switch ===================== */
@@ -3552,14 +3650,21 @@ document.addEventListener('visibilitychange',()=>{
     const gap = _momentsHiddenAt ? (Date.now() - _momentsHiddenAt) : 0;
     const local=readFriendsLocal();
     if(!local || Date.now()-(local.ts||0)>FRIENDS_TTL_MS) loadFriends(false);
-    const ml=readMomentsLocal();
-    if(!ml || Date.now()-(ml.ts||0)>MOMENTS_TTL_MS) preloadMoments();
+
+    // MOMENTS: nếu vừa quay lại và online + cache cũ > 30 giây → force fetch
+    var ml=readMomentsLocal();
+    var cacheAge = ml ? (Date.now()-(ml.ts||0)) : 999999;
+    if(navigator.onLine && cacheAge > 30000){
+      preloadMoments(); // sẽ tự force fetch
+    } else if(!ml || Date.now()-(ml.ts||0)>MOMENTS_TTL_MS) {
+      preloadMoments();
+    }
+
     const momentsActive = $('page-moments') && $('page-moments').classList.contains('active');
     if(momentsActive){
       ensureMomentsFromCache();
-      var _mc=momentsActiveContainer();
       if(gap > 15000 || !(_mc && _mc.children.length)){
-        loadMoments(true);
+        loadMoments(true); // force
         bindMomentsScroll();
       } else {
         pollMomentsOnce();
@@ -3575,10 +3680,14 @@ document.addEventListener('visibilitychange',()=>{
 });
 window.addEventListener('pageshow', function(e){
   if(e.persisted){
+    // BFCache restore: luôn force fetch moments nếu online
+    if(navigator.onLine){
+      momentsUpdatedAt = 0; // invalidate soft cache
+    }
     const momentsActive = $('page-moments') && $('page-moments').classList.contains('active');
     if(momentsActive){
       ensureMomentsFromCache();
-      loadMoments(true);
+      loadMoments(true); // force
       bindMomentsScroll();
     } else {
       ensureMomentsFromCache();
@@ -3859,10 +3968,8 @@ def api_moments_poll():
 
 @app.route("/api/img")
 def api_img():
-    """Proxy + JPEG convert so iPhone 6 / iOS 12 can display friend photos (no WebP)."""
     from flask import Response
     from urllib.parse import unquote, urlsplit, urlunsplit, quote
-    # Flask already percent-decodes query args once. Firebase object paths need %2F kept.
     url = (request.args.get("u") or "").strip()
     if "%252F" in url or "%253F" in url or "%2526" in url:
         url = unquote(url)
@@ -3873,7 +3980,6 @@ def api_img():
     except Exception:
         max_side = 720
     max_side = max(64, min(max_side, 1280))
-    # Re-encode path if something already turned %2F into raw /
     try:
         parts = urlsplit(url)
         path = parts.path or ""
@@ -3886,15 +3992,31 @@ def api_img():
             url = urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
     except Exception:
         pass
+    
+    # Smart convert: chỉ ép JPEG khi browser không hỗ trợ Webp HOẶC cần resize
+    client_supports_webp = request.args.get("webp") == "1"
+    needs_resize = max_side < 1080  # nếu xin thumb nhỏ thì vẫn resize
     try:
-        data, mime = fetch_image_as_jpeg(url, max_side=max_side)
+        if client_supports_webp and not needs_resize and (url.lower().endswith(".webp") or "image/webp" in (request.headers.get("Accept") or "")):
+            # Pass-through: redirect hoặc proxy gốc
+            r = _http.get(url, timeout=15, headers={"User-Agent": IOS_UA, "Accept": "image/webp,image/*,*/*;q=0.8"})
+            r.raise_for_status()
+            ctype = (r.headers.get("Content-Type") or "image/webp").split(";")[0].strip()
+            resp = Response(r.content, mimetype=ctype)
+            resp.headers["Cache-Control"] = "public, max-age=900"
+            return resp
+    except Exception:
+        pass
+
+    try:
+        force_convert = not client_supports_webp
+        data, mime = fetch_image_as_jpeg(url, max_side=max_side, force_convert=force_convert)
         resp = Response(data, mimetype=mime)
         resp.headers["Cache-Control"] = "public, max-age=900"
         return resp
     except Exception as e:
         logger.warning("IMG PROXY fail %s: %s", url[:120], e)
         return jsonify({"ok": False, "error": str(e)}), 502
-
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
