@@ -522,20 +522,31 @@ def get_friends(s: LocketSession) -> Tuple[List[Dict[str, Any]], List[Dict[str, 
     return celebs + normals, debug
 
 
-def get_moments_ws(s: LocketSession, page_token=None, client_target="all", timeout: int = 25
+def get_moments_ws(s: LocketSession, page_token=None, client_target="all", timeout: int = 55
                     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """binhake serves the full/paginated moment history over its WebSocket.
-    The server may reply with either action="getMoments" or action="getNewMoments"
-    (both carry the same Firestore-shaped data)."""
+    """binhake serves moment history over WebSocket.
+
+    Real browser flow (captured HAR 2026-08-14):
+      auth → authenticated → getMoments
+      server sends keep-alive {"oa":N} every ~10s
+      client sends {"action":"ping"} every ~25s
+      data arrives as action=getNewMoments ~25–35s after getMoments
+
+    Old timeout of 25s closed the socket before data arrived → empty list.
+    """
     if not websocket:
         raise LocketError("websocket-client is not installed (pip install websocket-client)")
 
     debug: List[Dict[str, Any]] = []
-    result = {"frame": None, "done": threading.Event()}
+    result = {"frames": [], "done": threading.Event()}
     ws_holder = [None]
+    last_app_ping = [0.0]
+    opened_at = [0.0]
 
     def on_open(ws):
         ws_holder[0] = ws
+        opened_at[0] = time.time()
+        last_app_ping[0] = time.time()
         auth_frame = {"action": "auth", "token": s.id_token, "_client": {"os": "Windows"}}
         debug.append(make_debug("send", "ws:auth", "WS", WS_URL, {"action": "auth", "token": "***"}))
         ws.send(json.dumps(auth_frame))
@@ -546,21 +557,47 @@ def get_moments_ws(s: LocketSession, page_token=None, client_target="all", timeo
         except Exception as e:
             debug.append(make_debug("error", "ws:message", "WS", WS_URL, None, None, message[:500], None, e))
             return
+
+        # Heartbeat {"oa": 60} — ignore, do not treat as error / done
+        if isinstance(data, dict) and "oa" in data and "action" not in data:
+            return
+
         action = data.get("action")
         debug.append(make_debug("recv", f"ws:{action}", "WS", WS_URL, None, None,
                                  json.dumps(data, ensure_ascii=False)[:1500]))
+
         if action == "authenticated":
             req = {"action": "getMoments", "id": None, "pageToken": page_token,
                    "clientTarget": client_target, "_client": {"os": "Windows"}}
             debug.append(make_debug("send", "ws:getMoments", "WS", WS_URL, req))
             ws.send(json.dumps(req))
-        elif action in ("getMoments", "getNewMoments"):
-            result["frame"] = data
+            return
+
+        if action == "pong":
+            return
+
+        if action in ("getMoments", "getNewMoments"):
+            result["frames"].append(data)
+            # Only finish when we got a list payload (even empty). Prefer waiting a
+            # little longer if first frame is empty — server sometimes sends an
+            # empty getMoments then a filled getNewMoments.
+            raw = data.get("data")
+            has_list = isinstance(raw, list)
+            has_items = has_list and len(raw) > 0
+            if has_items or (has_list and action == "getNewMoments"):
+                result["done"].set()
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            return
+
+        if action == "error" or data.get("error"):
             result["done"].set()
-            ws.close()
-        elif action == "error" or data.get("error"):
-            result["done"].set()
-            ws.close()
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     def on_error(ws, error):
         debug.append(make_debug("error", "ws:error", "WS", WS_URL, None, None, None, None, error))
@@ -574,10 +611,26 @@ def get_moments_ws(s: LocketSession, page_token=None, client_target="all", timeo
         header=["Origin: https://locket.binhake.dev", f"User-Agent: {s.ua}", f"Cookie: user_id={s.local_id}"],
         on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close,
     )
-    wst = threading.Thread(target=lambda: ws.run_forever(ping_interval=25, ping_timeout=4))
-    wst.daemon = True
+    # protocol-level pings + our app-level ping loop (binhake expects action=ping)
+    wst = threading.Thread(
+        target=lambda: ws.run_forever(ping_interval=20, ping_timeout=10),
+        daemon=True,
+    )
     wst.start()
-    result["done"].wait(timeout=timeout)
+
+    deadline = time.time() + max(15, timeout)
+    while time.time() < deadline and not result["done"].is_set():
+        result["done"].wait(timeout=1.0)
+        # app-level ping every 25s (matches binhake posts.html)
+        w = ws_holder[0]
+        if w and (time.time() - last_app_ping[0]) >= 25:
+            try:
+                w.send(json.dumps({"action": "ping", "_client": {"os": "Windows"}}))
+                last_app_ping[0] = time.time()
+                debug.append(make_debug("send", "ws:ping", "WS", WS_URL, {"action": "ping"}))
+            except Exception:
+                break
+
     if ws_holder[0]:
         try:
             ws_holder[0].close()
@@ -585,12 +638,29 @@ def get_moments_ws(s: LocketSession, page_token=None, client_target="all", timeo
             pass
     wst.join(timeout=2)
 
-    frame = result["frame"] or {}
-    items = frame.get("data")
-    if not isinstance(items, list):
-        items = [items] if items else []
+    # Merge all frames that carried data
+    items: List[Dict[str, Any]] = []
+    seen = set()
+    for frame in result["frames"]:
+        raw = frame.get("data")
+        if not isinstance(raw, list):
+            raw = [raw] if raw else []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            flat = flatten_firestore(item)
+            k = _moment_key(flat)
+            if k in seen:
+                continue
+            seen.add(k)
+            items.append(flat)
 
-    items = [flatten_firestore(item) for item in items if isinstance(item, dict)]
+    if not items and result["frames"]:
+        logger.warning("moments WS frames=%d but no items (timeout=%.0fs)", len(result["frames"]), timeout)
+    elif not result["frames"]:
+        logger.warning("moments WS returned no frames within %.0fs", timeout)
+    else:
+        logger.info("moments WS ok: %d items from %d frames", len(items), len(result["frames"]))
     return items, debug
 
 
@@ -638,12 +708,18 @@ def _live_moments_loop(s: LocketSession, state: Dict[str, Any]):
             data = json.loads(message)
         except Exception:
             return
+        # Keep-alive {"oa": N} from binhake — ignore
+        if isinstance(data, dict) and "oa" in data and "action" not in data:
+            return
         action = data.get("action")
         if action == "authenticated":
             req = {"action": "getMoments", "id": None, "pageToken": None,
                    "clientTarget": "all", "_client": {"os": "Windows"}}
             ws.send(json.dumps(req))
             state["last_ws_pull"] = time.time()
+            state["last_app_ping"] = time.time()
+        elif action == "pong":
+            return
         elif action in ("getMoments", "getNewMoments"):
             raw = data.get("data")
             if not isinstance(raw, list):
@@ -685,9 +761,15 @@ def _live_moments_loop(s: LocketSession, state: Dict[str, Any]):
             while not stop.is_set() and wst.is_alive():
                 stop.wait(5)
                 try:
+                    now = time.time()
+                    # App-level ping (binhake posts.html does this every ~25s)
+                    last_ping = state.get("last_app_ping") or 0
+                    if now - last_ping >= 25 and state.get("ws"):
+                        state["last_app_ping"] = now
+                        state["ws"].send(json.dumps({"action": "ping", "_client": {"os": "Windows"}}))
                     last_pull = state.get("last_ws_pull") or 0
-                    if time.time() - last_pull >= 45 and state.get("ws"):
-                        state["last_ws_pull"] = time.time()
+                    if now - last_pull >= 45 and state.get("ws"):
+                        state["last_ws_pull"] = now
                         state["ws"].send(json.dumps({
                             "action": "getMoments", "id": None, "pageToken": None,
                             "clientTarget": "all", "_client": {"os": "Windows"},
@@ -724,7 +806,7 @@ def _ensure_moments_state(local_id: str) -> Dict[str, Any]:
         return st
 
 
-def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int = 28) -> List[Dict[str, Any]]:
+def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int = 55) -> List[Dict[str, Any]]:
     """One-shot WS fetch and merge into state. Single-flight per user."""
     started_here = False
     with st["lock"]:
@@ -783,7 +865,7 @@ def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, 
         if warm:
             return list(st["items"])
 
-    out = _fetch_and_store_moments(s, st, timeout=28)
+    out = _fetch_and_store_moments(s, st, timeout=55)
 
     # Start long-lived listener if not running (best-effort on long-lived hosts;
     # on serverless the thread dies with the worker — poll/force still work).
@@ -798,18 +880,35 @@ def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, 
 
 
 def poll_new_moments(s: LocketSession, since: float = 0) -> Tuple[List[Dict[str, Any]], float]:
-    """Return moments if cache advanced past `since`. If cache is stale, refresh first."""
+    """Return moments if cache advanced past `since`.
+
+    Avoid force-refresh on every poll: binhake needs ~30s for getNewMoments, so a
+    force pull here would make every 8s client poll hang 30s+. Only force when the
+    cache is completely empty (first load / cold serverless instance).
+    """
     st = _ensure_moments_state(s.local_id)
     now = time.time()
     with st["lock"]:
         last = st.get("last_fetch_at") or st.get("updated_at") or 0
         has_data = bool(st.get("items"))
-    # If nothing yet, or last upstream fetch > 40s ago — pull fresh before answering poll
-    if not has_data or (now - last) > 40:
+        fetching = bool(st.get("fetching"))
+    # Cold start only — never block a poll for a 30s upstream wait when we already
+    # have moments (live WS / previous force will refresh in background).
+    if not has_data and not fetching:
         try:
             get_moments_cached(s, force=True)
         except Exception as e:
             logger.warning("poll refresh failed: %s", e)
+    elif has_data and (now - last) > 90:
+        # Stale but non-empty: kick a background force without blocking this response
+        try:
+            th = threading.Thread(
+                target=lambda: get_moments_cached(s, force=True),
+                daemon=True,
+            )
+            th.start()
+        except Exception as e:
+            logger.debug("poll background refresh skip: %s", e)
     with st["lock"]:
         updated = st.get("updated_at") or 0
         items = list(st.get("items") or [])
@@ -2707,7 +2806,7 @@ function loadMoments(force){
   _momentsFetchInFlight = true;
 
   var q = '?force=1';
-  apiTimeout('/api/moments'+q, null, 40000).then(function(d){
+  apiTimeout('/api/moments'+q, null, 65000).then(function(d){
     _momentsFetchInFlight = false;
     var queued = _momentsFetchQueued;
     _momentsFetchQueued = false;
