@@ -522,6 +522,86 @@ def get_friends(s: LocketSession) -> Tuple[List[Dict[str, Any]], List[Dict[str, 
     return celebs + normals, debug
 
 
+
+def _extract_moments_list(data: Any) -> List[Dict[str, Any]]:
+    """Normalize binhake HTTP/WS payloads into a flat list of moment dicts."""
+    if data is None:
+        return []
+    if isinstance(data, list):
+        raw = data
+    elif isinstance(data, dict):
+        raw = None
+        for path in (
+            data.get("data"),
+            data.get("moments"),
+            (data.get("result") or {}).get("data") if isinstance(data.get("result"), dict) else None,
+            data.get("items"),
+        ):
+            if isinstance(path, list):
+                raw = path
+                break
+            if isinstance(path, dict):
+                raw = [path]
+                break
+        if raw is None:
+            # Single firestore doc?
+            if "fields" in data or "thumbnail_url" in data or "canonical_uid" in data:
+                raw = [data]
+            else:
+                raw = []
+    else:
+        raw = []
+
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        flat = flatten_firestore(item) if "fields" in item else item
+        if not isinstance(flat, dict):
+            continue
+        k = _moment_key(flat)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(flat)
+    return out
+
+
+def get_moments_http(s: LocketSession, page_token=None, client_target: str = "all",
+                      timeout: int = 35) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """HTTP action=getMoments — same payload binhake posts.html uses via requestServerJson.
+
+    Prefer this on serverless (Vercel): outbound WebSocket is flaky and data on WS
+    often arrives only after 25–35s of heartbeats. HTTP returns in one request.
+    """
+    debug: List[Dict[str, Any]] = []
+    extra = {
+        "id": None,
+        "pageToken": page_token,
+        "clientTarget": client_target,
+        "_client": {"os": "Windows"},
+    }
+    debug.append(make_debug("send", "binhake:getMoments:http", "POST", BINHAKE_API,
+                             {"action": "getMoments", **extra}))
+    try:
+        data, dbg = binhake_call("getMoments", s, extra=extra, timeout=timeout)
+        debug.append(dbg)
+        items = _extract_moments_list(data)
+        if not items and isinstance(data, dict):
+            keys = list(data.keys())
+            sample = str(data)[:400]
+            logger.warning("getMoments HTTP empty — keys=%s sample=%s", keys, sample)
+        else:
+            logger.info("getMoments HTTP → %d items", len(items))
+        return items, debug
+    except Exception as e:
+        debug.append(make_debug("error", "binhake:getMoments:http", "POST", BINHAKE_API,
+                                 None, None, None, None, e))
+        logger.warning("getMoments HTTP failed: %s", e)
+        raise
+
+
 def get_moments_ws(s: LocketSession, page_token=None, client_target="all", timeout: int = 55
                     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """binhake serves moment history over WebSocket.
@@ -829,7 +909,19 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
 
     items: List[Dict[str, Any]] = []
     try:
-        items, _ = get_moments_ws(s, timeout=timeout)
+        # 1) HTTP first — works on Vercel/serverless, matches binhake requestServerJson
+        try:
+            items, _ = get_moments_http(s, timeout=min(35, max(12, timeout)))
+        except Exception as e_http:
+            logger.warning("moments HTTP failed (%s) — falling back to WebSocket", e_http)
+            items = []
+        # 2) WS fallback if HTTP returned nothing (some accounts/servers only push via WS)
+        if not items:
+            try:
+                items, _ = get_moments_ws(s, timeout=timeout)
+            except Exception as e_ws:
+                logger.error("moments WS fallback failed: %s", e_ws)
+                items = []
     except Exception as e:
         logger.error("moments fetch failed: %s", e)
         items = []
@@ -1502,7 +1594,7 @@ body{
 .lc-exposure-col.show{display:-webkit-box;display:-webkit-flex;display:flex}
 .lc-exposure-col{flex-direction:column}
 .lc-exposure-col i{color:#fff;font-size:12px;opacity:.85;text-shadow:0 1px 3px rgba(0,0,0,.5)}
-.lc-exposure-range{pointer-events:auto;-webkit-appearance:slider-vertical;appearance:slider-vertical;
+.lc-exposure-range{pointer-events:auto;-webkit-appearance:none;appearance:none;
   writing-mode:vertical-lr;direction:rtl;width:22px;flex:1;background:transparent;margin:6px 0}
 
 /* Bottom bar — 3-column grid keeps shutter perfectly centered */
@@ -4141,8 +4233,10 @@ def api_moments():
         return jsonify({
             "ok": True,
             "moments": items,
+            "count": len(items),
             "updated_at": st.get("updated_at") or time.time(),
             "cached": not force and bool(st.get("bootstrapped")),
+            "force": force,
         })
     except Exception as e:
         logger.error("MOMENTS error: %s", e)
