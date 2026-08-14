@@ -835,12 +835,17 @@ def stop_moments_live(local_id: str):
 def upload_media(s: LocketSession, data: bytes, filename: str, content_type: str,
                   caption: str = "", recipients: str = "all", timeout: int = 90,
                   thumb_data: Optional[bytes] = None, thumb_name: Optional[str] = None,
-                  thumb_type: Optional[str] = None,
+                  thumb_type: Optional[str] = None, crop_payload: Optional[str] = None,
                   ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """action=uploadMedia — binhake expects BOTH multipart fields:
     - thumb  (preview / square jpeg)
     - media  (full media; for photos same bytes as thumb)
     Missing either field returns MISSING_FIELDS 400.
+
+    crop_payload: JSON string matching binhake's own web client, e.g. for video
+    {"type":"video","crop":{"x":..,"y":..,"w":..,"h":..},"video":{"videoWidth":..,"videoHeight":..},"view":{"scale":1}}
+    (captured from a real browser upload — see HAR notes). Falls back to "null"
+    when not supplied, which is what photos already used successfully.
     """
     debug = []
     form = {
@@ -848,7 +853,7 @@ def upload_media(s: LocketSession, data: bytes, filename: str, content_type: str
         "captionID": "defaultCaption",
         "captionText": caption or "",
         "payload": "null",
-        "mediaCropPayload": "null",
+        "mediaCropPayload": crop_payload if crop_payload else "null",
         "recipients": recipients,
         "mode": '{"restoreToggle":false,"restoreDate":null,"exceptGroupToggle":false}',
     }
@@ -1358,6 +1363,22 @@ body{
   width:30px;height:30px;border-radius:50%;margin:0 4px;
   display:flex;align-items:center;justify-content:center;transition:background .12s,color .12s,width .12s}
 .lc-zoom-btn.active{background:var(--accent);color:#111;width:34px;height:34px;font-size:12.5px}
+.lc-focus-ring{position:absolute;width:66px;height:66px;margin:-33px 0 0 -33px;z-index:5;
+  border:1.5px solid #ffd60a;border-radius:6px;pointer-events:none;opacity:0;transform:scale(1.3)}
+.lc-focus-ring.pulse{animation:lcFocusPulse .6s cubic-bezier(.2,.8,.3,1) forwards}
+@keyframes lcFocusPulse{
+  0%{opacity:0;transform:scale(1.3)}
+  15%{opacity:1;transform:scale(1)}
+  75%{opacity:1;transform:scale(1)}
+  100%{opacity:0;transform:scale(1)}
+}
+.lc-exposure-col{position:absolute;top:54px;bottom:54px;right:8px;z-index:3;display:none;
+  align-items:center;pointer-events:none}
+.lc-exposure-col.show{display:-webkit-box;display:-webkit-flex;display:flex}
+.lc-exposure-col{flex-direction:column}
+.lc-exposure-col i{color:#fff;font-size:12px;opacity:.85;text-shadow:0 1px 3px rgba(0,0,0,.5)}
+.lc-exposure-range{pointer-events:auto;-webkit-appearance:slider-vertical;appearance:slider-vertical;
+  writing-mode:vertical-lr;direction:rtl;width:22px;flex:1;background:transparent;margin:6px 0}
 .lc-bar{display:flex;align-items:center;justify-content:center;padding:16px 10px 2px}
 .lc-bar > * + *{margin-left:36px}
 .lc-side{width:46px;height:46px;border-radius:50%;background:var(--surface);border:1px solid var(--border);
@@ -1368,6 +1389,21 @@ body{
 .lc-shutter span{display:block;width:100%;height:100%;border-radius:50%;background:#fff}
 .lc-shutter:active{opacity:.8}
 .lc-shutter:disabled{opacity:.5}
+.lc-mode-row{display:flex;align-items:center;justify-content:center;gap:22px;padding:8px 0 0}
+.lc-mode-row.hidden{display:none}
+.lc-mode-btn{background:none;border:none;cursor:pointer;color:rgba(255,255,255,.55);
+  font-size:12px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;padding:4px 2px;
+  border-bottom:2px solid transparent;transition:color .15s,border-color .15s}
+.lc-mode-btn.active{color:var(--accent);border-color:var(--accent)}
+.lc-shutter.recording{border-color:#ff3b30}
+.lc-shutter.recording span{border-radius:8px;width:56%;height:56%;background:#ff3b30;
+  transition:border-radius .15s,width .15s,height .15s}
+.lc-record-time{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:4;
+  display:none;align-items:center;gap:6px;background:rgba(0,0,0,.5);color:#fff;
+  font-size:12px;font-weight:700;padding:4px 10px;border-radius:999px}
+.lc-record-time.show{display:-webkit-box;display:-webkit-flex;display:flex}
+.lc-record-dot{width:7px;height:7px;border-radius:50%;background:#ff3b30;animation:lcRecDot 1s infinite}
+@keyframes lcRecDot{0%,100%{opacity:1}50%{opacity:.25}}
 
 /* ---------- Crop stage ---------- */
 .crop-stage{
@@ -1538,7 +1574,7 @@ body{
         Chạm để chọn ảnh/video<br><span style="opacity:.7;font-size:11px">hoặc dán ảnh (Ctrl+V)</span>
       </div>
       <img id="previewImg" class="hidden" alt="preview">
-      <video id="previewVid" class="hidden" playsinline muted loop autoplay></video>
+      <video id="previewVid" class="hidden" playsinline muted loop autoplay onloadedmetadata="onPreviewVidMeta.call(this)"></video>
     </div>
     <div class="live-cam hidden" id="liveCam">
       <div class="lc-frame">
@@ -1547,10 +1583,20 @@ body{
         <div class="lc-flash-overlay" id="lcFlashOverlay"></div>
         <button type="button" class="lc-flash-btn hidden" id="lcFlashBtn" onclick="toggleTorch(event)" aria-label="Đèn flash"><i class="bi bi-lightning-charge-fill"></i></button>
         <div class="lc-zoom-row" id="lcZoomRow"></div>
+        <div class="lc-exposure-col" id="lcExposureCol">
+          <i class="bi bi-brightness-high-fill"></i>
+          <input type="range" class="lc-exposure-range" id="lcExposureRange" min="0" max="1" step="0.01" value="0.5" oninput="onLcExposureInput(this.value)" aria-label="Độ sáng">
+          <i class="bi bi-brightness-low"></i>
+        </div>
+        <div class="lc-record-time" id="lcRecordTime"><span class="lc-record-dot"></span><span id="lcRecordTimeText">0:00</span></div>
+      </div>
+      <div class="lc-mode-row hidden" id="lcModeRow">
+        <button type="button" class="lc-mode-btn active" data-mode="photo" onclick="setLcCaptureMode('photo')">Ảnh</button>
+        <button type="button" class="lc-mode-btn" data-mode="video" onclick="setLcCaptureMode('video')">Video</button>
       </div>
       <div class="lc-bar">
         <div class="lc-side spacer"></div>
-        <button type="button" class="lc-shutter" id="lcShutterBtn" onclick="captureLivePhoto(event)" aria-label="Chụp"><span></span></button>
+        <button type="button" class="lc-shutter" id="lcShutterBtn" onclick="onLcShutterTap(event)" aria-label="Chụp"><span></span></button>
         <button type="button" class="lc-side" onclick="flipLiveCamera(event)" aria-label="Đổi camera"><i class="bi bi-arrow-repeat"></i></button>
       </div>
     </div>
@@ -1643,6 +1689,20 @@ const GOLD_BADGE="{{ gold_badge }}", CELEB_BADGE="{{ celeb_badge }}";
 const BOOT_NAME={{ (boot_name or '')|tojson }};
 const BOOT_PHOTO={{ (boot_photo or '')|tojson }};
 let croppedBlob=null, originalFile=null, isVideo=false, cropper=null;
+let videoCropPayload=null;
+/* Center-square crop metadata, same shape binhake's own web client sends for video
+   uploads (captured from a real browser session). Without this the field was
+   previously hardcoded to "null", which is what photos already used successfully,
+   but videos need the real dimensions + crop rect. */
+function buildVideoCropPayload(vw, vh){
+  if(!vw || !vh) return null;
+  var side=Math.min(vw, vh);
+  var x=Math.round((vw-side)/2), y=Math.round((vh-side)/2);
+  return JSON.stringify({type:'video', crop:{x:x,y:y,w:side,h:side}, video:{videoWidth:vw,videoHeight:vh}, view:{scale:1}});
+}
+function onPreviewVidMeta(){
+  videoCropPayload = buildVideoCropPayload(this.videoWidth, this.videoHeight);
+}
 let friendsCache=null, momentsLoaded=false, meLoaded=false;
 let momentsCache=[], momentsUpdatedAt=0, momentsPollTimer=null;
 
@@ -1754,6 +1814,17 @@ async function api(url,opts){
     console.error('api',url,err);
     throw err;
   }
+}
+// Same as api(), but aborts after `ms` so a hung request can never permanently wedge a
+// single-flight flag (was letting one dead request block every future reload silently).
+function apiTimeout(url, opts, ms){
+  var ctrl = (typeof AbortController!=='undefined') ? new AbortController() : null;
+  var o = Object.assign({}, opts||{});
+  if(ctrl) o.signal = ctrl.signal;
+  var timer = ctrl ? setTimeout(function(){ ctrl.abort(); }, ms) : null;
+  var p = api(url, o);
+  if(timer && p.finally) p = p.finally(function(){ clearTimeout(timer); });
+  return p;
 }
 
 {% if not logged_in %}
@@ -2281,7 +2352,7 @@ function refreshMomentsNow(){
     }
     hideNewMomentsPill();
     scrollMomentsTop();
-    applyMomentsNetworkResult(items, d.updated_at, false);
+    applyMomentsNetworkResult(items, d.updated_at, false, {notifyIfNoChange:true});
   }).catch(function(){
     if(icon) icon.classList.remove('icon-spin');
     toast('Lỗi mạng khi làm mới Moments');
@@ -2493,19 +2564,19 @@ function ensureMomentsFromCache(){
 var _momentsFetchInFlight = false;
 var _momentsFetchQueued = false;
 
-function applyMomentsNetworkResult(items, updatedAt, preferPrepend){
+function applyMomentsNetworkResult(items, updatedAt, preferPrepend, opts){
+  opts = opts || {};
   if(!items || !items.length){
     // Empty network response must NEVER wipe a healthy local cache (binhake glitch / timeout)
     if(momentsCache && momentsCache.length){
       loggerSoft('Moments network returned empty — keeping local cache of ' + momentsCache.length);
+      if(opts.notifyIfNoChange) toast('Không có Moments mới');
       return;
     }
     showMomentsEmpty(false);
     hideProgress(0);
     return;
   }
-  var prevTop = momentsCache[0] && momentKey(momentsCache[0]);
-  var newTop = items[0] && momentKey(items[0]);
   var hadCache = momentsCache && momentsCache.length > 0;
   momentsCache = items;
   momentsUpdatedAt = updatedAt || (Date.now()/1000);
@@ -2518,11 +2589,23 @@ function applyMomentsNetworkResult(items, updatedAt, preferPrepend){
     return;
   }
 
-  // Same top + same-ish length → skip full re-render (iPhone 6: avoid decode thrash)
-  if(hadCache && prevTop && prevTop === newTop && Math.abs((window._momentItems||[]).length - items.length) <= 2){
-    // Still update in-memory list for poll/count; leave painted nodes alone
+  // Compare against what's ACTUALLY painted on screen (window._momentItems), not momentsCache —
+  // momentsCache can get silently advanced by pollMomentsOnce() while the user is scrolled down
+  // (it shows a tappable pill instead of repainting), which used to leave momentsCache pointing
+  // at newer data than the DOM. Comparing against momentsCache made this function think "nothing
+  // changed" and bail out, so opening the tab again or pressing Reload appeared to do nothing even
+  // though a real update was sitting unpainted. window._momentItems is only ever updated when
+  // something was actually painted, so it's the correct baseline.
+  var painted = window._momentItems || [];
+  var prevTop = painted[0] && momentKey(painted[0]);
+  var newTop = items[0] && momentKey(items[0]);
+  var fullyPainted = momentsRendered >= painted.length;
+
+  if(hadCache && fullyPainted && prevTop && prevTop === newTop && Math.abs(painted.length - items.length) <= 2){
+    // Genuinely nothing new and everything visible is already on screen.
     window._momentItems = items;
     prefetchMomentImages(items, PREFETCH_COUNT);
+    if(opts.notifyIfNoChange) toast('Đã là Moments mới nhất');
     return;
   }
 
@@ -2567,7 +2650,7 @@ function loadMoments(force){
   _momentsFetchInFlight = true;
 
   var q = '?force=1';
-  api('/api/moments'+q).then(function(d){
+  apiTimeout('/api/moments'+q, null, 40000).then(function(d){
     _momentsFetchInFlight = false;
     var queued = _momentsFetchQueued;
     _momentsFetchQueued = false;
@@ -2752,7 +2835,7 @@ function confirmCrop(){
   },'image/jpeg',0.92);
 }
 function clearUpload(){
-  croppedBlob=null;originalFile=null;isVideo=false;
+  croppedBlob=null;originalFile=null;isVideo=false;videoCropPayload=null;
   $('fileInput').value='';
   if($('cameraInput')) $('cameraInput').value='';
   $('previewImg').classList.add('hidden');$('previewVid').classList.add('hidden');
@@ -2763,6 +2846,10 @@ function clearUpload(){
 /* ===================== Live camera (in-page, giống Locket gốc) ===================== */
 let lcStream=null, lcTrack=null, lcFacing='environment', lcTorchOn=false, lcWantActive=false, lcStarting=false;
 let lcZoomCaps=null, lcZoomCurrent=1, lcPinchStartDist=0, lcPinchStartZoom=1;
+let lcExposureCaps=null;
+var _lcTouchStartPt=null, _lcTouchMoved=false, _lcLastTouchTime=0;
+let lcCaptureMode='photo', lcRecorder=null, lcRecordedChunks=[], lcRecordTimer=null, lcRecordStartTs=0;
+const LC_MAX_RECORD_MS=15000;
 
 function isLiveCamera(){
   try{ return localStorage.getItem('locket_live_camera')==='1'; }catch(e){ return false; }
@@ -2848,9 +2935,13 @@ function openCapture(){
 function stopLiveCamera(){
   lcWantActive=false;
   if(lcStream){ lcStream.getTracks().forEach(t=>t.stop()); lcStream=null; }
-  lcTrack=null; lcTorchOn=false; lcZoomCaps=null; lcZoomCurrent=1;
+  lcTrack=null; lcTorchOn=false; lcZoomCaps=null; lcZoomCurrent=1; lcExposureCaps=null;
+  lcStopRecording(true);
+  lcCaptureMode='photo';
   const fb=$('lcFlashBtn'); if(fb){ fb.classList.remove('on'); fb.classList.add('hidden'); }
   const zr=$('lcZoomRow'); if(zr){ zr.classList.remove('show'); zr.innerHTML=''; }
+  const ec=$('lcExposureCol'); if(ec) ec.classList.remove('show');
+  const mr=$('lcModeRow'); if(mr) mr.classList.add('hidden');
   const v=$('lcVideo'); if(v) v.srcObject=null;
 }
 function startLiveCamera(){
@@ -2899,6 +2990,8 @@ function startLiveCamera(){
       // of defaulting to 1x, which is the "camera opens at 0.5x" bug. Force it back to 1x
       // and, when the lens truly supports multiple steps, show quick-tap pills + pinch zoom.
       setupLcZoom(caps);
+      setupLcExposure(caps);
+      setupLcModeSwitch();
     }catch(e){}
   }).catch(err=>{
     lcStarting=false;
@@ -2910,6 +3003,7 @@ function startLiveCamera(){
 }
 function flipLiveCamera(e){
   if(e)e.preventDefault();
+  if(lcRecorder && lcRecorder.state==='recording'){ toast('Không đổi camera được khi đang quay'); return; }
   lcFacing = lcFacing==='environment' ? 'user' : 'environment';
   startLiveCamera();
 }
@@ -2964,25 +3058,122 @@ function applyLcZoom(z, updateUI){
   }
 }
 function setLcZoom(z){ applyLcZoom(z, true); }
-/* Pinch-to-zoom on the live frame — two-finger distance ratio mapped onto the
-   lens's real zoom range. No-op (both handlers bail early) when the device only
-   has one lens, so it costs nothing on older phones. */
+/* Exposure/brightness — mirrors the sun-icon control in the native Camera app.
+   Only shown when the track truly exposes exposureCompensation (most browsers) or the
+   older `brightness` capability. Neither is implemented by WebKit today, so this stays
+   hidden on iOS — better than showing a slider that silently does nothing. */
+function setupLcExposure(caps){
+  const col=$('lcExposureCol'), range=$('lcExposureRange');
+  lcExposureCaps=null;
+  if(col) col.classList.remove('show');
+  if(!caps) return;
+  var key = (caps.exposureCompensation && typeof caps.exposureCompensation==='object') ? 'exposureCompensation'
+          : (caps.brightness && typeof caps.brightness==='object') ? 'brightness' : null;
+  if(!key) return;
+  var c=caps[key];
+  if(typeof c.min!=='number' || typeof c.max!=='number' || c.max<=c.min) return;
+  var step=c.step || ((c.max-c.min)/100);
+  lcExposureCaps={key:key, min:c.min, max:c.max};
+  if(range){
+    range.min=c.min; range.max=c.max; range.step=step;
+    range.value=(c.min+c.max)/2;
+  }
+  if(col) col.classList.add('show');
+}
+function onLcExposureInput(v){
+  if(!lcTrack || !lcExposureCaps) return;
+  var c={}; c[lcExposureCaps.key]=parseFloat(v);
+  try{ lcTrack.applyConstraints({advanced:[c]}); }catch(e){}
+}
+/* Tap-to-focus — shows the same focus square/pulse as a native camera app on every tap,
+   and additionally nudges the real focus point when the browser exposes that control
+   (mainly Chrome/Android; WebKit doesn't support it, so on iPhone this is visual-only,
+   same as iOS's own camera already auto-focusing continuously in the background). */
+function lcDoFocusAt(clientX, clientY){
+  var frame=document.querySelector('#liveCam .lc-frame');
+  if(!frame) return;
+  var rect=frame.getBoundingClientRect();
+  if(!rect.width || !rect.height) return;
+  var relX=Math.min(Math.max((clientX-rect.left)/rect.width,0),1);
+  var relY=Math.min(Math.max((clientY-rect.top)/rect.height,0),1);
+  showLcFocusRing(clientX-rect.left, clientY-rect.top);
+  if(!lcTrack) return;
+  try{
+    var caps=lcTrack.getCapabilities && lcTrack.getCapabilities();
+    if(!caps || !caps.focusMode) return;
+    var modes=caps.focusMode, advanced={};
+    if(caps.pointsOfInterest) advanced.pointsOfInterest=[{x:relX,y:relY}];
+    if(modes.indexOf && modes.indexOf('single-shot')>=0) advanced.focusMode='single-shot';
+    else if(modes.indexOf && modes.indexOf('continuous')>=0) advanced.focusMode='continuous';
+    if(Object.keys(advanced).length) lcTrack.applyConstraints({advanced:[advanced]}).catch(function(){});
+  }catch(e){}
+}
+function showLcFocusRing(x,y){
+  var frame=document.querySelector('#liveCam .lc-frame');
+  if(!frame) return;
+  var ring=frame.querySelector('.lc-focus-ring');
+  if(!ring){
+    ring=document.createElement('div');
+    ring.className='lc-focus-ring';
+    frame.appendChild(ring);
+  }
+  ring.style.left=x+'px'; ring.style.top=y+'px';
+  ring.classList.remove('pulse');
+  void ring.offsetWidth; // restart the CSS animation
+  ring.classList.add('pulse');
+}
+/* Pinch-to-zoom (two fingers) and tap-to-focus (one finger, minimal movement) share the
+   same touch sequence, so they're disambiguated here by touch count + movement threshold.
+   Both branches bail out cheaply when the device doesn't support the underlying capability. */
 function lcTouchDist(t){
   var dx=t[0].clientX-t[1].clientX, dy=t[0].clientY-t[1].clientY;
   return Math.sqrt(dx*dx+dy*dy);
 }
 function lcPinchStart(e){
-  if(!lcZoomCaps || !e.touches || e.touches.length!==2) return;
-  lcPinchStartDist=lcTouchDist(e.touches);
-  lcPinchStartZoom=lcZoomCurrent;
+  if(!e.touches) return;
+  if(e.touches.length===2 && lcZoomCaps){
+    lcPinchStartDist=lcTouchDist(e.touches);
+    lcPinchStartZoom=lcZoomCurrent;
+    _lcTouchStartPt=null;
+  } else if(e.touches.length===1){
+    var t=e.target;
+    if(t.closest && t.closest('button,input,.lc-zoom-row,.lc-exposure-col')){
+      _lcTouchStartPt=null;
+      return;
+    }
+    _lcTouchStartPt={x:e.touches[0].clientX, y:e.touches[0].clientY};
+    _lcTouchMoved=false;
+  }
 }
 function lcPinchMove(e){
-  if(!lcZoomCaps || !e.touches || e.touches.length!==2 || !lcPinchStartDist) return;
-  e.preventDefault();
-  var ratio=lcTouchDist(e.touches)/lcPinchStartDist;
-  applyLcZoom(lcPinchStartZoom*ratio, true);
+  if(!e.touches) return;
+  if(e.touches.length===2 && lcZoomCaps && lcPinchStartDist){
+    e.preventDefault();
+    var ratio=lcTouchDist(e.touches)/lcPinchStartDist;
+    applyLcZoom(lcPinchStartZoom*ratio, true);
+    return;
+  }
+  if(e.touches.length===1 && _lcTouchStartPt){
+    var dx=e.touches[0].clientX-_lcTouchStartPt.x, dy=e.touches[0].clientY-_lcTouchStartPt.y;
+    if(Math.sqrt(dx*dx+dy*dy) > 12) _lcTouchMoved=true;
+  }
 }
-function lcPinchEnd(){ lcPinchStartDist=0; }
+function lcPinchEnd(e){
+  lcPinchStartDist=0;
+  _lcLastTouchTime=Date.now();
+  if(_lcTouchStartPt && !_lcTouchMoved){
+    lcDoFocusAt(_lcTouchStartPt.x, _lcTouchStartPt.y);
+  }
+  _lcTouchStartPt=null; _lcTouchMoved=false;
+}
+function lcFrameClick(e){
+  // Ignore the synthetic click that follows a touch tap — already handled in lcPinchEnd.
+  if(Date.now() - _lcLastTouchTime < 600) return;
+  // Ignore taps on the flash/zoom/exposure controls that live inside the frame —
+  // those already have their own handlers and shouldn't also trigger a focus tap.
+  if(e.target.closest && e.target.closest('button,input,.lc-zoom-row,.lc-exposure-col')) return;
+  lcDoFocusAt(e.clientX, e.clientY);
+}
 function captureLivePhoto(e){
   if(e)e.preventDefault();
   const v=$('lcVideo');
@@ -3011,6 +3202,103 @@ function captureLivePhoto(e){
     $('liveCam').classList.add('hidden');
     $('previewBox').classList.remove('hidden');
   }, 'image/jpeg', 0.92);
+}
+
+/* ===================== Live camera: Photo/Video mode switch ===================== */
+// MediaRecorder only exists on Safari 14.3+/iOS 14.3+ — iPhone 6 tops out at iOS 12.5.7,
+// so it never has it. Hide the Video mode entirely there instead of showing a button that
+// would just fail — same "only offer what the device can actually do" approach as zoom/focus.
+function setupLcModeSwitch(){
+  const row=$('lcModeRow');
+  if(!row) return;
+  const supported = (typeof MediaRecorder!=='undefined');
+  row.classList.toggle('hidden', !supported);
+  setLcCaptureMode('photo');
+}
+function setLcCaptureMode(mode){
+  if(lcRecorder && lcRecorder.state==='recording') return; // don't switch mid-recording
+  lcCaptureMode = mode;
+  const row=$('lcModeRow');
+  if(row){
+    var btns=row.querySelectorAll('.lc-mode-btn');
+    for(var i=0;i<btns.length;i++) btns[i].classList.toggle('active', btns[i].getAttribute('data-mode')===mode);
+  }
+  const shutter=$('lcShutterBtn');
+  if(shutter) shutter.setAttribute('aria-label', mode==='video' ? 'Quay video' : 'Chụp');
+}
+function onLcShutterTap(e){
+  if(e)e.preventDefault();
+  if(lcCaptureMode==='video'){
+    if(lcRecorder && lcRecorder.state==='recording') lcStopRecording(false);
+    else lcStartRecording();
+  } else {
+    captureLivePhoto(e);
+  }
+}
+function pickLcMimeType(){
+  var candidates=['video/mp4;codecs=avc1,mp4a', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+  for(var i=0;i<candidates.length;i++){
+    try{ if(MediaRecorder.isTypeSupported(candidates[i])) return candidates[i]; }catch(e){}
+  }
+  return '';
+}
+function lcStartRecording(){
+  if(!lcStream || lcRecorder) return;
+  var mime=pickLcMimeType();
+  try{
+    lcRecorder = mime ? new MediaRecorder(lcStream, {mimeType:mime}) : new MediaRecorder(lcStream);
+  }catch(e){
+    toast('Trình duyệt không hỗ trợ quay video'); return;
+  }
+  lcRecordedChunks=[];
+  lcRecorder.ondataavailable=function(ev){ if(ev.data && ev.data.size) lcRecordedChunks.push(ev.data); };
+  lcRecorder.onstop=function(){ finishVideoCapture(); };
+  lcRecorder.start(250);
+  lcRecordStartTs=Date.now();
+  const shutter=$('lcShutterBtn'); if(shutter) shutter.classList.add('recording');
+  const rt=$('lcRecordTime'); if(rt) rt.classList.add('show');
+  lcRecordTimer=setInterval(lcTickRecordTimer, 200);
+  lcTickRecordTimer();
+}
+function lcTickRecordTimer(){
+  var ms=Date.now()-lcRecordStartTs;
+  var s=Math.floor(ms/1000);
+  var txt=$('lcRecordTimeText');
+  if(txt) txt.textContent='0:'+(s<10?'0':'')+s;
+  if(ms>=LC_MAX_RECORD_MS) lcStopRecording(false);
+}
+function lcStopRecording(discard){
+  if(lcRecordTimer){ clearInterval(lcRecordTimer); lcRecordTimer=null; }
+  const shutter=$('lcShutterBtn'); if(shutter) shutter.classList.remove('recording');
+  const rt=$('lcRecordTime'); if(rt) rt.classList.remove('show');
+  if(!lcRecorder) return;
+  if(discard){
+    try{ if(lcRecorder.state!=='inactive') lcRecorder.stop(); }catch(e){}
+    lcRecordedChunks=[];
+    lcRecorder=null;
+    return;
+  }
+  try{
+    if(lcRecorder.state!=='inactive') lcRecorder.stop();
+  }catch(e){ lcRecorder=null; }
+}
+function finishVideoCapture(){
+  var mime=(lcRecorder && lcRecorder.mimeType) || 'video/webm';
+  var blob=new Blob(lcRecordedChunks, {type:mime});
+  lcRecordedChunks=[];
+  lcRecorder=null;
+  if(!blob.size){ toast('Không quay được video, thử lại nhé'); return; }
+  const ext = mime.indexOf('mp4')>=0 ? 'mp4' : 'webm';
+  croppedBlob=blob;
+  isVideo=true;
+  originalFile={name:'lc_video_'+Date.now()+'.'+ext};
+  $('previewVid').src=URL.createObjectURL(blob);
+  $('previewVid').classList.remove('hidden');
+  $('previewImg').classList.add('hidden');
+  $('uploadActions').classList.remove('hidden');
+  stopLiveCamera();
+  $('liveCam').classList.add('hidden');
+  $('previewBox').classList.remove('hidden');
 }
 
 /* ===================== Offline upload queue (IndexedDB) ===================== */
@@ -3208,6 +3496,7 @@ function doUpload(){
     const fd=new FormData();
     fd.append('file',croppedBlob,filename);
     fd.append('caption',cap);
+    if(isVideo && videoCropPayload) fd.append('cropPayload', videoCropPayload);
     api('/api/upload',{method:'POST',body:fd}).then(d=>{
       if(d.ok){ finishOk(); momentsLoaded=false; momentsUpdatedAt=0; /* keep momentsCache — avoid empty flash on iPhone 6 */ }
       else finishFail(d.error||'Đăng thất bại');
@@ -3252,6 +3541,7 @@ bindMomentsClickDelegation();
   frame.addEventListener('touchmove', lcPinchMove, {passive:false});
   frame.addEventListener('touchend', lcPinchEnd, {passive:true});
   frame.addEventListener('touchcancel', lcPinchEnd, {passive:true});
+  frame.addEventListener('click', lcFrameClick);
 })();
 updateOnlineUI();
 renderQueue().then(()=>flushQueue());
@@ -3267,7 +3557,8 @@ document.addEventListener('visibilitychange',()=>{
     const momentsActive = $('page-moments') && $('page-moments').classList.contains('active');
     if(momentsActive){
       ensureMomentsFromCache();
-      if(gap > 15000 || !($('momentsGrid') && $('momentsGrid').children.length)){
+      var _mc=momentsActiveContainer();
+      if(gap > 15000 || !(_mc && _mc.children.length)){
         loadMoments(true);
         bindMomentsScroll();
       } else {
@@ -3614,6 +3905,7 @@ def api_upload():
         return jsonify({"ok": False, "error": "No file"})
     f = request.files["file"]
     caption = request.form.get("caption", "")
+    crop_payload = request.form.get("cropPayload") or None
     if f.filename == "":
         return jsonify({"ok": False, "error": "Empty filename"})
     try:
@@ -3624,7 +3916,7 @@ def api_upload():
         if is_video:
             ext = f.filename.rsplit(".", 1)[-1] if "." in f.filename else "mp4"
             filename = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}.{ext}"
-            result, _dbg = upload_media(s, raw, filename, ct, caption=caption)
+            result, _dbg = upload_media(s, raw, filename, ct, caption=caption, crop_payload=crop_payload)
         else:
             data, filename = compress_image(raw)
             result, _dbg = upload_media(s, data, filename, "image/jpeg", caption=caption)
