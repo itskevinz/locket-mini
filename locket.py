@@ -1371,16 +1371,17 @@ body{
 .lc-flash-overlay.fire{opacity:.85;transition:opacity .12s ease-out}
 
 /* Zoom pills — clean, even */
-.lc-zoom-row{position:absolute;left:0;right:0;bottom:10px;z-index:3;display:none;
-  align-items:center;justify-content:center;pointer-events:none;gap:8px}
+.lc-zoom-row{position:absolute;left:0;right:0;bottom:12px;z-index:3;display:none;
+  align-items:center;justify-content:center;pointer-events:none}
 .lc-zoom-row.show{display:-webkit-box;display:-webkit-flex;display:flex}
+.lc-zoom-row > * + *{margin-left:8px}
 .lc-zoom-btn{pointer-events:auto;-webkit-appearance:none;border:none;cursor:pointer;
-  background:rgba(0,0,0,.45);color:#fff;font-size:12px;font-weight:800;
-  min-width:38px;height:32px;border-radius:500px;padding:0 10px;
+  background:rgba(0,0,0,.5);color:#fff;font-size:12px;font-weight:800;
+  min-width:40px;height:30px;border-radius:500px;padding:0 12px;
   display:flex;align-items:center;justify-content:center;
   transition:background .15s,color .15s,transform .1s;
-  -webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);
-  border:1px solid rgba(255,255,255,.08)}
+  -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
+  border:1px solid rgba(255,255,255,.1);letter-spacing:.02em}
 .lc-zoom-btn.active{background:var(--accent);color:#111;border-color:var(--accent);font-weight:900}
 .lc-zoom-btn:active{-webkit-transform:scale(.92);transform:scale(.92)}
 
@@ -1405,28 +1406,30 @@ body{
 .lc-exposure-range{pointer-events:auto;-webkit-appearance:slider-vertical;appearance:slider-vertical;
   writing-mode:vertical-lr;direction:rtl;width:22px;flex:1;background:transparent;margin:6px 0}
 
-/* Bottom bar — shutter redesigned */
-.lc-bar{display:flex;align-items:center;justify-content:center;padding:16px 10px 2px}
-.lc-bar > * + *{margin-left:36px}
-.lc-side{width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);
+/* Bottom bar — 3-column grid keeps shutter perfectly centered */
+.lc-bar{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:18px 16px 6px;gap:0}
+.lc-bar .lc-side:first-child{justify-self:start}
+.lc-bar .lc-side:last-child,.lc-bar .lc-side.flip{justify-self:end}
+.lc-side{width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.14);
   color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;-webkit-appearance:none;flex-shrink:0;
-  -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);font-size:18px;
-  transition:background .15s,transform .1s}
-.lc-side:active{-webkit-transform:scale(.92);transform:scale(.92)}
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);font-size:17px;
+  transition:background .15s,transform .1s,border-color .15s}
+.lc-side:active{-webkit-transform:scale(.9);transform:scale(.9);background:rgba(255,255,255,.18)}
 .lc-side.spacer{visibility:hidden;pointer-events:none}
 
-/* Shutter — native iOS: white ring + solid white inner */
-.lc-shutter{width:72px;height:72px;border-radius:50%;border:4px solid #fff;background:none;
-  padding:4px;cursor:pointer;-webkit-appearance:none;flex-shrink:0;
-  box-shadow:0 2px 12px rgba(0,0,0,.35);transition:transform .1s,opacity .1s}
+/* Shutter — iOS Camera: outer ring + solid inner disc, optical balance */
+.lc-shutter{width:76px;height:76px;border-radius:50%;border:3px solid #fff;background:transparent;
+  padding:5px;cursor:pointer;-webkit-appearance:none;flex-shrink:0;justify-self:center;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 0 0 1px rgba(0,0,0,.2),0 4px 16px rgba(0,0,0,.35);transition:transform .12s,opacity .12s;box-sizing:border-box}
 .lc-shutter span{display:block;width:100%;height:100%;border-radius:50%;background:#fff;
-  transition:background .15s,border-radius .15s,width .15s,height .15s}
-.lc-shutter:active{-webkit-transform:scale(.94);transform:scale(.94)}
-.lc-shutter:disabled{opacity:.5}
+  transition:background .15s,border-radius .18s,width .15s,height .15s}
+.lc-shutter:active{-webkit-transform:scale(.92);transform:scale(.92)}
+.lc-shutter:disabled{opacity:.45}
 
-/* Recording state: red ring + red square */
-.lc-shutter.recording{border-color:#ff3b30}
-.lc-shutter.recording span{border-radius:6px;width:52%;height:52%;background:#ff3b30;margin:0 auto}
+/* Recording state: red ring + red rounded square */
+.lc-shutter.recording{border-color:#ff3b30;box-shadow:0 0 0 1px rgba(255,59,48,.25),0 4px 16px rgba(255,59,48,.25)}
+.lc-shutter.recording span{border-radius:8px;width:42%;height:42%;background:#ff3b30}
 
 .lc-mode-row{display:flex;align-items:center;justify-content:center;gap:22px;padding:8px 0 0}
 .lc-mode-row.hidden{display:none}
@@ -1631,9 +1634,9 @@ body{
         <button type="button" class="lc-mode-btn" data-mode="video" onclick="setLcCaptureMode('video')">Video</button>
       </div>
       <div class="lc-bar">
-        <div class="lc-side spacer"></div>
+        <div class="lc-side spacer" aria-hidden="true"></div>
         <button type="button" class="lc-shutter" id="lcShutterBtn" onclick="onLcShutterTap(event)" aria-label="Chụp"><span></span></button>
-        <button type="button" class="lc-side" onclick="flipLiveCamera(event)" aria-label="Đổi camera"><i class="bi bi-arrow-repeat"></i></button>
+        <button type="button" class="lc-side flip" onclick="flipLiveCamera(event)" aria-label="Đổi camera"><i class="bi bi-arrow-repeat"></i></button>
       </div>
     </div>
     <div class="upload-actions hidden" id="uploadActions">
@@ -1919,8 +1922,8 @@ function showPage(name){
     scrollMomentsTop();
     ensureMomentsFromCache();
     var age = (Date.now()/1000) - (momentsUpdatedAt || 0);
-    // Nếu online và cache cũ > 2 phút → force fetch ngay
-    if(navigator.onLine && age > 120){
+    // Online + cache older than 25s (or never refreshed after offline) → force network
+    if(navigator.onLine && (age > 25 || !momentsUpdatedAt)){
       loadMoments(true);
     } else {
       loadMoments(false);
@@ -2034,7 +2037,7 @@ function loadMe(){
 const FRIENDS_CACHE_KEY='locket_friends_cache_v1';
 const FRIENDS_TTL_MS=6*60*60*1000; // 6 hours — avoid re-fetch every visit
 const MOMENTS_LS_KEY='locket_moments_cache_v1';
-const MOMENTS_TTL_MS=2*60*1000; // 2 phút khi online (thay vì 6 giờ)
+const MOMENTS_TTL_MS=45*1000; // 45s soft TTL — after offline, online handler zeros ts anyway
 let friendsFetchedAt=0;
 /* friends progressive render — smaller batches on weak devices */
 const FRIENDS_BATCH = IS_PHONE ? 8 : 16;
@@ -2148,16 +2151,7 @@ function normalizeMediaUrl(u){
   if(!u)return'';
   return String(u).replace('firebasestorage.googleapis.com:443','firebasestorage.googleapis.com');
 }
-/* Proxy remote images as JPEG — iOS 12 cannot decode WebP.
-   w = max side in px: 360 avatar, 480 feed thumb (fast), 1080 viewer */
-function mediaSrc(u, w){
-  u=normalizeMediaUrl(u);
-  if(!u)return'';
-  if(u.indexOf('/api/img')===0||u.indexOf('blob:')===0||u.indexOf('data:')===0)return u;
-  var q='/api/img?u='+encodeURIComponent(u);
-  if(w) q+='&w='+w;
-  return q;
-}
+/* mediaSrc defined once above with WebP-aware path */
 function isPhone(){return window.innerWidth<=520 || IS_PHONE}
 function extractCaption(m){
   if(m.caption)return m.caption;
@@ -3014,26 +3008,39 @@ function startLiveCamera(){
   const hint=$('lcHint'); if(hint) hint.classList.remove('hidden');
   _sizeLcFrame();
 
-  // YÊU CẦU độ phân giải cao nhất có thể — đây là chìa khóa chống vỡ nét
+  // Prefer exact facing + highest practical resolution. Many mobile browsers
+  // still downscale the preview track — we re-apply max from capabilities after open.
   var constraints = {
     audio:false,
     video:{
-      facingMode: { ideal: lcFacing },
-      width: { min: 1280, ideal: 1920, max: 4096 },
-      height: { min: 720, ideal: 1080, max: 2160 },
-      advanced: [{ width: 1920, height: 1080 }, { width: 1280, height: 720 }]
+      facingMode: { exact: lcFacing },
+      width: { ideal: 1920 },
+      height: { ideal: 1080 }
     }
   };
 
-  navigator.mediaDevices.getUserMedia(constraints).catch(function(){
-    // Fallback: nếu high-res bị từ chối, thử medium
-    return navigator.mediaDevices.getUserMedia({
+  function openCam(c){
+    return navigator.mediaDevices.getUserMedia(c);
+  }
+
+  openCam(constraints).catch(function(){
+    // exact facingMode often fails on desktop / some Android — fall back to ideal
+    return openCam({
+      audio:false,
+      video:{
+        facingMode: { ideal: lcFacing },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
+      }
+    });
+  }).catch(function(){
+    return openCam({
       audio:false,
       video:{ facingMode: lcFacing, width: { ideal: 1280 }, height: { ideal: 720 } }
     });
-  }).then(s=>{
+  }).then(function(s){
     lcStarting=false;
-    if(!lcWantActive){ s.getTracks().forEach(t=>t.stop()); return; }
+    if(!lcWantActive){ s.getTracks().forEach(function(t){t.stop()}); return; }
     lcStream=s; lcTrack=s.getVideoTracks()[0];
     const v=$('lcVideo');
     try{ v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline',''); v.muted=true; v.playsInline=true; }catch(e){}
@@ -3046,25 +3053,43 @@ function startLiveCamera(){
     _sizeLcFrame();
     setTimeout(function(){ _sizeLcFrame(); scrollUploadCameraIntoView(); }, 120);
 
-    // Cấu hình camera nâng cao: focus liên tục + chống rung
     try{
       const caps=lcTrack.getCapabilities && lcTrack.getCapabilities();
+      const settings=lcTrack.getSettings && lcTrack.getSettings();
       const fb=$('lcFlashBtn');
       if(fb) fb.classList.toggle('hidden', !(caps && caps.torch));
 
-      // Bật continuous focus ngay từ đầu nếu được
-      if(caps && caps.focusMode && Array.isArray(caps.focusMode)){
-        var modes = caps.focusMode;
+      // Push track to sensor max when browser allows (reduces soft upscale on front cam)
+      if(caps && caps.width && caps.height && typeof caps.width.max==='number'){
+        var wantW = Math.min(caps.width.max, 1920);
+        var wantH = Math.min(caps.height.max, 1080);
+        var curW = (settings && settings.width) || 0;
+        var curH = (settings && settings.height) || 0;
+        if(wantW > curW || wantH > curH){
+          lcTrack.applyConstraints({
+            width: { ideal: wantW },
+            height: { ideal: wantH }
+          }).catch(function(){});
+        }
+      }
+
+      // Continuous AF when available (Chrome/Android). iOS WebKit ignores this — OS AF stays on.
+      if(caps && caps.focusMode){
+        var modes = Array.isArray(caps.focusMode) ? caps.focusMode : [caps.focusMode];
         var want = modes.indexOf('continuous') >= 0 ? 'continuous'
                   : modes.indexOf('single-shot') >= 0 ? 'single-shot' : null;
-        if(want) lcTrack.applyConstraints({advanced:[{focusMode: want}]}).catch(function(){});
+        if(want){
+          lcTrack.applyConstraints({ advanced: [{ focusMode: want }] }).catch(function(){
+            try{ lcTrack.applyConstraints({ focusMode: want }); }catch(e2){}
+          });
+        }
       }
 
       setupLcZoom(caps);
       setupLcExposure(caps);
       setupLcModeSwitch();
     }catch(e){}
-  }).catch(err=>{
+  }).catch(function(err){
     lcStarting=false;
     if(hint) hint.classList.add('hidden');
     toast('Không mở được camera: '+(err&&err.message?err.message:'bị từ chối quyền'));
@@ -3261,45 +3286,98 @@ function lcFrameClick(e){
   if(e.target.closest && e.target.closest('button,input,.lc-zoom-row,.lc-exposure-col')) return;
   lcDoFocusAt(e.clientX, e.clientY);
 }
+function finishLiveStill(blob){
+  var btn=$('lcShutterBtn'); if(btn) btn.disabled=false;
+  if(!blob){ toast('Không chụp được ảnh, thử lại'); return; }
+  croppedBlob=blob; isVideo=false; originalFile=null;
+  $('previewImg').src=URL.createObjectURL(blob);
+  $('previewImg').classList.remove('hidden');
+  $('previewVid').classList.add('hidden');
+  $('uploadActions').classList.remove('hidden');
+  stopLiveCamera();
+  $('liveCam').classList.add('hidden');
+  $('previewBox').classList.remove('hidden');
+}
+function canvasCaptureFromVideo(v){
+  var vw=v.videoWidth, vh=v.videoHeight;
+  if(!vw || !vh) return null;
+  var size=Math.min(vw,vh);
+  var sx=(vw-size)/2, sy=(vh-size)/2;
+  // Capture at source resolution then downscale once — sharper than drawing straight to 1080
+  var srcCanvas=document.createElement('canvas');
+  srcCanvas.width=size; srcCanvas.height=size;
+  var sctx=srcCanvas.getContext('2d');
+  if(lcFacing==='user'){ sctx.translate(size,0); sctx.scale(-1,1); }
+  sctx.imageSmoothingEnabled=true;
+  try{ sctx.imageSmoothingQuality='high'; }catch(e){}
+  sctx.drawImage(v, sx, sy, size, size, 0, 0, size, size);
+
+  var out=document.createElement('canvas');
+  out.width=1080; out.height=1080;
+  var octx=out.getContext('2d');
+  octx.imageSmoothingEnabled=true;
+  try{ octx.imageSmoothingQuality='high'; }catch(e){}
+  octx.drawImage(srcCanvas, 0, 0, 1080, 1080);
+  return out;
+}
 function captureLivePhoto(e){
   if(e)e.preventDefault();
   const v=$('lcVideo');
   if(!v || !v.videoWidth) return;
   const btn=$('lcShutterBtn'); btn.disabled=true;
   const overlay=$('lcFlashOverlay');
-  overlay.classList.add('fire'); setTimeout(()=>overlay.classList.remove('fire'),120);
+  if(overlay){ overlay.classList.add('fire'); setTimeout(function(){ overlay.classList.remove('fire'); },120); }
 
-  // Trigger auto-focus trước khi capture (giảm mờ do sai lấy nét)
+  // Nudge single-shot AF when the browser exposes it (mostly Android/Chrome)
   if(lcTrack && lcTrack.applyConstraints){
     try{
-      lcTrack.applyConstraints({advanced:[{focusMode:'single-shot'}]}).catch(function(){});
+      lcTrack.applyConstraints({ advanced: [{ focusMode: 'single-shot' }] }).catch(function(){
+        try{ lcTrack.applyConstraints({ focusMode: 'single-shot' }); }catch(e2){}
+      });
     }catch(e){}
   }
 
-  // Đợi 150ms cho focus settle rồi mới capture
+  var settleMs = 220; // slightly longer than before so AF can settle
   setTimeout(function(){
-    const vw=v.videoWidth, vh=v.videoHeight, size=Math.min(vw,vh);
-    const sx=(vw-size)/2, sy=(vh-size)/2;
-    const canvas=document.createElement('canvas');
-    canvas.width=1080; canvas.height=1080;
-    const ctx=canvas.getContext('2d');
-    if(lcFacing==='user'){ ctx.translate(canvas.width,0); ctx.scale(-1,1); }
-    // Vẽ từ video gốc (đã high-res), crop center square
-    ctx.drawImage(v, sx, sy, size, size, 0, 0, 1080, 1080);
+    // Path A: ImageCapture.takePhoto — full still pipeline (best sharpness when supported)
+    if(window.ImageCapture && lcTrack){
+      try{
+        var ic = new ImageCapture(lcTrack);
+        if(ic.takePhoto){
+          ic.takePhoto().then(function(blob){
+            if(!blob){ fallbackCanvas(); return; }
+            // Crop center-square to 1080 JPEG
+            createImageBitmap(blob).then(function(bmp){
+              var side=Math.min(bmp.width, bmp.height);
+              var sx=(bmp.width-side)/2, sy=(bmp.height-side)/2;
+              var c=document.createElement('canvas');
+              c.width=1080; c.height=1080;
+              var ctx=c.getContext('2d');
+              ctx.imageSmoothingEnabled=true;
+              try{ ctx.imageSmoothingQuality='high'; }catch(e){}
+              if(lcFacing==='user'){ ctx.translate(1080,0); ctx.scale(-1,1); }
+              ctx.drawImage(bmp, sx, sy, side, side, 0, 0, 1080, 1080);
+              try{ bmp.close(); }catch(e){}
+              c.toBlob(function(b){ finishLiveStill(b || blob); }, 'image/jpeg', 0.93);
+            }).catch(function(){ fallbackCanvas(); });
+          }).catch(function(){ fallbackCanvas(); });
+          return;
+        }
+      }catch(e){}
+    }
+    fallbackCanvas();
+  }, settleMs);
 
-    canvas.toBlob(b=>{
+  function fallbackCanvas(){
+    try{
+      var canvas=canvasCaptureFromVideo(v);
+      if(!canvas){ btn.disabled=false; toast('Camera chưa sẵn sàng'); return; }
+      canvas.toBlob(function(b){ finishLiveStill(b); }, 'image/jpeg', 0.93);
+    }catch(err){
       btn.disabled=false;
-      if(!b) return;
-      croppedBlob=b; isVideo=false; originalFile=null;
-      $('previewImg').src=URL.createObjectURL(b);
-      $('previewImg').classList.remove('hidden');
-      $('previewVid').classList.add('hidden');
-      $('uploadActions').classList.remove('hidden');
-      stopLiveCamera();
-      $('liveCam').classList.add('hidden');
-      $('previewBox').classList.remove('hidden');
-    }, 'image/jpeg', 0.92);
-  }, 150);
+      toast('Không chụp được ảnh');
+    }
+  }
 }
 
 /* ===================== Live camera: Photo/Video mode switch ===================== */
@@ -3643,19 +3721,44 @@ bindMomentsClickDelegation();
 })();
 updateOnlineUI();
 renderQueue().then(()=>flushQueue());
-window.addEventListener('online',()=>{ updateOnlineUI(); toast('Đã có mạng — đang đăng hàng đợi'); flushQueue(); });
-window.addEventListener('offline',()=>{ updateOnlineUI(); toast('Mất mạng — ảnh mới sẽ lưu máy'); });
-document.addEventListener('visibilitychange',()=>{
+window.addEventListener('online',function(){
+  updateOnlineUI();
+  toast('Đã có mạng — đang đăng hàng đợi');
+  flushQueue();
+  // Coming back online: soft cache is untrusted (may be hours old while offline).
+  // Invalidate timers and force a real fetch so Moments are not stuck on stale local data.
+  momentsUpdatedAt = 0;
+  try{
+    var ml0=readMomentsLocal();
+    if(ml0){
+      ml0.ts = 0;
+      // keep items for instant paint, but mark age expired
+      localStorage.setItem(MOMENTS_LS_KEY, JSON.stringify({
+        moments: ml0.moments||[],
+        updated_at: 0,
+        ts: 0
+      }));
+    }
+  }catch(e){}
+  preloadMoments();
+  if($('page-moments') && $('page-moments').classList.contains('active')){
+    ensureMomentsFromCache();
+    loadMoments(true);
+  }
+});
+window.addEventListener('offline',function(){ updateOnlineUI(); toast('Mất mạng — ảnh mới sẽ lưu máy'); });
+document.addEventListener('visibilitychange',function(){
   if(document.visibilityState==='visible'){
     const gap = _momentsHiddenAt ? (Date.now() - _momentsHiddenAt) : 0;
     const local=readFriendsLocal();
     if(!local || Date.now()-(local.ts||0)>FRIENDS_TTL_MS) loadFriends(false);
 
-    // MOMENTS: nếu vừa quay lại và online + cache cũ > 30 giây → force fetch
     var ml=readMomentsLocal();
     var cacheAge = ml ? (Date.now()-(ml.ts||0)) : 999999;
-    if(navigator.onLine && cacheAge > 30000){
-      preloadMoments(); // sẽ tự force fetch
+    // After long background / offline stretch → force network; keep painting local meanwhile
+    if(navigator.onLine && (cacheAge > 30000 || gap > 60000)){
+      momentsUpdatedAt = 0;
+      preloadMoments();
     } else if(!ml || Date.now()-(ml.ts||0)>MOMENTS_TTL_MS) {
       preloadMoments();
     }
@@ -3663,14 +3766,16 @@ document.addEventListener('visibilitychange',()=>{
     const momentsActive = $('page-moments') && $('page-moments').classList.contains('active');
     if(momentsActive){
       ensureMomentsFromCache();
-      if(gap > 15000 || !(_mc && _mc.children.length)){
-        loadMoments(true); // force
+      var grid=$('momentsGrid'), feed=$('momentsFeed');
+      var hasDom = (grid && grid.children.length) || (feed && feed.children.length);
+      if(gap > 15000 || !hasDom || cacheAge > 30000){
+        loadMoments(true);
         bindMomentsScroll();
       } else {
         pollMomentsOnce();
       }
     }
-    if($('page-upload').classList.contains('active') && isLiveCamera() && !croppedBlob && !lcStream){
+    if($('page-upload') && $('page-upload').classList.contains('active') && isLiveCamera() && !croppedBlob && !lcStream){
       startLiveCamera();
     }
   } else {
