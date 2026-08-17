@@ -1792,6 +1792,13 @@ body{
       </div>
       <label class="switch"><input type="checkbox" id="autoCameraSwitch" onchange="toggleAutoCamera(this.checked)"><span class="slider"></span></label>
     </div>
+    <div class="switch-row">
+      <div>
+        <div class="sw-text">Chế độ máy yếu</div>
+        <div class="sw-sub">Giảm độ phân giải camera & ảnh chụp — mượt hơn trên máy cũ/cam yếu (iPhone 6 trở về sau)</div>
+      </div>
+      <label class="switch"><input type="checkbox" id="lowPowerSwitch" onchange="toggleLowPower(this.checked)"><span class="slider"></span></label>
+    </div>
     <div class="preview-box" id="previewBox" onclick="openCapture()">
       <div class="preview-hint" id="uploadPlaceholder">
         <i class="bi bi-camera" style="font-size:40px"></i><br>
@@ -1940,6 +1947,32 @@ var FEED_THUMB_W = IS_PHONE ? 360 : 540;  // vertical feed card
 var AVATAR_W = 96;
 var LOCAL_MOMENTS_CAP = IS_PHONE ? 30 : 80;
 var LOCAL_FRIENDS_CAP = 200;
+
+/* ---------- Low-power mode: manual toggle + auto-detect old iOS ---------- */
+var OLD_IOS = (function(){
+  var m = navigator.userAgent.match(/OS (\d+)_/);
+  return !!(m && parseInt(m[1],10) <= 12 && /iPhone|iPad|iPod/.test(navigator.userAgent));
+})();
+function isLowPower(){
+  try{
+    var v = localStorage.getItem('locket_low_power');
+    if(v==='1') return true;
+    if(v==='0') return false;
+  }catch(e){}
+  return OLD_IOS; // unset = auto, based on device
+}
+function setLowPower(on){
+  try{ localStorage.setItem('locket_low_power', on?'1':'0'); }catch(e){}
+  LOW_POWER = on;
+}
+var LOW_POWER = isLowPower();
+/* Capture/preview sizing driven by LOW_POWER — smaller frames decode/encode much
+   faster on iPhone 6-era Safari and avoid the tab getting killed for memory. */
+var LC_WIDTH_IDEAL = LOW_POWER ? 960 : 1920;
+var LC_HEIGHT_IDEAL = LOW_POWER ? 960 : 1080;
+var LC_FRAMERATE_IDEAL = LOW_POWER ? 15 : 30;
+var CAPTURE_SIZE = LOW_POWER ? 720 : 1080;
+var CAPTURE_JPEG_Q = LOW_POWER ? 0.82 : 0.93;
 /* WebP support detection — chỉ convert sang JPEG khi thực sự cần */
 var WEBP_SUPPORTED = false;
 (function(){
@@ -3062,7 +3095,7 @@ function confirmCrop(){
   if(!cropper)return;
   const btn=document.querySelector('#cropStage .crop-header button:last-child');
   if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner light"></span>'}
-  const canvas=cropper.getCroppedCanvas({width:1080,height:1080,imageSmoothingQuality:'high'});
+  const canvas=cropper.getCroppedCanvas({width:CAPTURE_SIZE,height:CAPTURE_SIZE,imageSmoothingQuality:'high'});
   canvas.toBlob(b=>{
     croppedBlob=b;
     $('previewImg').src=URL.createObjectURL(b);
@@ -3074,7 +3107,7 @@ function confirmCrop(){
     document.body.style.overflow='';
     if(btn){btn.disabled=false;btn.textContent='Xong'}
     cropper.destroy();cropper=null;
-  },'image/jpeg',0.92);
+  },'image/jpeg',CAPTURE_JPEG_Q);
 }
 function clearUpload(){
   croppedBlob=null;originalFile=null;isVideo=false;videoCropPayload=null;
@@ -3199,8 +3232,9 @@ function startLiveCamera(){
     audio:false,
     video:{
       facingMode: { exact: lcFacing },
-      width: { ideal: 1920 },
-      height: { ideal: 1080 }
+      width: { ideal: LC_WIDTH_IDEAL },
+      height: { ideal: LC_HEIGHT_IDEAL },
+      frameRate: { ideal: LC_FRAMERATE_IDEAL }
     }
   };
 
@@ -3214,14 +3248,15 @@ function startLiveCamera(){
       audio:false,
       video:{
         facingMode: { ideal: lcFacing },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 }
+        width: { ideal: LC_WIDTH_IDEAL },
+        height: { ideal: LC_HEIGHT_IDEAL },
+        frameRate: { ideal: LC_FRAMERATE_IDEAL }
       }
     });
   }).catch(function(){
     return openCam({
       audio:false,
-      video:{ facingMode: lcFacing, width: { ideal: 1280 }, height: { ideal: 720 } }
+      video:{ facingMode: lcFacing, width: { ideal: LOW_POWER ? 640 : 1280 }, height: { ideal: LOW_POWER ? 640 : 720 } }
     });
   }).then(function(s){
     lcStarting=false;
@@ -3244,8 +3279,9 @@ function startLiveCamera(){
       const fb=$('lcFlashBtn');
       if(fb) fb.classList.toggle('hidden', !(caps && caps.torch));
 
-      // Push track to sensor max when browser allows (reduces soft upscale on front cam)
-      if(caps && caps.width && caps.height && typeof caps.width.max==='number'){
+      // Push track to sensor max when browser allows (reduces soft upscale on front cam).
+      // Skipped entirely in low-power mode — the smaller ideal size above is the point.
+      if(!LOW_POWER && caps && caps.width && caps.height && typeof caps.width.max==='number'){
         var wantW = Math.min(caps.width.max, 1920);
         var wantH = Math.min(caps.height.max, 1080);
         var curW = (settings && settings.width) || 0;
@@ -3525,12 +3561,12 @@ function canvasCaptureFromVideo(v){
   var size=Math.min(vw,vh);
   var sx=(vw-size)/2, sy=(vh-size)/2;
   var out=document.createElement('canvas');
-  out.width=1080; out.height=1080;
+  out.width=CAPTURE_SIZE; out.height=CAPTURE_SIZE;
   var ctx=out.getContext('2d');
-  if(lcFacing==='user'){ ctx.translate(1080,0); ctx.scale(-1,1); }
+  if(lcFacing==='user'){ ctx.translate(CAPTURE_SIZE,0); ctx.scale(-1,1); }
   ctx.imageSmoothingEnabled=true;
   try{ ctx.imageSmoothingQuality='high'; }catch(e){}
-  ctx.drawImage(v, sx, sy, size, size, 0, 0, 1080, 1080);
+  ctx.drawImage(v, sx, sy, size, size, 0, 0, CAPTURE_SIZE, CAPTURE_SIZE);
   return out;
 }
 function captureLivePhoto(e){
@@ -3564,14 +3600,14 @@ function captureLivePhoto(e){
               var side=Math.min(bmp.width, bmp.height);
               var sx=(bmp.width-side)/2, sy=(bmp.height-side)/2;
               var c=document.createElement('canvas');
-              c.width=1080; c.height=1080;
+              c.width=CAPTURE_SIZE; c.height=CAPTURE_SIZE;
               var ctx=c.getContext('2d');
               ctx.imageSmoothingEnabled=true;
               try{ ctx.imageSmoothingQuality='high'; }catch(e){}
-              if(lcFacing==='user'){ ctx.translate(1080,0); ctx.scale(-1,1); }
-              ctx.drawImage(bmp, sx, sy, side, side, 0, 0, 1080, 1080);
+              if(lcFacing==='user'){ ctx.translate(CAPTURE_SIZE,0); ctx.scale(-1,1); }
+              ctx.drawImage(bmp, sx, sy, side, side, 0, 0, CAPTURE_SIZE, CAPTURE_SIZE);
               try{ bmp.close(); }catch(e){}
-              c.toBlob(function(b){ finishLiveStill(b); }, 'image/jpeg', 0.93);
+              c.toBlob(function(b){ finishLiveStill(b); }, 'image/jpeg', CAPTURE_JPEG_Q);
             }).catch(function(){ fromVideoEl(); });
             return;
           }
@@ -3588,7 +3624,7 @@ function captureLivePhoto(e){
     try{
       var canvas=canvasCaptureFromVideo(v);
       if(!canvas){ btn.disabled=false; toast('Camera chưa sẵn sàng'); return; }
-      canvas.toBlob(function(b){ finishLiveStill(b); }, 'image/jpeg', 0.93);
+      canvas.toBlob(function(b){ finishLiveStill(b); }, 'image/jpeg', CAPTURE_JPEG_Q);
     }catch(err){
       btn.disabled=false;
       toast('Không chụp được ảnh');
@@ -3786,6 +3822,11 @@ async function enqueueUpload(blob, caption, filename, contentType){
   await renderQueue();
   return job;
 }
+/* Backoff schedule for jobs the server actively rejects (not just offline) —
+   keeps a flaky connection from hammering /api/upload every tick while the
+   page happens to stay open. Network errors (offline mid-request) reset to
+   immediate retry since those aren't the server's fault. */
+var QUEUE_BACKOFF_MS = [5000, 15000, 30000, 60000, 120000, 300000];
 async function postJob(job){
   job.status='uploading'; job.error='';
   await qPut(job); await renderQueue();
@@ -3803,11 +3844,15 @@ async function postJob(job){
       await renderQueue();
       return true;
     }
+    job.attempts=(job.attempts||0)+1;
     job.status='error'; job.error=(d&&d.error)||'Đăng thất bại';
+    job.nextTry=Date.now()+QUEUE_BACKOFF_MS[Math.min(job.attempts-1, QUEUE_BACKOFF_MS.length-1)];
     await qPut(job); await renderQueue();
     return false;
   }catch(err){
-    job.status='pending'; job.error='';
+    // Request never reached the server (offline mid-flight, DNS, etc) — not the
+    // job's fault, so don't burn a backoff step; just wait for real connectivity.
+    job.status='pending'; job.error=''; job.nextTry=0;
     await qPut(job); await renderQueue();
     return false;
   }
@@ -3818,9 +3863,11 @@ async function flushQueue(){
   _queueFlushing=true;
   try{
     const jobs=await qAll();
+    const now=Date.now();
     for(const j of jobs){
       if(!navigator.onLine) break;
       if(j.status==='done'){ await qDel(j.id); continue; }
+      if(j.nextTry && j.nextTry>now) continue; // still backing off, try next job instead
       const ok=await postJob(j);
       if(!ok && j.status==='error') continue; // try next; errors stay for retry
     }
@@ -3828,6 +3875,20 @@ async function flushQueue(){
     _queueFlushing=false;
     await renderQueue();
   }
+}
+/* There's no true background delivery on iOS Safari (no Background Sync API,
+   even in installed/Home-Screen PWAs) — a queued moment can only actually leave
+   the device while this tab/app is open and foregrounded. This ticker is the
+   closest practical substitute: as long as the person has the tab open (even
+   just sitting on another page inside the app), it keeps quietly retrying
+   instead of waiting for a single 'online' event that iOS may not always fire
+   reliably. Nothing sends while the tab is closed or the phone is locked/off. */
+var _queueTicker=null;
+function startQueueTicker(){
+  if(_queueTicker) return;
+  _queueTicker=setInterval(function(){
+    if(document.visibilityState==='visible' && navigator.onLine) flushQueue();
+  }, 20000);
 }
 function updateOnlineUI(){
   const b=$('offlineBanner');
@@ -3846,6 +3907,17 @@ function toggleAutoCamera(on){
 }
 function isAutoCamera(){
   try{ return localStorage.getItem('locket_auto_camera')==='1'; }catch(e){ return false; }
+}
+function toggleLowPower(on){
+  setLowPower(on);
+  LC_WIDTH_IDEAL = on ? 960 : 1920;
+  LC_HEIGHT_IDEAL = on ? 960 : 1080;
+  LC_FRAMERATE_IDEAL = on ? 15 : 30;
+  CAPTURE_SIZE = on ? 720 : 1080;
+  CAPTURE_JPEG_Q = on ? 0.82 : 0.93;
+  toast(on ? 'Đã bật chế độ máy yếu' : 'Đã tắt chế độ máy yếu');
+  // Re-open the live camera with the new constraints if it's currently running
+  if(lcStream) startLiveCamera();
 }
 function maybeAutoCamera(){
   if(!isAutoCamera()) return;
@@ -3937,6 +4009,8 @@ bindMomentsClickDelegation();
 })();
 updateOnlineUI();
 renderQueue().then(()=>flushQueue());
+startQueueTicker();
+window.addEventListener('focus',function(){ if(navigator.onLine) flushQueue(); });
 window.addEventListener('online',function(){
   updateOnlineUI();
   toast('Đã có mạng — đang đăng hàng đợi');
@@ -3965,6 +4039,7 @@ window.addEventListener('online',function(){
 window.addEventListener('offline',function(){ updateOnlineUI(); toast('Mất mạng — ảnh mới sẽ lưu máy'); });
 document.addEventListener('visibilitychange',function(){
   if(document.visibilityState==='visible'){
+    if(navigator.onLine) flushQueue();
     const gap = _momentsHiddenAt ? (Date.now() - _momentsHiddenAt) : 0;
     const local=readFriendsLocal();
     if(!local || Date.now()-(local.ts||0)>FRIENDS_TTL_MS) loadFriends(false);
@@ -4035,6 +4110,10 @@ window.addEventListener('orientationchange', function(){
 (function initLiveCamera(){
   const sw=$('liveCameraSwitch');
   if(sw) sw.checked=isLiveCamera();
+})();
+(function initLowPower(){
+  const sw=$('lowPowerSwitch');
+  if(sw) sw.checked=isLowPower();
 })();
 if('serviceWorker' in navigator){
   setTimeout(function(){
