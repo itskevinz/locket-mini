@@ -1966,8 +1966,6 @@ function setLowPower(on){
   LOW_POWER = on;
 }
 var LOW_POWER = isLowPower();
-/* Capture/preview sizing driven by LOW_POWER — smaller frames decode/encode much
-   faster on iPhone 6-era Safari and avoid the tab getting killed for memory. */
 var LC_WIDTH_IDEAL = LOW_POWER ? 960 : 1920;
 var LC_HEIGHT_IDEAL = LOW_POWER ? 960 : 1080;
 var LC_FRAMERATE_IDEAL = LOW_POWER ? 15 : 30;
@@ -2117,7 +2115,7 @@ function doLogin(){
   const remember=!!$('loginRemember')&&$('loginRemember').checked;
   if(!e||!p){toast('Nhập email và mật khẩu');return}
   btn.innerHTML='<span class="spinner"></span>';btn.disabled=true;
-  api('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e,password:p,remember:remember})})
+  apiTimeout('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e,password:p,remember:remember})}, 20000)
   .then(d=>{
     btn.innerHTML='Log In';btn.disabled=false;
     if(d.ok){location.reload()}else{toast(d.error||'Đăng nhập thất bại')}
@@ -2240,7 +2238,7 @@ function loadMe(){
   }else{
     $('dashAvatar').innerHTML=renderAvatar({},56);
   }
-  api('/api/me').then(d=>{
+  apiTimeout('/api/me', null, 15000).then(d=>{
     if(!d.ok){toast(d.error||'Không tải được thông tin');return}
     meLoaded=true;
     const me=d.me||{};
@@ -2302,7 +2300,7 @@ function loadFriends(force){
     $('friendsEmpty').classList.add('hidden');
     list.innerHTML=Array(5).fill('<div class="skeleton" style="height:68px;margin-bottom:10px"></div>').join('');
   }
-  api('/api/friends').then(d=>{
+  apiTimeout('/api/friends', null, 15000).then(d=>{
     if(!d.ok){
       if(!friendsCache||!friendsCache.length){
         toast(d.error||'Không tải được bạn bè');
@@ -2617,7 +2615,7 @@ function applyPendingMoments(){
 function refreshMomentsNow(){
   var icon=$('momentsRefreshIcon');
   if(icon) icon.classList.add('icon-spin');
-  api('/api/moments?force=1').then(function(d){
+  apiTimeout('/api/moments?force=1', null, 20000).then(function(d){
     if(icon) icon.classList.remove('icon-spin');
     if(!d.ok){ toast(d.error||'Không làm mới được Moments'); return; }
     var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
@@ -2964,7 +2962,7 @@ function preloadMoments(){
   var need=!(local && (Date.now()-(local.ts||0)<MOMENTS_TTL_MS) && local.moments && local.moments.length);
   var run = function(){
     if(_momentsFetchInFlight) return;
-    api('/api/moments?force=1').then(function(d){
+    apiTimeout('/api/moments?force=1', null, 20000).then(function(d){
       if(!d.ok) return;
       var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
       // Silent: only update memory/localStorage; do not force full UI re-render unless on page
@@ -2988,7 +2986,7 @@ function preloadMoments(){
   }
 }
 function pollMomentsOnce(){
-  api('/api/moments/poll?since='+encodeURIComponent(momentsUpdatedAt||0)).then(function(d){
+  apiTimeout('/api/moments/poll?since='+encodeURIComponent(momentsUpdatedAt||0), null, 20000).then(function(d){
     if(!d.ok||!d.changed)return;
     const items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
     if(!items.length)return;
@@ -3737,33 +3735,47 @@ function openQdb(){
     if(_qdb){resolve(_qdb);return}
     const req=indexedDB.open(QDB_NAME,1);
     req.onupgradeneeded=()=>{const db=req.result; if(!db.objectStoreNames.contains(QDB_STORE)) db.createObjectStore(QDB_STORE,{keyPath:'id'});};
-    req.onsuccess=()=>{_qdb=req.result; resolve(_qdb)};
+    req.onsuccess=()=>{
+      _qdb=req.result;
+      _qdb.onclose=function(){ _qdb=null; };
+      _qdb.onversionchange=function(){ try{ _qdb.close(); }catch(e){} _qdb=null; };
+      resolve(_qdb);
+    };
     req.onerror=()=>reject(req.error);
   });
 }
+function qWithRetry(run){
+  return run().catch(err=>{
+    // Safari/WKWebView can force-close an idle IndexedDB connection while the
+    // tab is backgrounded; the cached handle then throws on the next use.
+    // Drop it and reopen once instead of failing the whole upload.
+    _qdb=null;
+    return run();
+  });
+}
 function qAll(){
-  return openQdb().then(db=>new Promise((resolve,reject)=>{
+  return qWithRetry(()=>openQdb().then(db=>new Promise((resolve,reject)=>{
     const tx=db.transaction(QDB_STORE,'readonly');
     const req=tx.objectStore(QDB_STORE).getAll();
     req.onsuccess=()=>resolve((req.result||[]).sort((a,b)=>a.created-b.created));
     req.onerror=()=>reject(req.error);
-  }));
+  })));
 }
 function qPut(job){
-  return openQdb().then(db=>new Promise((resolve,reject)=>{
+  return qWithRetry(()=>openQdb().then(db=>new Promise((resolve,reject)=>{
     const tx=db.transaction(QDB_STORE,'readwrite');
     tx.objectStore(QDB_STORE).put(job);
     tx.oncomplete=()=>resolve();
     tx.onerror=()=>reject(tx.error);
-  }));
+  })));
 }
 function qDel(id){
-  return openQdb().then(db=>new Promise((resolve,reject)=>{
+  return qWithRetry(()=>openQdb().then(db=>new Promise((resolve,reject)=>{
     const tx=db.transaction(QDB_STORE,'readwrite');
     tx.objectStore(QDB_STORE).delete(id);
     tx.oncomplete=()=>resolve();
     tx.onerror=()=>reject(tx.error);
-  }));
+  })));
 }
 function blobToDataUrl(blob){
   return new Promise((resolve,reject)=>{
@@ -3822,10 +3834,6 @@ async function enqueueUpload(blob, caption, filename, contentType){
   await renderQueue();
   return job;
 }
-/* Backoff schedule for jobs the server actively rejects (not just offline) —
-   keeps a flaky connection from hammering /api/upload every tick while the
-   page happens to stay open. Network errors (offline mid-request) reset to
-   immediate retry since those aren't the server's fault. */
 var QUEUE_BACKOFF_MS = [5000, 15000, 30000, 60000, 120000, 300000];
 async function postJob(job){
   job.status='uploading'; job.error='';
@@ -3835,10 +3843,9 @@ async function postJob(job){
   fd.append('file', blob, job.filename||'moment.jpg');
   fd.append('caption', job.caption||'');
   try{
-    const d=await api('/api/upload',{method:'POST',body:fd});
+    const d=await apiTimeout('/api/upload',{method:'POST',body:fd}, 25000);
     if(d&&d.ok){
       await qDel(job.id);
-      // Do NOT wipe momentsCache — mark stale so next open merges, old posts stay visible
       momentsUpdatedAt=0;
       momentsLoaded=false;
       await renderQueue();
@@ -3850,8 +3857,6 @@ async function postJob(job){
     await qPut(job); await renderQueue();
     return false;
   }catch(err){
-    // Request never reached the server (offline mid-flight, DNS, etc) — not the
-    // job's fault, so don't burn a backoff step; just wait for real connectivity.
     job.status='pending'; job.error=''; job.nextTry=0;
     await qPut(job); await renderQueue();
     return false;
@@ -3859,35 +3864,26 @@ async function postJob(job){
 }
 async function flushQueue(){
   if(_queueFlushing) return;
-  if(!navigator.onLine) return;
   _queueFlushing=true;
   try{
     const jobs=await qAll();
     const now=Date.now();
     for(const j of jobs){
-      if(!navigator.onLine) break;
       if(j.status==='done'){ await qDel(j.id); continue; }
-      if(j.nextTry && j.nextTry>now) continue; // still backing off, try next job instead
+      if(j.nextTry && j.nextTry>now) continue;
       const ok=await postJob(j);
-      if(!ok && j.status==='error') continue; // try next; errors stay for retry
+      if(!ok && j.status==='error') continue;
     }
   }finally{
     _queueFlushing=false;
     await renderQueue();
   }
 }
-/* There's no true background delivery on iOS Safari (no Background Sync API,
-   even in installed/Home-Screen PWAs) — a queued moment can only actually leave
-   the device while this tab/app is open and foregrounded. This ticker is the
-   closest practical substitute: as long as the person has the tab open (even
-   just sitting on another page inside the app), it keeps quietly retrying
-   instead of waiting for a single 'online' event that iOS may not always fire
-   reliably. Nothing sends while the tab is closed or the phone is locked/off. */
 var _queueTicker=null;
 function startQueueTicker(){
   if(_queueTicker) return;
   _queueTicker=setInterval(function(){
-    if(document.visibilityState==='visible' && navigator.onLine) flushQueue();
+    if(document.visibilityState==='visible') flushQueue();
   }, 20000);
 }
 function updateOnlineUI(){
@@ -3942,9 +3938,9 @@ function doUpload(){
   const ct=(croppedBlob.type)||(isVideo?'video/mp4':'image/jpeg');
   btn.innerHTML='<span class="spinner"></span> Đang xử lý...';btn.disabled=true;
 
-  const finishOk=()=>{
+  const finishOk=(sent)=>{
     btn.innerHTML='Gửi cho tất cả bạn bè';btn.disabled=false;
-    toast(navigator.onLine?'Đã đăng!':'Đã lưu — sẽ tự đăng khi có mạng');
+    toast(sent?'Đã đăng!':'Đã lưu — sẽ tự đăng khi có mạng');
     $('caption').value=''; clearUpload();
   };
   const finishFail=(msg)=>{
@@ -3953,45 +3949,37 @@ function doUpload(){
   };
 
   const directUpload=()=>{
-    // Videos skip the base64/IndexedDB queue entirely: atob()-ing a multi-MB
-    // video into memory is exactly the kind of allocation that kills the tab
-    // on an iPhone 6. Photos are already small (compressed before this point)
-    // so the offline queue stays safe for them.
     const fd=new FormData();
     fd.append('file',croppedBlob,filename);
     fd.append('caption',cap);
     if(isVideo && videoCropPayload) fd.append('cropPayload', videoCropPayload);
-    api('/api/upload',{method:'POST',body:fd}).then(d=>{
-      if(d.ok){ finishOk(); momentsLoaded=false; momentsUpdatedAt=0; /* keep momentsCache — avoid empty flash on iPhone 6 */ }
+    apiTimeout('/api/upload',{method:'POST',body:fd}, isVideo?60000:25000).then(d=>{
+      if(d.ok){ finishOk(true); momentsLoaded=false; momentsUpdatedAt=0; }
       else finishFail(d.error||'Đăng thất bại');
-    }).catch(()=>finishFail('Lỗi mạng khi đăng'));
+    }).catch(()=>finishFail(navigator.onLine?'Lỗi mạng khi đăng, thử lại':'Mất mạng — thử lại sau'));
   };
 
   if(isVideo){
-    if(!navigator.onLine){ finishFail('Mất mạng — video không thể lưu offline, thử lại khi có mạng'); return; }
     directUpload();
     return;
   }
 
-  // Always enqueue for durability; if online, flush immediately in order
+  // Always enqueue for durability, then attempt to send right away regardless of
+  // what navigator.onLine claims — it can report a stale value after the app
+  // comes back from being backgrounded, so trusting it here silently stranded
+  // moments in the queue on an actually-connected phone.
   enqueueUpload(croppedBlob, cap, filename, ct).then(job=>{
-    if(!navigator.onLine){
-      finishOk();
-      return;
-    }
     return postJob(job).then(ok=>{
-      if(ok) finishOk();
-      else finishFail(job.error||'Đăng thất bại — đã giữ trong hàng đợi');
+      if(ok) finishOk(true);
+      else finishOk(false); // stays queued, ticker/focus/online listeners retry it
     });
   }).catch(err=>{
     console.error(err);
-    // fallback: try direct upload if queue failed (e.g. private mode no IDB)
-    if(!navigator.onLine){ finishFail('Không lưu offline được trên trình duyệt này'); return; }
     directUpload();
   });
 }
 
-function doLogout(){api('/api/logout').then(()=>location.reload())}
+function doLogout(){apiTimeout('/api/logout', null, 10000).then(()=>location.reload()).catch(()=>location.reload())}
 
 /* boot */
 loadMe();
@@ -4010,7 +3998,7 @@ bindMomentsClickDelegation();
 updateOnlineUI();
 renderQueue().then(()=>flushQueue());
 startQueueTicker();
-window.addEventListener('focus',function(){ if(navigator.onLine) flushQueue(); });
+window.addEventListener('focus',function(){ flushQueue(); });
 window.addEventListener('online',function(){
   updateOnlineUI();
   toast('Đã có mạng — đang đăng hàng đợi');
@@ -4039,7 +4027,7 @@ window.addEventListener('online',function(){
 window.addEventListener('offline',function(){ updateOnlineUI(); toast('Mất mạng — ảnh mới sẽ lưu máy'); });
 document.addEventListener('visibilitychange',function(){
   if(document.visibilityState==='visible'){
-    if(navigator.onLine) flushQueue();
+    flushQueue();
     const gap = _momentsHiddenAt ? (Date.now() - _momentsHiddenAt) : 0;
     const local=readFriendsLocal();
     if(!local || Date.now()-(local.ts||0)>FRIENDS_TTL_MS) loadFriends(false);
@@ -4076,6 +4064,7 @@ document.addEventListener('visibilitychange',function(){
 });
 window.addEventListener('pageshow', function(e){
   if(e.persisted){
+    flushQueue();
     // BFCache restore: luôn force fetch moments nếu online
     if(navigator.onLine){
       momentsUpdatedAt = 0; // invalidate soft cache
