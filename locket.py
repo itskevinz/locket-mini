@@ -124,6 +124,15 @@ _MOMENTS_CACHE: Dict[str, Dict[str, Any]] = {}
 # token refresh tracking
 _TOKEN_LOCK = threading.Lock()
 
+_UPLOAD_DEDUPE_LOCK = threading.Lock()
+_UPLOAD_DEDUPE: Dict[str, Any] = {}
+_UPLOAD_DEDUPE_TTL_SEC = 600
+
+def _dedupe_prune(now: float) -> None:
+    stale = [k for k, v in _UPLOAD_DEDUPE.items() if now - v["at"] > _UPLOAD_DEDUPE_TTL_SEC]
+    for k in stale:
+        _UPLOAD_DEDUPE.pop(k, None)
+
 IOS_UA = "com.locket.Locket/1.100.0 iPhone/18.2 hw/iPhone14_3"
 FIREBASE_GMPID = "1:641029076083:ios:cc8eb46290d69b234fa606"
 IOS_BUNDLE = "com.locket.Locket"
@@ -1770,6 +1779,7 @@ body{
         </a>
       </div>
     </div>
+    <div class="app-version">{{ app_version }}</div>
   </div>
 
   <div class="page" id="page-upload">
@@ -3835,31 +3845,39 @@ async function enqueueUpload(blob, caption, filename, contentType){
   return job;
 }
 var QUEUE_BACKOFF_MS = [5000, 15000, 30000, 60000, 120000, 300000];
+var _inFlightJobs = new Set();
 async function postJob(job){
-  job.status='uploading'; job.error='';
-  await qPut(job); await renderQueue();
-  const blob=dataUrlToBlob(job.dataUrl);
-  const fd=new FormData();
-  fd.append('file', blob, job.filename||'moment.jpg');
-  fd.append('caption', job.caption||'');
+  if(_inFlightJobs.has(job.id)) return false;
+  _inFlightJobs.add(job.id);
   try{
-    const d=await apiTimeout('/api/upload',{method:'POST',body:fd}, 25000);
-    if(d&&d.ok){
-      await qDel(job.id);
-      momentsUpdatedAt=0;
-      momentsLoaded=false;
-      await renderQueue();
-      return true;
+    job.status='uploading'; job.error='';
+    await qPut(job); await renderQueue();
+    const blob=dataUrlToBlob(job.dataUrl);
+    const fd=new FormData();
+    fd.append('file', blob, job.filename||'moment.jpg');
+    fd.append('caption', job.caption||'');
+    fd.append('client_id', job.id);
+    try{
+      const d=await apiTimeout('/api/upload',{method:'POST',body:fd}, 25000);
+      if(d&&d.ok){
+        await qDel(job.id);
+        momentsUpdatedAt=0;
+        momentsLoaded=false;
+        await renderQueue();
+        return true;
+      }
+      job.attempts=(job.attempts||0)+1;
+      job.status='error'; job.error=(d&&d.error)||'Đăng thất bại';
+      job.nextTry=Date.now()+QUEUE_BACKOFF_MS[Math.min(job.attempts-1, QUEUE_BACKOFF_MS.length-1)];
+      await qPut(job); await renderQueue();
+      return false;
+    }catch(err){
+      job.status='pending'; job.error=''; job.nextTry=0;
+      await qPut(job); await renderQueue();
+      return false;
     }
-    job.attempts=(job.attempts||0)+1;
-    job.status='error'; job.error=(d&&d.error)||'Đăng thất bại';
-    job.nextTry=Date.now()+QUEUE_BACKOFF_MS[Math.min(job.attempts-1, QUEUE_BACKOFF_MS.length-1)];
-    await qPut(job); await renderQueue();
-    return false;
-  }catch(err){
-    job.status='pending'; job.error=''; job.nextTry=0;
-    await qPut(job); await renderQueue();
-    return false;
+  }finally{
+    _inFlightJobs.delete(job.id);
   }
 }
 async function flushQueue(){
@@ -3870,6 +3888,7 @@ async function flushQueue(){
     const now=Date.now();
     for(const j of jobs){
       if(j.status==='done'){ await qDel(j.id); continue; }
+      if(_inFlightJobs.has(j.id)) continue;
       if(j.nextTry && j.nextTry>now) continue;
       const ok=await postJob(j);
       if(!ok && j.status==='error') continue;
@@ -3952,6 +3971,7 @@ function doUpload(){
     const fd=new FormData();
     fd.append('file',croppedBlob,filename);
     fd.append('caption',cap);
+    fd.append('client_id', 'd_'+Date.now()+'_'+Math.random().toString(36).slice(2,8));
     if(isVideo && videoCropPayload) fd.append('cropPayload', videoCropPayload);
     apiTimeout('/api/upload',{method:'POST',body:fd}, isVideo?60000:25000).then(d=>{
       if(d.ok){ finishOk(true); momentsLoaded=false; momentsUpdatedAt=0; }
@@ -4419,8 +4439,17 @@ def api_upload():
     f = request.files["file"]
     caption = request.form.get("caption", "")
     crop_payload = request.form.get("cropPayload") or None
+    client_id = request.form.get("client_id") or None
     if f.filename == "":
         return jsonify({"ok": False, "error": "Empty filename"})
+    dedupe_key = f"{s.local_id}:{client_id}" if client_id else None
+    if dedupe_key:
+        with _UPLOAD_DEDUPE_LOCK:
+            now = time.time()
+            _dedupe_prune(now)
+            hit = _UPLOAD_DEDUPE.get(dedupe_key)
+            if hit:
+                return jsonify({"ok": True, "result": hit["result"], "deduped": True})
     try:
         s = ensure_fresh_token(s)
         raw = f.read()
@@ -4433,6 +4462,9 @@ def api_upload():
         else:
             data, filename = compress_image(raw)
             result, _dbg = upload_media(s, data, filename, "image/jpeg", caption=caption)
+        if dedupe_key:
+            with _UPLOAD_DEDUPE_LOCK:
+                _UPLOAD_DEDUPE[dedupe_key] = {"at": time.time(), "result": result}
         # Mark cache stale but KEEP items — client paints old posts while force-fetch merges new one
         with _MOMENTS_LOCK:
             st = _MOMENTS_CACHE.get(s.local_id)
