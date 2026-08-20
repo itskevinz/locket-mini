@@ -148,6 +148,13 @@ CELEB_BADGE = "https://locket.binhake.dev/assets/images/celebrity_badge_small_No
 FONT_URL = "https://raw.githubusercontent.com/itskevinz/assets/main/proxima_soft_bold.otf"
 FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_preview_Normal@2x.png"
 
+# Engine name shown in Settings — "Lumen" for the light/glow theme this app already
+# leans on (gold badge, glow shadows, moments = little bursts of light).
+APP_CODENAME = "Lumen"
+APP_VERSION = "1.0"
+APP_BUILD = "2026.08"
+APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
+
 
 class LocketError(RuntimeError):
     pass
@@ -754,7 +761,13 @@ def get_moments_ws(s: LocketSession, page_token=None, client_target="all", timeo
 
 
 def _moment_key(m: Dict[str, Any]) -> str:
-    key = m.get("canonical_uid") or m.get("md5") or m.get("thumbnail_url") or m.get("url") or m.get("video_url")
+    # Firestore's own resource path ("projects/.../documents/moments/{docId}")
+    # is the only field here that's guaranteed both unique AND stable across
+    # repeated fetches. thumbnail_url/url are signed URLs that can come back
+    # with a different token each time the same moment is re-fetched, which
+    # made the old key-priority order treat one real moment as "new" again
+    # and duplicate it in the merged list.
+    key = m.get("name") or m.get("canonical_uid") or m.get("md5") or m.get("thumbnail_url") or m.get("url") or m.get("video_url")
     if key:
         return str(key)
     # Last-resort deterministic fallback — never id(m): that's a per-process
@@ -1493,6 +1506,8 @@ body{
 .contact-link .bi{margin-right:12px;font-size:22px}
 .contact-link span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .contact-link .cl-handle{color:var(--text2);font-weight:600;font-size:12.5px;margin-left:auto}
+.app-version{text-align:center;color:var(--text2);font-size:12px;font-weight:600;letter-spacing:.02em;
+  padding:18px 0 6px;opacity:.6}
 .switch-row{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-radius:14px;
   background:var(--surface);border:1px solid var(--border);margin-bottom:12px}
 .switch-row .sw-text{font-size:13px;font-weight:700;line-height:1.35;padding-right:12px}
@@ -2425,7 +2440,7 @@ function buildMomentNode(m, idx, friendMap, eager){
 function momentsActiveContainer(){
   return $(MOMENTS_GRID_MODE ? 'momentsGrid' : 'momentsFeed');
 }
-function momentKey(m){ return (m&&(m.thumbnail_url||m.url||m.video_url))||''; }
+function momentKey(m){ return (m&&(m.name||m.thumbnail_url||m.url||m.video_url))||''; }
 function bindMomentsClickDelegation(){
   var grid=$('momentsGrid'), feed=$('momentsFeed');
   function onClick(e){
@@ -2785,7 +2800,7 @@ function writeMomentsLocal(moments, updatedAt){
   function leanMap(list, cap){
     return (list||[]).slice(0, cap).map(function(m){
       return {
-        user:m.user, user_id:m.user_id, thumbnail_url:m.thumbnail_url, url:m.url, video_url:m.video_url,
+        name:m.name, user:m.user, user_id:m.user_id, thumbnail_url:m.thumbnail_url, url:m.url, video_url:m.video_url,
         date:m.date, timestamp:m.timestamp, created_at:m.created_at, caption:m.caption, overlays:m.overlays,
         first_name:m.first_name, last_name:m.last_name, profile_picture_url:m.profile_picture_url,
         from_celebrity:m.from_celebrity
@@ -3850,6 +3865,18 @@ async function postJob(job){
   if(_inFlightJobs.has(job.id)) return false;
   _inFlightJobs.add(job.id);
   try{
+    if(navigator.locks && navigator.locks.request){
+      return await navigator.locks.request('locket-job-'+job.id, {ifAvailable:true}, async lock=>{
+        if(!lock) return false; // another tab already holds this job's lock
+        return await postJobInner(job);
+      });
+    }
+    return await postJobInner(job);
+  }finally{
+    _inFlightJobs.delete(job.id);
+  }
+}
+async function postJobInner(job){
     job.status='uploading'; job.error='';
     await qPut(job); await renderQueue();
     const blob=dataUrlToBlob(job.dataUrl);
@@ -3876,9 +3903,6 @@ async function postJob(job){
       await qPut(job); await renderQueue();
       return false;
     }
-  }finally{
-    _inFlightJobs.delete(job.id);
-  }
 }
 async function flushQueue(){
   if(_queueFlushing) return;
@@ -4171,6 +4195,7 @@ def index():
         boot_name=(s.display_name if s else ""),
         boot_photo=(s.photo_url if s else ""),
         boot_email=(s.email if s else ""),
+        app_version=APP_VERSION_STRING,
     )
 
 
@@ -4449,7 +4474,14 @@ def api_upload():
             _dedupe_prune(now)
             hit = _UPLOAD_DEDUPE.get(dedupe_key)
             if hit:
+                if hit.get("pending"):
+                    return jsonify({"ok": False, "error": "Đang đăng ảnh này rồi, đợi chút", "retry": True})
                 return jsonify({"ok": True, "result": hit["result"], "deduped": True})
+            # Reserve the key for the whole duration of the upload — closes the
+            # window where two requests for the same client_id (two tabs, or a
+            # retry racing the original) both pass the check before either has
+            # a result to dedupe against, and both end up posted to Locket.
+            _UPLOAD_DEDUPE[dedupe_key] = {"at": now, "pending": True, "result": None}
     try:
         s = ensure_fresh_token(s)
         raw = f.read()
@@ -4464,7 +4496,7 @@ def api_upload():
             result, _dbg = upload_media(s, data, filename, "image/jpeg", caption=caption)
         if dedupe_key:
             with _UPLOAD_DEDUPE_LOCK:
-                _UPLOAD_DEDUPE[dedupe_key] = {"at": time.time(), "result": result}
+                _UPLOAD_DEDUPE[dedupe_key] = {"at": time.time(), "pending": False, "result": result}
         # Mark cache stale but KEEP items — client paints old posts while force-fetch merges new one
         with _MOMENTS_LOCK:
             st = _MOMENTS_CACHE.get(s.local_id)
@@ -4474,13 +4506,19 @@ def api_upload():
         return jsonify({"ok": True, "result": result})
     except requests.HTTPError as e:
         logger.error("UPLOAD http error: %s", e)
+        if dedupe_key:
+            with _UPLOAD_DEDUPE_LOCK:
+                _UPLOAD_DEDUPE.pop(dedupe_key, None)
         return jsonify({"ok": False, "error": f"Upload bị từ chối ({e})"})
     except Exception as e:
         logger.error("UPLOAD error: %s", e)
+        if dedupe_key:
+            with _UPLOAD_DEDUPE_LOCK:
+                _UPLOAD_DEDUPE.pop(dedupe_key, None)
         return jsonify({"ok": False, "error": str(e)})
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    logger.info("Starting Locket Mini on http://0.0.0.0:%d", port)
+    logger.info("Starting Locket Mini (%s) on http://0.0.0.0:%d", APP_VERSION_STRING, port)
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
