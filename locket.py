@@ -151,8 +151,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "1.0"
-APP_BUILD = "2026.08"
+APP_VERSION = "1.3"
+APP_BUILD = "2026.08.21"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -1945,7 +1945,7 @@ const GOLD_BADGE="{{ gold_badge }}", CELEB_BADGE="{{ celeb_badge }}";
 const BOOT_NAME={{ (boot_name or '')|tojson }};
 const BOOT_PHOTO={{ (boot_photo or '')|tojson }};
 let croppedBlob=null, originalFile=null, isVideo=false, cropper=null;
-let videoCropPayload=null;
+let videoCropPayload=null, videoThumbBlob=null;
 /* Center-square crop metadata, same shape binhake's own web client sends for video
    uploads (captured from a real browser session). Without this the field was
    previously hardcoded to "null", which is what photos already used successfully,
@@ -1958,6 +1958,26 @@ function buildVideoCropPayload(vw, vh){
 }
 function onPreviewVidMeta(){
   videoCropPayload = buildVideoCropPayload(this.videoWidth, this.videoHeight);
+}
+/* Locket's real API expects an actual JPEG still (a "thumb" field) alongside the
+   video, matching binhake's own web client. Without a real image here the field
+   silently fell back to the raw video bytes, which the real API rejects — this
+   is what was actually breaking video posts, not a network issue. Captures a
+   center-square frame from whichever <video> currently holds the footage. */
+function captureVideoThumb(videoEl){
+  return new Promise(function(resolve){
+    try{
+      if(!videoEl || !videoEl.videoWidth || !videoEl.videoHeight){ resolve(null); return; }
+      var vw=videoEl.videoWidth, vh=videoEl.videoHeight;
+      var side=Math.min(vw,vh);
+      var sx=(vw-side)/2, sy=(vh-side)/2;
+      var c=document.createElement('canvas');
+      c.width=CAPTURE_SIZE; c.height=CAPTURE_SIZE;
+      var ctx=c.getContext('2d');
+      ctx.drawImage(videoEl, sx, sy, side, side, 0, 0, CAPTURE_SIZE, CAPTURE_SIZE);
+      c.toBlob(function(b){ resolve(b); }, 'image/jpeg', CAPTURE_JPEG_Q);
+    }catch(e){ resolve(null); }
+  });
 }
 let friendsCache=null, momentsLoaded=false, meLoaded=false;
 let momentsCache=[], momentsUpdatedAt=0, momentsPollTimer=null;
@@ -3091,7 +3111,9 @@ function handleIncomingFile(f){
     $('previewVid').classList.remove('hidden'); $('previewVid').src=url;
     $('uploadPlaceholder').classList.add('hidden');
     $('uploadActions').classList.remove('hidden');
-    croppedBlob=f; return;
+    croppedBlob=f;
+    videoThumbBlob=null; // captured by the previewVid 'loadeddata' listener once a frame decodes
+    return;
   }
   $('cropImg').src=url;
   const stage=$('cropStage');
@@ -3133,7 +3155,7 @@ function confirmCrop(){
   },'image/jpeg',CAPTURE_JPEG_Q);
 }
 function clearUpload(){
-  croppedBlob=null;originalFile=null;isVideo=false;videoCropPayload=null;
+  croppedBlob=null;originalFile=null;isVideo=false;videoCropPayload=null;videoThumbBlob=null;
   $('fileInput').value='';
   if($('cameraInput')) $('cameraInput').value='';
   $('previewImg').classList.add('hidden');$('previewVid').classList.add('hidden');
@@ -3243,7 +3265,7 @@ function openCapture(){
   if(croppedBlob){
     $('previewImg').classList.add('hidden');$('previewVid').classList.add('hidden');
     $('uploadActions').classList.add('hidden');
-    croppedBlob=null;originalFile=null;isVideo=false;
+    croppedBlob=null;originalFile=null;isVideo=false;videoThumbBlob=null;videoCropPayload=null;
   }
   if(isLiveCamera()){
     $('previewBox').classList.add('hidden');
@@ -3772,6 +3794,11 @@ function finishVideoCapture(){
   croppedBlob=blob;
   isVideo=true;
   originalFile={name:'lc_video_'+Date.now()+'.'+ext};
+  // Grab the thumb frame from the still-live feed before stopLiveCamera() tears
+  // down the stream — drawImage() below captures synchronously, so this is safe
+  // even though the actual JPEG encode (toBlob) finishes asynchronously after.
+  videoThumbBlob=null;
+  captureVideoThumb($('lcVideo')).then(function(b){ videoThumbBlob=b; });
   $('previewVid').src=URL.createObjectURL(blob);
   $('previewVid').classList.remove('hidden');
   $('previewImg').classList.add('hidden');
@@ -4024,6 +4051,7 @@ function doUpload(){
     fd.append('caption',cap);
     fd.append('client_id', 'd_'+Date.now()+'_'+Math.random().toString(36).slice(2,8));
     if(videoCropPayload) fd.append('cropPayload', videoCropPayload);
+    if(videoThumbBlob) fd.append('thumb', videoThumbBlob, 'thumb.jpg');
     apiTimeout('/api/upload',{method:'POST',body:fd}, 60000).then(d=>{
       if(d&&d.ok){
         btn.innerHTML='Gửi cho tất cả bạn bè';btn.disabled=false;
@@ -4061,6 +4089,15 @@ loadMe();
 preloadFriends();
 preloadMoments();
 bindMomentsClickDelegation();
+(function bindPreviewVidThumb(){
+  var pv=$('previewVid');
+  if(!pv) return;
+  pv.addEventListener('loadeddata', function(){
+    if(isVideo && !videoThumbBlob){
+      captureVideoThumb(pv).then(function(b){ videoThumbBlob=b; });
+    }
+  });
+})();
 (function bindLcPinchZoom(){
   var frame=document.querySelector('#liveCam .lc-frame');
   if(!frame) return;
@@ -4493,6 +4530,7 @@ def api_upload():
     if "file" not in request.files:
         return jsonify({"ok": False, "error": "No file"})
     f = request.files["file"]
+    thumb_f = request.files.get("thumb")
     caption = request.form.get("caption", "")
     crop_payload = request.form.get("cropPayload") or None
     client_id = request.form.get("client_id") or None
@@ -4521,7 +4559,28 @@ def api_upload():
         if is_video:
             ext = f.filename.rsplit(".", 1)[-1] if "." in f.filename else "mp4"
             filename = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}.{ext}"
-            result, _dbg = upload_media(s, raw, filename, ct, caption=caption, crop_payload=crop_payload)
+            # Locket's real client always sends a JPEG "thumb" alongside the video;
+            # without one, upload_media() fell back to sending the raw video bytes
+            # (with a video/* content-type) as the thumb field, which the real
+            # binhake API silently rejects — that was the actual "video won't
+            # post" bug, not a network/timeout issue. The client now captures a
+            # real still frame before sending; use it when present.
+            thumb_data = thumb_name = thumb_type = None
+            if thumb_f and thumb_f.filename:
+                thumb_data = thumb_f.read()
+                thumb_name = "thumb.jpg"
+                thumb_type = thumb_f.content_type or "image/jpeg"
+            else:
+                # Defensive fallback for an old cached page that hasn't picked up
+                # the client-side thumb capture yet — still never send raw video
+                # bytes as the thumb field.
+                buf = io.BytesIO()
+                Image.new("RGB", (16, 16), (10, 10, 10)).save(buf, format="JPEG", quality=70)
+                thumb_data = buf.getvalue()
+                thumb_name = "thumb.jpg"
+                thumb_type = "image/jpeg"
+            result, _dbg = upload_media(s, raw, filename, ct, caption=caption, crop_payload=crop_payload,
+                                         thumb_data=thumb_data, thumb_name=thumb_name, thumb_type=thumb_type)
         else:
             data, filename = compress_image(raw)
             result, _dbg = upload_media(s, data, filename, "image/jpeg", caption=caption)
