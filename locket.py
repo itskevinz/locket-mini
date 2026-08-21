@@ -3186,6 +3186,35 @@ function _sizeLcFrame(){
     frame.style.marginLeft = '0';
     frame.style.marginRight = '0';
     frame.classList.add('sized');
+    _coverLcVideo();
+  }catch(e){}
+}
+/** Manually crop-to-cover the live video into its (always-square) frame using
+ *  explicit pixel geometry instead of CSS object-fit. Old WebKit (iOS 12 /
+ *  iPhone 6) has a history of getting object-fit:cover wrong on <video>
+ *  inside a transformed/absolutely-positioned ancestor — the frame stays
+ *  square, but the video paints at its native (often portrait, non-1:1)
+ *  aspect, making the picture look like a tall rectangle squeezed in rather
+ *  than a true square crop. Computing width/height/left/top by hand sidesteps
+ *  that entirely: this works identically on every browser, old or new.
+ */
+function _coverLcVideo(){
+  try{
+    var v=$('lcVideo');
+    var frame=document.querySelector('#liveCam .lc-frame');
+    if(!v || !frame) return;
+    var vw=v.videoWidth, vh=v.videoHeight;
+    var fw=frame.clientWidth||frame.offsetWidth||0, fh=frame.clientHeight||frame.offsetHeight||0;
+    if(!vw || !vh || !fw || !fh) return;
+    var scale=Math.max(fw/vw, fh/vh);
+    var w=Math.ceil(vw*scale), h=Math.ceil(vh*scale);
+    v.style.position='absolute';
+    v.style.width=w+'px';
+    v.style.height=h+'px';
+    v.style.left=Math.round((fw-w)/2)+'px';
+    v.style.top=Math.round((fh-h)/2)+'px';
+    v.style.right='auto';
+    v.style.bottom='auto';
   }catch(e){}
 }
 function scrollUploadCameraIntoView(){
@@ -3291,10 +3320,10 @@ function startLiveCamera(){
     v.classList.toggle('mirrored', lcFacing==='user');
     var tryPlay = function(){ try{ var p=v.play(); if(p&&p.catch) p.catch(function(){}); }catch(e){} };
     tryPlay();
-    v.onloadedmetadata = function(){ tryPlay(); _sizeLcFrame(); scrollUploadCameraIntoView(); };
+    v.onloadedmetadata = function(){ tryPlay(); _sizeLcFrame(); _coverLcVideo(); scrollUploadCameraIntoView(); };
     if(hint) hint.classList.add('hidden');
     _sizeLcFrame();
-    setTimeout(function(){ _sizeLcFrame(); scrollUploadCameraIntoView(); }, 120);
+    setTimeout(function(){ _sizeLcFrame(); _coverLcVideo(); scrollUploadCameraIntoView(); }, 120);
 
     try{
       const caps=lcTrack.getCapabilities && lcTrack.getCapabilities();
@@ -3979,47 +4008,49 @@ function doUpload(){
   const cap=$('caption').value,btn=$('uploadBtn');
   const filename=isVideo?(originalFile?originalFile.name:'video.mp4'):'moment.jpg';
   const ct=(croppedBlob.type)||(isVideo?'video/mp4':'image/jpeg');
-  btn.innerHTML='<span class="spinner"></span> Đang xử lý...';btn.disabled=true;
 
-  const finishOk=(sent)=>{
-    btn.innerHTML='Gửi cho tất cả bạn bè';btn.disabled=false;
-    toast(sent?'Đã đăng!':'Đã lưu — sẽ tự đăng khi có mạng');
-    $('caption').value=''; clearUpload();
-  };
   const finishFail=(msg)=>{
     btn.innerHTML='Gửi cho tất cả bạn bè';btn.disabled=false;
     toast(msg||'Đăng thất bại');
   };
 
-  const directUpload=()=>{
+  if(isVideo){
+    // Video still goes straight over the network (not queued) — a multi-MB
+    // video base64'd into IndexedDB is the kind of allocation that kills the
+    // tab on an iPhone 6, so this path keeps the button busy until it's sent.
+    btn.innerHTML='<span class="spinner"></span> Đang xử lý...';btn.disabled=true;
     const fd=new FormData();
     fd.append('file',croppedBlob,filename);
     fd.append('caption',cap);
     fd.append('client_id', 'd_'+Date.now()+'_'+Math.random().toString(36).slice(2,8));
-    if(isVideo && videoCropPayload) fd.append('cropPayload', videoCropPayload);
-    apiTimeout('/api/upload',{method:'POST',body:fd}, isVideo?60000:25000).then(d=>{
-      if(d.ok){ finishOk(true); momentsLoaded=false; momentsUpdatedAt=0; }
-      else finishFail(d.error||'Đăng thất bại');
+    if(videoCropPayload) fd.append('cropPayload', videoCropPayload);
+    apiTimeout('/api/upload',{method:'POST',body:fd}, 60000).then(d=>{
+      if(d&&d.ok){
+        btn.innerHTML='Gửi cho tất cả bạn bè';btn.disabled=false;
+        toast('Đã đăng!');
+        momentsLoaded=false; momentsUpdatedAt=0;
+        $('caption').value=''; clearUpload();
+      }else{
+        finishFail(d&&d.error||'Đăng thất bại');
+      }
     }).catch(()=>finishFail(navigator.onLine?'Lỗi mạng khi đăng, thử lại':'Mất mạng — thử lại sau'));
-  };
-
-  if(isVideo){
-    directUpload();
     return;
   }
 
-  // Always enqueue for durability, then attempt to send right away regardless of
-  // what navigator.onLine claims — it can report a stale value after the app
-  // comes back from being backgrounded, so trusting it here silently stranded
-  // moments in the queue on an actually-connected phone.
+  // Photos: hand straight to the offline queue and give the button back
+  // immediately — no spinner, no waiting on the network round trip. Sending
+  // now happens in the background via flushQueue() (kicked off right below,
+  // plus the ticker and the focus/visibility/online listeners as backup), and
+  // actual delivery status shows up in the queue list, not on this button.
+  btn.disabled=true;
   enqueueUpload(croppedBlob, cap, filename, ct).then(job=>{
-    return postJob(job).then(ok=>{
-      if(ok) finishOk(true);
-      else finishOk(false); // stays queued, ticker/focus/online listeners retry it
-    });
+    btn.innerHTML='Gửi cho tất cả bạn bè';btn.disabled=false;
+    toast('Đã lưu — đang gửi...');
+    $('caption').value=''; clearUpload();
+    flushQueue();
   }).catch(err=>{
     console.error(err);
-    directUpload();
+    finishFail('Không lưu được, thử lại');
   });
 }
 
