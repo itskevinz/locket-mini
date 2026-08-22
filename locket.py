@@ -151,8 +151,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "1.3"
-APP_BUILD = "2026.08.21"
+APP_VERSION = "1.4"
+APP_BUILD = "2026.08.22"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -1946,15 +1946,14 @@ const BOOT_NAME={{ (boot_name or '')|tojson }};
 const BOOT_PHOTO={{ (boot_photo or '')|tojson }};
 let croppedBlob=null, originalFile=null, isVideo=false, cropper=null;
 let videoCropPayload=null, videoThumbBlob=null;
-/* Center-square crop metadata, same shape binhake's own web client sends for video
-   uploads (captured from a real browser session). Without this the field was
-   previously hardcoded to "null", which is what photos already used successfully,
-   but videos need the real dimensions + crop rect. */
+/* Center-square crop metadata. Shape confirmed against a real captured request
+   from binhake's own web client (HAR capture, Aug 2026): exactly {type, crop,
+   video} — no extra "view" key. */
 function buildVideoCropPayload(vw, vh){
   if(!vw || !vh) return null;
   var side=Math.min(vw, vh);
   var x=Math.round((vw-side)/2), y=Math.round((vh-side)/2);
-  return JSON.stringify({type:'video', crop:{x:x,y:y,w:side,h:side}, video:{videoWidth:vw,videoHeight:vh}, view:{scale:1}});
+  return JSON.stringify({type:'video', crop:{x:x,y:y,w:side,h:side}, video:{videoWidth:vw,videoHeight:vh}});
 }
 function onPreviewVidMeta(){
   videoCropPayload = buildVideoCropPayload(this.videoWidth, this.videoHeight);
@@ -3910,7 +3909,24 @@ async function enqueueUpload(blob, caption, filename, contentType){
   try{ if(blob.type&&blob.type.startsWith('image')) preview=await blobToDataUrl(blob); }catch(e){}
   let dataUrl='';
   try{ dataUrl=await blobToDataUrl(blob); }catch(e){ toast('Không lưu được ảnh offline'); throw e; }
-  const job={id, created:Date.now(), caption:caption||'', filename, contentType, dataUrl, preview, status:'pending', error:''};
+  const job={id, kind:'photo', created:Date.now(), caption:caption||'', filename, contentType, dataUrl, preview, status:'pending', error:''};
+  await qPut(job);
+  await renderQueue();
+  return job;
+}
+/* Videos skip the base64 round trip entirely — IndexedDB's structured clone can
+   store a Blob natively, so there's no atob() memory spike here the way there
+   would be if this went through blobToDataUrl() like photos do. Only the (tiny)
+   JPEG thumb gets base64'd, since that's cheap regardless. Old iOS (<14) has a
+   history of silently corrupting Blobs stored this way, so this is skipped
+   entirely in that case — caller falls back to direct-send-only. */
+async function enqueueVideoUpload(blob, caption, filename, contentType, cropPayload, thumbBlob){
+  if(OLD_IOS) throw new Error('blob-store-unsupported');
+  const id='j_'+Date.now()+'_'+Math.random().toString(36).slice(2,8);
+  let thumbDataUrl='';
+  if(thumbBlob){ try{ thumbDataUrl=await blobToDataUrl(thumbBlob); }catch(e){} }
+  const job={id, kind:'video', created:Date.now(), caption:caption||'', filename, contentType,
+             videoBlob:blob, cropPayload:cropPayload||'', thumbDataUrl, status:'pending', error:''};
   await qPut(job);
   await renderQueue();
   return job;
@@ -3935,13 +3951,18 @@ async function postJob(job){
 async function postJobInner(job){
     job.status='uploading'; job.error='';
     await qPut(job); await renderQueue();
-    const blob=dataUrlToBlob(job.dataUrl);
+    const isVideoJob = job.kind==='video';
+    const blob = isVideoJob ? job.videoBlob : dataUrlToBlob(job.dataUrl);
     const fd=new FormData();
-    fd.append('file', blob, job.filename||'moment.jpg');
+    fd.append('file', blob, job.filename||(isVideoJob?'video.mp4':'moment.jpg'));
     fd.append('caption', job.caption||'');
     fd.append('client_id', job.id);
+    if(isVideoJob && job.cropPayload) fd.append('cropPayload', job.cropPayload);
+    if(isVideoJob && job.thumbDataUrl){
+      try{ fd.append('thumb', dataUrlToBlob(job.thumbDataUrl), 'thumb.jpg'); }catch(e){}
+    }
     try{
-      const d=await apiTimeout('/api/upload',{method:'POST',body:fd}, 25000);
+      const d=await apiTimeout('/api/upload',{method:'POST',body:fd}, isVideoJob?60000:25000);
       if(d&&d.ok){
         await qDel(job.id);
         momentsUpdatedAt=0;
@@ -4041,10 +4062,11 @@ function doUpload(){
     toast(msg||'Đăng thất bại');
   };
 
-  if(isVideo){
-    // Video still goes straight over the network (not queued) — a multi-MB
-    // video base64'd into IndexedDB is the kind of allocation that kills the
-    // tab on an iPhone 6, so this path keeps the button busy until it's sent.
+  const directVideoUpload=()=>{
+    // Fallback path only: old iOS (Blob-in-IndexedDB is unreliable there) or the
+    // queue write itself failed. Goes straight over the network, so a dropped
+    // connection here does lose the video — that's the honest tradeoff on
+    // devices too old to safely persist it locally.
     btn.innerHTML='<span class="spinner"></span> Đang xử lý...';btn.disabled=true;
     const fd=new FormData();
     fd.append('file',croppedBlob,filename);
@@ -4061,7 +4083,23 @@ function doUpload(){
       }else{
         finishFail(d&&d.error||'Đăng thất bại');
       }
-    }).catch(()=>finishFail(navigator.onLine?'Lỗi mạng khi đăng, thử lại':'Mất mạng — thử lại sau'));
+    }).catch(()=>finishFail(navigator.onLine?'Lỗi mạng khi đăng, thử lại':'Mất mạng — video này không lưu được offline trên máy này, thử lại khi có mạng'));
+  };
+
+  if(isVideo){
+    // Same as photos: save first, send in the background. A dropped connection
+    // (or no connection at all) no longer loses the video or shows a bare error —
+    // it sits in the queue and the ticker/focus/online listeners retry it.
+    btn.disabled=true;
+    enqueueVideoUpload(croppedBlob, cap, filename, ct, videoCropPayload, videoThumbBlob).then(job=>{
+      btn.innerHTML='Gửi cho tất cả bạn bè';btn.disabled=false;
+      toast('Đã lưu — đang gửi...');
+      $('caption').value=''; clearUpload();
+      flushQueue();
+    }).catch(err=>{
+      console.error(err);
+      directVideoUpload();
+    });
     return;
   }
 
