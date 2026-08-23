@@ -151,7 +151,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "1.5"
+APP_VERSION = "1.6"
 APP_BUILD = "2026.08.23"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
@@ -1379,9 +1379,8 @@ body{
   border:1px solid rgba(255,184,0,.25)}
 .streak-num{font-size:30px;font-weight:800;color:var(--accent);line-height:1}
 .streak-label{font-size:12px;color:var(--text2);font-weight:700;text-transform:uppercase;letter-spacing:.5px}
-.quick-row{display:flex;margin-top:4px}
-.quick-row > * + *{margin-left:10px}
-.quick-row .btn{padding:13px}
+.quick-row{display:flex;flex-wrap:wrap;margin-top:4px;gap:10px}
+.quick-row .btn{padding:13px;flex:1 1 120px;min-height:48px}
 
 /* ---------- Moments grid 2x3 ---------- */
 /* Moments: desktop = square grid; phone = vertical snap feed (1 per screen) */
@@ -1554,8 +1553,24 @@ body{
   text-align:center;color:var(--text2);font-weight:700;font-size:13px;padding:0 20px}
 .preview-hint i{opacity:.6;margin-bottom:10px;display:inline-block}
 #fileInput,#cameraInput{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0,0,0,0)}
-.upload-actions{display:flex;margin-top:10px}
-.upload-actions .btn-ghost{flex:1;font-size:13px;padding:10px;margin:0 4px}
+.upload-actions{display:flex;flex-wrap:wrap;margin-top:10px;gap:8px}
+.upload-actions .btn-ghost{flex:1 1 0;min-width:0;min-height:44px;font-size:13px;padding:10px 8px;margin:0;display:flex;align-items:center;justify-content:center}
+.upload-send-row{display:flex;gap:8px;margin-top:14px;align-items:stretch}
+.upload-send-row .btn{min-height:48px}
+.video-speed-row{display:flex;flex-wrap:wrap;gap:6px}
+.video-speed-row .btn{flex:1 1 calc(25% - 6px);min-width:56px;min-height:40px;padding:8px 0}
+.page-upload-head{display:flex;align-items:center;justify-content:space-between;margin:0 0 14px;gap:10px}
+.page-upload-head h2{margin:0;font-size:20px;font-weight:800;min-width:0}
+.queue-save-chip{flex-shrink:0;background:rgba(255,255,255,.08);border:1px solid var(--border);color:var(--text2);
+  border-radius:500px;padding:7px 12px;font-size:12px;font-weight:700;font-family:inherit;cursor:pointer;
+  display:inline-flex;align-items:center;gap:5px;min-height:36px;-webkit-tap-highlight-color:transparent}
+.queue-save-chip:active{transform:scale(.96);background:rgba(255,255,255,.12)}
+.queue-save-chip i{font-size:14px}
+@media (max-width:360px){
+  .upload-actions .btn-ghost{font-size:12px;padding:9px 6px}
+  .video-speed-row .btn{flex:1 1 calc(50% - 6px)}
+  .queue-save-chip{padding:6px 10px;font-size:11px}
+}
 
 /* ---------- Live camera — redesigned, native feel ---------- */
 .live-cam{width:100%;margin:0 0 4px}
@@ -1667,9 +1682,10 @@ body{
 .crop-header span{font-weight:800;font-size:15px}
 .crop-header button{background:none;border:none;color:var(--accent);font-family:inherit;font-weight:800;font-size:15px;cursor:pointer;padding:8px 10px}
 .crop-header button.cancel{color:var(--text2)}
-.crop-area{flex:1;min-height:0;overflow:hidden;background:#000;position:relative}
-.crop-area img{display:block;max-width:100%}
-.cropper-container{max-height:100% !important}
+.crop-area{flex:1 1 auto;min-height:200px;overflow:hidden;background:#111;position:relative}
+.crop-area img{display:block;max-width:100%;opacity:0;transition:opacity .15s}
+.cropper-container{max-height:100% !important;background:#111 !important}
+.cropper-modal{background:rgba(0,0,0,.65) !important}
 .cropper-view-box,.cropper-face{border-radius:0}
 .cropper-point{background:var(--accent);width:8px;height:8px}
 .cropper-line{background:var(--accent)}
@@ -1799,7 +1815,12 @@ body{
   </div>
 
   <div class="page" id="page-upload">
-    <h2 style="margin:0 0 14px;font-size:20px;font-weight:800">Khoảnh khắc mới</h2>
+    <div class="page-upload-head">
+      <h2>Khoảnh khắc mới</h2>
+      <button type="button" class="queue-save-chip" id="queueOnlyBtn" onclick="doSaveQueueOnly()" title="Lưu vào hàng đợi, không gửi ngay">
+        <i class="bi bi-inbox"></i><span>Hàng đợi</span>
+      </button>
+    </div>
     <div class="offline-banner" id="offlineBanner">
       <i class="bi bi-wifi-off" style="font-size:16px"></i>
       Đang offline — ảnh sẽ lưu máy và tự đăng khi có mạng
@@ -1834,14 +1855,20 @@ body{
       <video id="previewVid" class="hidden" playsinline muted loop autoplay onloadedmetadata="onPreviewVidMeta.call(this)"></video>
     </div>
     <div class="video-crop-row hidden" id="videoCropRow">
-      <label class="label" style="margin-top:10px">Vị trí khung vuông (video)</label>
-      <input type="range" id="videoCropSlider" min="0" max="100" value="50" oninput="setVideoCropOffset(this.value)" style="width:100%">
-      <label class="label" style="margin-top:10px">Tốc độ video</label>
-      <div class="video-speed-row" id="videoSpeedRow" style="display:flex;gap:6px">
-        <button type="button" class="btn-ghost btn" style="flex:1;padding:8px 0" onclick="setVideoSpeed(0.5)" data-speed="0.5">0.5x</button>
-        <button type="button" class="btn-ghost btn active" style="flex:1;padding:8px 0" onclick="setVideoSpeed(1)" data-speed="1">1x</button>
-        <button type="button" class="btn-ghost btn" style="flex:1;padding:8px 0" onclick="setVideoSpeed(2)" data-speed="2">2x</button>
-        <button type="button" class="btn-ghost btn" style="flex:1;padding:8px 0" onclick="setVideoSpeed(4)" data-speed="4">4x</button>
+      <label class="label" style="margin-top:10px" id="videoCropLabel">Vị trí khung vuông</label>
+      <input type="range" id="videoCropSlider" min="0" max="100" value="50" oninput="setVideoCropOffset(this.value)" style="width:100%;min-height:28px">
+      <div class="label" style="margin-top:6px;font-weight:600;text-transform:none;letter-spacing:0;display:flex;justify-content:space-between">
+        <span id="videoCropHintL">Trái / trên</span>
+        <span id="videoCropHintR">Phải / dưới</span>
+      </div>
+    </div>
+    <div class="video-speed-block hidden" id="videoSpeedBlock">
+      <label class="label" style="margin-top:12px">Tốc độ video</label>
+      <div class="video-speed-row" id="videoSpeedRow">
+        <button type="button" class="btn-ghost btn" onclick="setVideoSpeed(0.5)" data-speed="0.5">0.5x</button>
+        <button type="button" class="btn-ghost btn active" onclick="setVideoSpeed(1)" data-speed="1">1x</button>
+        <button type="button" class="btn-ghost btn" onclick="setVideoSpeed(2)" data-speed="2">2x</button>
+        <button type="button" class="btn-ghost btn" onclick="setVideoSpeed(4)" data-speed="4">4x</button>
       </div>
     </div>
     <div class="live-cam hidden" id="liveCam">
@@ -1877,9 +1904,8 @@ body{
     <input type="file" id="cameraInput" accept="image/*" capture="environment" class="hidden" onchange="onFilePick(event)">
     <label class="label" style="margin-top:14px">Chú thích</label>
     <input class="input" id="caption" placeholder="Viết gì đó..." maxlength="200">
-    <div class="upload-send-row" style="display:flex;gap:8px;margin-top:14px">
+    <div class="upload-send-row">
       <button class="btn" style="flex:1" onclick="doUpload()" id="uploadBtn">Gửi cho tất cả bạn bè</button>
-      <button class="btn-ghost btn" style="flex:0 0 auto;padding:0 16px" onclick="doSaveQueueOnly()" id="queueOnlyBtn" title="Lưu vào hàng đợi, không gửi ngay"><i class="bi bi-inbox"></i></button>
     </div>
     <div class="queue-box hidden" id="queueBox">
       <div class="qb-head"><span>Hàng đợi đăng</span><span id="queueCount">0</span></div>
@@ -1970,6 +1996,11 @@ var CAN_RENDER_VIDEO_SPEED = (typeof MediaRecorder!=='undefined' &&
    video} — no extra "view" key. offsetFrac (0..1) slides the square along
    whichever axis actually has slack (portrait video: vertical; landscape:
    horizontal) — 0.5 is the old fixed center-crop behavior. */
+function isNearSquare(w, h, tol){
+  if(!w || !h) return false;
+  var t = (typeof tol === 'number') ? tol : 0.02;
+  return Math.abs(w - h) / Math.max(w, h) <= t;
+}
 function buildVideoCropPayload(vw, vh, offsetFrac){
   if(!vw || !vh) return null;
   var side=Math.min(vw, vh);
@@ -1977,23 +2008,68 @@ function buildVideoCropPayload(vw, vh, offsetFrac){
   var x=Math.round((vw-side)*f), y=Math.round((vh-side)*f);
   return JSON.stringify({type:'video', crop:{x:x,y:y,w:side,h:side}, video:{videoWidth:vw,videoHeight:vh}});
 }
-/* previewVid uses object-fit:cover, so nudging object-position with the same
-   fraction gives an exact live preview of the crop with zero extra overlay
-   math — the browser's own cover-crop rendering IS the preview. */
+/* previewVid uses object-fit:cover. Only the long axis has slack — set
+   object-position on that axis only so the slider matches the server crop. */
 function setVideoCropOffset(percent){
   videoCropOffsetFrac = Math.max(0, Math.min(100, Number(percent)||0)) / 100;
   const v=$('previewVid');
-  if(v){
-    v.style.objectPosition = (videoCropOffsetFrac*100) + '% ' + (videoCropOffsetFrac*100) + '%';
-    if(v.videoWidth) videoCropPayload = buildVideoCropPayload(v.videoWidth, v.videoHeight, videoCropOffsetFrac);
+  if(!v) return;
+  var vw=v.videoWidth||0, vh=v.videoHeight||0;
+  var pct=Math.round(videoCropOffsetFrac*100);
+  if(vw && vh){
+    if(vw > vh){
+      v.style.objectPosition = pct + '% 50%';
+    } else if(vh > vw){
+      v.style.objectPosition = '50% ' + pct + '%';
+    } else {
+      v.style.objectPosition = '50% 50%';
+    }
+    videoCropPayload = buildVideoCropPayload(vw, vh, videoCropOffsetFrac);
+  } else {
+    v.style.objectPosition = pct + '% ' + pct + '%';
   }
 }
 function onPreviewVidMeta(){
+  var vw=this.videoWidth||0, vh=this.videoHeight||0;
+  var square=isNearSquare(vw, vh);
   const row=$('videoCropRow');
-  if(row) row.classList.toggle('hidden', !isVideo);
-  const speedRow=$('videoSpeedRow');
-  if(speedRow) speedRow.classList.toggle('hidden', !CAN_RENDER_VIDEO_SPEED);
-  videoCropPayload = buildVideoCropPayload(this.videoWidth, this.videoHeight, videoCropOffsetFrac);
+  const speedBlock=$('videoSpeedBlock');
+  // Square video → skip crop slider. Non-square → show axis-aware slider.
+  if(row){
+    if(!isVideo || square){
+      row.classList.add('hidden');
+      if(square){
+        videoCropOffsetFrac=0.5;
+        if($('videoCropSlider')) $('videoCropSlider').value=50;
+        this.style.objectPosition='50% 50%';
+      }
+    } else {
+      row.classList.remove('hidden');
+      var label=$('videoCropLabel'), hl=$('videoCropHintL'), hr=$('videoCropHintR');
+      if(vw > vh){
+        if(label) label.textContent='Kéo khung vuông trái ↔ phải';
+        if(hl) hl.textContent='Trái';
+        if(hr) hr.textContent='Phải';
+      } else {
+        if(label) label.textContent='Kéo khung vuông trên ↔ dưới';
+        if(hl) hl.textContent='Trên';
+        if(hr) hr.textContent='Dưới';
+      }
+    }
+  }
+  if(speedBlock){
+    speedBlock.classList.toggle('hidden', !(isVideo && CAN_RENDER_VIDEO_SPEED));
+  }
+  videoCropPayload = buildVideoCropPayload(vw, vh, videoCropOffsetFrac);
+  if(!square) setVideoCropOffset(Math.round(videoCropOffsetFrac*100));
+  try{
+    this.muted=true;
+    this.playsInline=true;
+    this.setAttribute('playsinline','');
+    this.setAttribute('webkit-playsinline','');
+    var p=this.play();
+    if(p && p.catch) p.catch(function(){});
+  }catch(e){}
 }
 /* Speed change re-renders from the pristine original every time (never from an
    already-sped-up result) — draws the source video onto a canvas while it
@@ -3207,28 +3283,42 @@ function handleIncomingFile(f){
   originalFile=f; isVideo=f.type.startsWith('video');
   const url=URL.createObjectURL(f);
   if(isVideo){
+    videoCropOffsetFrac=0.5;
+    videoCropPayload=null;
+    if($('videoCropSlider')) $('videoCropSlider').value=50;
+    if($('videoCropRow')) $('videoCropRow').classList.add('hidden');
+    if($('videoSpeedBlock')) $('videoSpeedBlock').classList.add('hidden');
     $('previewImg').classList.add('hidden');
-    $('previewVid').classList.remove('hidden'); $('previewVid').src=url;
+    var pv=$('previewVid');
+    pv.classList.remove('hidden');
+    pv.style.objectPosition='50% 50%';
+    pv.src=url;
+    try{ pv.load(); }catch(e){}
     $('uploadPlaceholder').classList.add('hidden');
     $('uploadActions').classList.remove('hidden');
     croppedBlob=f;
     originalVideoBlob=f;
     videoSpeedFactor=1;
     videoThumbBlob=null; // captured by the previewVid 'loadeddata' listener once a frame decodes
+    if($('videoSpeedRow')) Array.prototype.forEach.call($('videoSpeedRow').querySelectorAll('button'), function(b){
+      b.classList.toggle('active', Number(b.getAttribute('data-speed'))===1);
+    });
     return;
   }
-  // If the picked photo is already a perfect square, skip the crop step
-  // entirely — just resize/compress it to CAPTURE_SIZE and go straight to
-  // caption. Cropper.js still runs for anything that actually needs cropping.
+  // Near-square photos skip Cropper (avoids black crop stage on already-square shots).
   const probe=new Image();
   probe.onload=function(){
-    if(probe.naturalWidth>0 && probe.naturalWidth===probe.naturalHeight){
+    var w=probe.naturalWidth, h=probe.naturalHeight;
+    if(w>0 && isNearSquare(w, h, 0.03)){
       const c=document.createElement('canvas');
       c.width=CAPTURE_SIZE; c.height=CAPTURE_SIZE;
       const ctx=c.getContext('2d');
       ctx.imageSmoothingEnabled=true;
       try{ ctx.imageSmoothingQuality='high'; }catch(e){}
-      ctx.drawImage(probe, 0, 0, CAPTURE_SIZE, CAPTURE_SIZE);
+      // Center-crop if tiny aspect drift, else direct draw.
+      var side=Math.min(w,h);
+      var sx=(w-side)/2, sy=(h-side)/2;
+      ctx.drawImage(probe, sx, sy, side, side, 0, 0, CAPTURE_SIZE, CAPTURE_SIZE);
       c.toBlob(function(b){
         croppedBlob=b;
         $('previewImg').src=URL.createObjectURL(b);
@@ -3245,18 +3335,57 @@ function handleIncomingFile(f){
   probe.src=url;
 }
 function openCropStage(url){
-  $('cropImg').src=url;
   const stage=$('cropStage');
+  const img=$('cropImg');
+  if(cropper){ try{ cropper.destroy(); }catch(e){} cropper=null; }
   stage.classList.add('open');
   document.body.style.overflow='hidden';
-  if(cropper){cropper.destroy()}
-  // delay init so layout is fullscreen first (iOS)
-  setTimeout(()=>{
-    cropper=new Cropper($('cropImg'),{
-      aspectRatio:1,viewMode:1,autoCropArea:1,dragMode:'move',
-      guides:true,center:true,highlight:false,background:false,responsive:true,toggleDragModeOnDblclick:false,
+  // Reset src so onload always fires (same blob URL would skip load on some WebKits).
+  img.removeAttribute('src');
+  img.style.opacity='0';
+  function initCropper(){
+    if(!stage.classList.contains('open')) return;
+    if(cropper){ try{ cropper.destroy(); }catch(e){} cropper=null; }
+    // Layout must be open + image decoded; black crop = Cropper measured 0-size box.
+    var area=stage.querySelector('.crop-area');
+    if(area && area.clientHeight < 40){
+      setTimeout(initCropper, 40);
+      return;
+    }
+    try{
+      cropper=new Cropper(img,{
+        aspectRatio:1,
+        viewMode:1,
+        autoCropArea:1,
+        dragMode:'move',
+        guides:true,
+        center:true,
+        highlight:false,
+        background:false,
+        responsive:true,
+        checkOrientation:true,
+        toggleDragModeOnDblclick:false,
+        ready:function(){ img.style.opacity='1'; }
+      });
+    }catch(err){
+      console.warn('cropper init', err);
+      toast('Không mở được crop — thử ảnh khác');
+      cancelCrop();
+    }
+  }
+  img.onload=function(){
+    img.onload=null;
+    // Double rAF so flex layout of fullscreen crop-stage settles on iOS.
+    requestAnimationFrame(function(){
+      requestAnimationFrame(function(){ setTimeout(initCropper, 30); });
     });
-  },50);
+  };
+  img.onerror=function(){
+    img.onerror=null;
+    toast('Không tải được ảnh để crop');
+    cancelCrop();
+  };
+  img.src=url;
 }
 function cancelCrop(){
   $('cropStage').classList.remove('open');
@@ -3264,14 +3393,29 @@ function cancelCrop(){
   $('fileInput').value='';
   if($('cameraInput')) $('cameraInput').value='';
   if(!croppedBlob){$('uploadActions').classList.add('hidden')}
-  if(cropper){cropper.destroy();cropper=null}
+  if(cropper){ try{ cropper.destroy(); }catch(e){} cropper=null; }
+  var img=$('cropImg');
+  if(img){ img.onload=null; img.onerror=null; img.removeAttribute('src'); img.style.opacity=''; }
 }
 function confirmCrop(){
   if(!cropper)return;
   const btn=document.querySelector('#cropStage .crop-header button:last-child');
   if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner light"></span>'}
-  const canvas=cropper.getCroppedCanvas({width:CAPTURE_SIZE,height:CAPTURE_SIZE,imageSmoothingQuality:'high'});
+  var canvas=null;
+  try{
+    canvas=cropper.getCroppedCanvas({width:CAPTURE_SIZE,height:CAPTURE_SIZE,imageSmoothingQuality:'high'});
+  }catch(e){ canvas=null; }
+  if(!canvas){
+    if(btn){btn.disabled=false;btn.textContent='Xong'}
+    toast('Crop lỗi — thử lại');
+    return;
+  }
   canvas.toBlob(b=>{
+    if(!b){
+      if(btn){btn.disabled=false;btn.textContent='Xong'}
+      toast('Không xuất được ảnh crop');
+      return;
+    }
     croppedBlob=b;
     $('previewImg').src=URL.createObjectURL(b);
     $('previewImg').classList.remove('hidden');
@@ -3281,7 +3425,8 @@ function confirmCrop(){
     $('cropStage').classList.remove('open');
     document.body.style.overflow='';
     if(btn){btn.disabled=false;btn.textContent='Xong'}
-    cropper.destroy();cropper=null;
+    try{ cropper.destroy(); }catch(e){}
+    cropper=null;
   },'image/jpeg',CAPTURE_JPEG_Q);
 }
 function clearUpload(){
@@ -3293,6 +3438,7 @@ function clearUpload(){
   $('previewVid').style.objectPosition='';
   if($('videoCropSlider')) $('videoCropSlider').value=50;
   if($('videoCropRow')) $('videoCropRow').classList.add('hidden');
+  if($('videoSpeedBlock')) $('videoSpeedBlock').classList.add('hidden');
   if($('videoSpeedRow')) Array.prototype.forEach.call($('videoSpeedRow').querySelectorAll('button'), b=>{
     b.classList.toggle('active', Number(b.getAttribute('data-speed'))===1);
   });
