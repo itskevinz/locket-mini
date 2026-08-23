@@ -151,7 +151,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 APP_BUILD = "2026.08.23"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
@@ -3380,6 +3380,7 @@ document.addEventListener('paste',function(e){
 });
 function handleIncomingFile(f){
   if(!f){ toast('Không nhận được file'); return; }
+  if(!(f.size>0)){ toast('File ảnh/video trống'); return; }
   // Clipboard files sometimes have empty type — sniff from name
   var type=(f.type||'').toLowerCase();
   if(!type && f.name){
@@ -3419,9 +3420,9 @@ function handleIncomingFile(f){
     videoThumbBlob=null;
     return;
   }
-  // Decode first — never open crop stage until naturalWidth is known (fixes blank crop on paste).
-  const probe=new Image();
-  probe.onload=function(){
+  // Decode first — never open crop until naturalWidth is known.
+  // Prefer FileReader→dataURL for paste reliability (blob:// can race with Cropper).
+  function afterDecoded(probe, srcForCrop){
     var w=probe.naturalWidth, h=probe.naturalHeight;
     if(!w || !h){
       toast('Ảnh không hợp lệ');
@@ -3448,8 +3449,49 @@ function handleIncomingFile(f){
       }, 'image/jpeg', CAPTURE_JPEG_Q);
       return;
     }
-    openCropStage(url);
-  };
+    openCropStage(srcForCrop || url);
+  }
+  // FileReader path: clipboard paste on desktop is most reliable as data URL
+  var useReader = (typeof FileReader!=='undefined') && f.size < 12*1024*1024;
+  if(useReader){
+    var reader=new FileReader();
+    reader.onload=function(){
+      var dataUrl=reader.result;
+      if(!dataUrl || typeof dataUrl!=='string'){
+        // fallback blob URL
+        var probe=new Image();
+        probe.onload=function(){ afterDecoded(probe, url); };
+        probe.onerror=function(){ toast('Không đọc được ảnh đã dán/chọn'); revokeIncomingUrl(); };
+        probe.src=url;
+        return;
+      }
+      var probe=new Image();
+      probe.onload=function(){ afterDecoded(probe, dataUrl); };
+      probe.onerror=function(){
+        // data URL failed (rare) — try blob
+        var p2=new Image();
+        p2.onload=function(){ afterDecoded(p2, url); };
+        p2.onerror=function(){ toast('Không đọc được ảnh đã dán/chọn'); revokeIncomingUrl(); };
+        p2.src=url;
+      };
+      probe.src=dataUrl;
+    };
+    reader.onerror=function(){
+      var probe=new Image();
+      probe.onload=function(){ afterDecoded(probe, url); };
+      probe.onerror=function(){ toast('Không đọc được ảnh đã dán/chọn'); revokeIncomingUrl(); };
+      probe.src=url;
+    };
+    try{ reader.readAsDataURL(f); }catch(e){
+      var probe=new Image();
+      probe.onload=function(){ afterDecoded(probe, url); };
+      probe.onerror=function(){ toast('Không đọc được ảnh đã dán/chọn'); revokeIncomingUrl(); };
+      probe.src=url;
+    }
+    return;
+  }
+  const probe=new Image();
+  probe.onload=function(){ afterDecoded(probe, url); };
   probe.onerror=function(){
     toast('Không đọc được ảnh đã dán/chọn');
     revokeIncomingUrl();
@@ -3459,27 +3501,41 @@ function handleIncomingFile(f){
 function openCropStage(url){
   if(!url){ toast('Thiếu ảnh để crop'); return; }
   const stage=$('cropStage');
-  const img=$('cropImg');
+  const area=stage.querySelector('.crop-area');
+  if(!area){ toast('Thiếu khung crop'); return; }
+  // Destroy previous instance completely
   if(cropper){ try{ cropper.destroy(); }catch(e){} cropper=null; }
-  // Clear handlers from any previous attempt
-  img.onload=null;
-  img.onerror=null;
+  // CRITICAL: replace <img> with a fresh element every open.
+  // Reusing the same node + reassigning src (or the old 1×1 GIF trick) caused
+  // Cropper to init on a blank/transparent frame → black crop box (your screenshot).
+  area.innerHTML='';
+  var img=document.createElement('img');
+  img.id='cropImg';
+  img.alt='';
+  img.style.display='block';
+  img.style.maxWidth='100%';
+  img.style.opacity='0';
+  area.appendChild(img);
+
   stage.classList.add('open');
   document.body.style.overflow='hidden';
-  img.style.opacity='0';
+
+  var loadGen=(openCropStage._gen=(openCropStage._gen||0)+1);
+  var myGen=loadGen;
+
   function initCropper(){
+    if(myGen!==openCropStage._gen) return;
     if(!stage.classList.contains('open')) return;
-    if(!img.naturalWidth || !img.naturalHeight){
+    if(!img.naturalWidth || img.naturalWidth < 2){
       toast('Ảnh crop chưa sẵn sàng');
       cancelCrop();
       return;
     }
-    if(cropper){ try{ cropper.destroy(); }catch(e){} cropper=null; }
-    var area=stage.querySelector('.crop-area');
-    if(area && area.clientHeight < 40){
+    if(area.clientHeight < 40){
       setTimeout(initCropper, 50);
       return;
     }
+    if(cropper){ try{ cropper.destroy(); }catch(e){} cropper=null; }
     try{
       cropper=new Cropper(img,{
         aspectRatio:1,
@@ -3489,7 +3545,7 @@ function openCropStage(url){
         guides:true,
         center:true,
         highlight:false,
-        background:false,
+        background:true,
         responsive:true,
         checkOrientation:true,
         toggleDragModeOnDblclick:false,
@@ -3501,8 +3557,11 @@ function openCropStage(url){
       cancelCrop();
     }
   }
-  function afterImageReady(){
-    if(!img.naturalWidth){
+
+  img.onload=function(){
+    if(myGen!==openCropStage._gen) return;
+    img.onload=null;
+    if(!img.naturalWidth || img.naturalWidth < 2){
       toast('Không tải được ảnh để crop');
       cancelCrop();
       return;
@@ -3510,39 +3569,31 @@ function openCropStage(url){
     requestAnimationFrame(function(){
       requestAnimationFrame(function(){ setTimeout(initCropper, 40); });
     });
-  }
-  img.onload=function(){
-    img.onload=null;
-    afterImageReady();
   };
   img.onerror=function(){
+    if(myGen!==openCropStage._gen) return;
     img.onerror=null;
     toast('Không tải được ảnh để crop');
     cancelCrop();
   };
-  // Force a real load cycle: blank first, then blob URL on next tick.
-  // Same-blob reassign after removeAttribute often skips onload on desktop Chrome → black crop.
-  try{ img.removeAttribute('src'); }catch(e){}
-  img.src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
-  setTimeout(function(){
-    if(!stage.classList.contains('open')) return;
-    img.src=url;
-    // Cached complete path (rare for blob, but safe)
-    if(img.complete && img.naturalWidth){
-      img.onload=null;
-      afterImageReady();
-    }
-  }, 0);
+  img.src=url;
 }
 function cancelCrop(){
+  openCropStage._gen=(openCropStage._gen||0)+1; // invalidate in-flight load
   $('cropStage').classList.remove('open');
   document.body.style.overflow='';
   $('fileInput').value='';
   if($('cameraInput')) $('cameraInput').value='';
   if(!croppedBlob){$('uploadActions').classList.add('hidden')}
   if(cropper){ try{ cropper.destroy(); }catch(e){} cropper=null; }
-  var img=$('cropImg');
-  if(img){ img.onload=null; img.onerror=null; img.removeAttribute('src'); img.style.opacity=''; }
+  var area=$('cropStage') && $('cropStage').querySelector('.crop-area');
+  if(area){
+    area.innerHTML='';
+    var img=document.createElement('img');
+    img.id='cropImg';
+    img.alt='';
+    area.appendChild(img);
+  }
 }
 function confirmCrop(){
   if(!cropper)return;
