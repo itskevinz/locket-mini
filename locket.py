@@ -151,7 +151,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 APP_BUILD = "2026.08.23"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
@@ -1557,8 +1557,18 @@ body{
 .upload-actions .btn-ghost{flex:1 1 0;min-width:0;min-height:44px;font-size:13px;padding:10px 8px;margin:0;display:flex;align-items:center;justify-content:center}
 .upload-send-row{display:flex;gap:8px;margin-top:14px;align-items:stretch}
 .upload-send-row .btn{min-height:48px}
-.video-speed-row{display:flex;flex-wrap:wrap;gap:6px}
-.video-speed-row .btn{flex:1 1 calc(25% - 6px);min-width:56px;min-height:40px;padding:8px 0}
+.video-speed-block{margin-top:4px}
+.video-speed-head{display:flex;align-items:center;justify-content:space-between;margin:10px 0 6px}
+.video-speed-val{font-size:13px;font-weight:800;color:var(--accent);font-variant-numeric:tabular-nums;letter-spacing:.02em}
+.video-speed-slider{-webkit-appearance:none;appearance:none;width:100%;height:28px;background:transparent;margin:0;cursor:pointer}
+.video-speed-slider:focus{outline:none}
+.video-speed-slider::-webkit-slider-runnable-track{height:6px;border-radius:500px;background:rgba(255,255,255,.14)}
+.video-speed-slider::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:var(--accent);
+  margin-top:-8px;box-shadow:0 0 0 3px rgba(255,184,0,.25),0 2px 8px rgba(0,0,0,.35);border:none}
+.video-speed-slider::-moz-range-track{height:6px;border-radius:500px;background:rgba(255,255,255,.14);border:none}
+.video-speed-slider::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:var(--accent);border:none;
+  box-shadow:0 0 0 3px rgba(255,184,0,.25),0 2px 8px rgba(0,0,0,.35)}
+.video-speed-marks{display:flex;justify-content:space-between;margin-top:2px;font-size:10px;font-weight:700;color:var(--muted)}
 .page-upload-head{display:flex;align-items:center;justify-content:space-between;margin:0 0 14px;gap:10px}
 .page-upload-head h2{margin:0;font-size:20px;font-weight:800;min-width:0}
 .queue-save-chip{flex-shrink:0;background:rgba(255,255,255,.08);border:1px solid var(--border);color:var(--text2);
@@ -1863,13 +1873,16 @@ body{
       </div>
     </div>
     <div class="video-speed-block hidden" id="videoSpeedBlock">
-      <label class="label" style="margin-top:12px">Tốc độ video</label>
-      <div class="video-speed-row" id="videoSpeedRow">
-        <button type="button" class="btn-ghost btn" onclick="setVideoSpeed(0.5)" data-speed="0.5">0.5x</button>
-        <button type="button" class="btn-ghost btn active" onclick="setVideoSpeed(1)" data-speed="1">1x</button>
-        <button type="button" class="btn-ghost btn" onclick="setVideoSpeed(2)" data-speed="2">2x</button>
-        <button type="button" class="btn-ghost btn" onclick="setVideoSpeed(4)" data-speed="4">4x</button>
+      <div class="video-speed-head">
+        <label class="label" style="margin:0">Tốc độ video</label>
+        <span class="video-speed-val" id="videoSpeedVal">1.00×</span>
       </div>
+      <input type="range" class="video-speed-slider" id="videoSpeedSlider"
+        min="0.25" max="4" step="0.05" value="1"
+        oninput="onVideoSpeedInput(this.value)"
+        onchange="onVideoSpeedCommit(this.value)"
+        aria-label="Tốc độ phát video">
+      <div class="video-speed-marks"><span>0.25×</span><span>1×</span><span>2×</span><span>4×</span></div>
     </div>
     <div class="live-cam hidden" id="liveCam">
       <div class="lc-frame">
@@ -2071,36 +2084,73 @@ function onPreviewVidMeta(){
     if(p && p.catch) p.catch(function(){});
   }catch(e){}
 }
-/* Speed change re-renders from the pristine original every time (never from an
-   already-sped-up result) — draws the source video onto a canvas while it
-   plays at the target playbackRate, and records that canvas via MediaRecorder.
-   This is the same "record what's on screen" trick the live-camera recorder
-   already relies on, so it needs the same browser support: no MediaRecorder /
-   canvas.captureStream means no iPhone 6 (iOS ≤13) — those just don't see the
-   speed row (CAN_RENDER_VIDEO_SPEED gates it in onPreviewVidMeta above). */
-function setVideoSpeed(x){
-  if(!isVideo || !originalVideoBlob || !CAN_RENDER_VIDEO_SPEED) return;
-  const row=$('videoSpeedRow');
-  if(row) Array.prototype.forEach.call(row.querySelectorAll('button'), b=>{
-    b.classList.toggle('active', Number(b.getAttribute('data-speed'))===x);
-  });
+/* Smooth speed slider: live preview via playbackRate while dragging;
+   re-encode from original only after the user stops (debounced commit). */
+var _videoSpeedTimer=null;
+var _videoSpeedBusy=false;
+var _videoSpeedToken=0;
+function formatSpeedLabel(x){
+  var n=Number(x)||1;
+  return (Math.round(n*100)/100).toFixed(2).replace(/\.?0+$/,'') + '×';
+}
+function syncVideoSpeedUI(x){
+  var n=Math.min(4, Math.max(0.25, Number(x)||1));
+  var sl=$('videoSpeedSlider'), val=$('videoSpeedVal');
+  if(sl && Math.abs(Number(sl.value)-n)>0.001) sl.value=String(n);
+  if(val) val.textContent=formatSpeedLabel(n);
+  return n;
+}
+function onVideoSpeedInput(raw){
+  if(!isVideo || !originalVideoBlob) return;
+  var x=syncVideoSpeedUI(raw);
   videoSpeedFactor=x;
-  if(x===1){
+  // Live preview only — no re-encode while dragging
+  var pv=$('previewVid');
+  if(pv){
+    try{ pv.playbackRate=x; }catch(e){}
+  }
+  if(_videoSpeedTimer) clearTimeout(_videoSpeedTimer);
+  _videoSpeedTimer=setTimeout(function(){ onVideoSpeedCommit(x); }, 420);
+}
+function onVideoSpeedCommit(raw){
+  if(_videoSpeedTimer){ clearTimeout(_videoSpeedTimer); _videoSpeedTimer=null; }
+  if(!isVideo || !originalVideoBlob || !CAN_RENDER_VIDEO_SPEED) return;
+  var x=syncVideoSpeedUI(raw);
+  videoSpeedFactor=x;
+  // ~1x: restore original blob, skip expensive re-encode
+  if(Math.abs(x-1)<0.03){
+    x=1; videoSpeedFactor=1; syncVideoSpeedUI(1);
     croppedBlob=originalVideoBlob;
-    $('previewVid').src=URL.createObjectURL(croppedBlob);
+    var pv=$('previewVid');
+    if(pv){
+      var same = pv.src && croppedBlob;
+      pv.src=URL.createObjectURL(croppedBlob);
+      try{ pv.playbackRate=1; }catch(e){}
+      try{ pv.play(); }catch(e){}
+    }
     videoThumbBlob=null;
     return;
   }
   renderVideoAtSpeed(x);
 }
+function setVideoSpeed(x){
+  // Kept for callers; routes through the slider path
+  onVideoSpeedCommit(x);
+}
 function renderVideoAtSpeed(x){
-  toast('Đang xử lý tốc độ '+x+'x…');
+  if(_videoSpeedBusy){
+    // Latest token wins when a previous encode is still running
+  }
+  var token=++_videoSpeedToken;
+  _videoSpeedBusy=true;
+  toast('Đang xử lý tốc độ '+formatSpeedLabel(x)+'…');
   const srcVideo=document.createElement('video');
   srcVideo.muted=true; srcVideo.playsInline=true; srcVideo.setAttribute('playsinline','');
   srcVideo.src=URL.createObjectURL(originalVideoBlob);
   srcVideo.onloadedmetadata=function(){
+    if(token!==_videoSpeedToken){ return; }
     const w=srcVideo.videoWidth, h=srcVideo.videoHeight;
-    if(!w||!h){ toast('Không đọc được video gốc'); return; }
+    if(!w||!h){ _videoSpeedBusy=false; toast('Không đọc được video gốc'); return; }
     const canvas=document.createElement('canvas');
     canvas.width=w; canvas.height=h;
     const ctx=canvas.getContext('2d');
@@ -2111,29 +2161,36 @@ function renderVideoAtSpeed(x){
         ? 'video/mp4'
         : (MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm');
       rec=new MediaRecorder(stream, {mimeType:mime});
-    }catch(e){ toast('Trình duyệt không hỗ trợ đổi tốc độ video'); return; }
+    }catch(e){ _videoSpeedBusy=false; toast('Trình duyệt không hỗ trợ đổi tốc độ video'); return; }
     const chunks=[];
     rec.ondataavailable=function(e){ if(e.data && e.data.size) chunks.push(e.data); };
     rec.onstop=function(){
+      _videoSpeedBusy=false;
+      if(token!==_videoSpeedToken) return;
       const outBlob=new Blob(chunks, {type:mime});
       if(!outBlob.size){ toast('Xử lý tốc độ thất bại, thử lại'); return; }
       croppedBlob=outBlob;
-      $('previewVid').src=URL.createObjectURL(outBlob);
+      var pv=$('previewVid');
+      if(pv){
+        pv.src=URL.createObjectURL(outBlob);
+        try{ pv.playbackRate=1; }catch(e){} // already baked into timeline
+        try{ pv.play(); }catch(e){}
+      }
       videoThumbBlob=null;
-      toast('Xong — video '+x+'x sẵn sàng');
+      toast('Xong — video '+formatSpeedLabel(x)+' sẵn sàng');
     };
     srcVideo.playbackRate=Math.min(Math.max(x,0.0625),16);
     let drawing=true;
     function draw(){
-      if(!drawing) return;
+      if(!drawing || token!==_videoSpeedToken) return;
       try{ ctx.drawImage(srcVideo,0,0,w,h); }catch(e){}
       requestAnimationFrame(draw);
     }
-    srcVideo.onplay=function(){ rec.start(); draw(); };
+    srcVideo.onplay=function(){ try{ rec.start(200); }catch(e){ rec.start(); } draw(); };
     srcVideo.onended=function(){ drawing=false; try{ rec.stop(); }catch(e){} };
-    srcVideo.play().catch(function(){ toast('Không xử lý được tốc độ video'); });
+    srcVideo.play().catch(function(){ _videoSpeedBusy=false; toast('Không xử lý được tốc độ video'); });
   };
-  srcVideo.onerror=function(){ toast('Không đọc được video gốc'); };
+  srcVideo.onerror=function(){ _videoSpeedBusy=false; toast('Không đọc được video gốc'); };
 }
 /* Locket's real API expects an actual JPEG still (a "thumb" field) alongside the
    video, matching binhake's own web client. Without a real image here the field
@@ -3267,59 +3324,121 @@ function openViewer(idx){
 function closeViewer(){$('viewerStage').classList.add('hidden');$('viewerStage').innerHTML=''}
 
 /* ===================== Upload: pick / paste / crop ===================== */
+var _incomingObjectUrl=null;
+function revokeIncomingUrl(){
+  if(_incomingObjectUrl){
+    try{ URL.revokeObjectURL(_incomingObjectUrl); }catch(e){}
+    _incomingObjectUrl=null;
+  }
+}
 function triggerFilePick(){$('fileInput').click()}
 function triggerCamera(){const c=$('cameraInput'); if(c) c.click(); else triggerFilePick()}
 function onFilePick(e){const f=e.target.files[0];if(f)handleIncomingFile(f); e.target.value=''}
-document.addEventListener('paste',(e)=>{
-  if(!$('page-upload')||!$('page-upload').classList.contains('active'))return;
-  const items=(e.clipboardData||{}).items||[];
-  for(const it of items){
-    if(it.type&&it.type.startsWith('image/')){
-      const f=it.getAsFile(); if(f){handleIncomingFile(f);e.preventDefault();break}
+function extractClipboardImage(cd){
+  if(!cd) return null;
+  // Prefer clipboardData.files (desktop Chrome/Edge paste from file manager)
+  try{
+    if(cd.files && cd.files.length){
+      for(var i=0;i<cd.files.length;i++){
+        var f=cd.files[i];
+        if(f && f.type && f.type.indexOf('image/')===0 && f.size>0) return f;
+      }
     }
+  }catch(e){}
+  // items API (screenshot / copy image)
+  try{
+    var items=cd.items||[];
+    for(var j=0;j<items.length;j++){
+      var it=items[j];
+      if(!it) continue;
+      var kind=it.kind||'';
+      var type=it.type||'';
+      if((kind==='file' || !kind) && type.indexOf('image/')===0){
+        var file=it.getAsFile && it.getAsFile();
+        if(file && file.size>0) return file;
+      }
+    }
+  }catch(e){}
+  return null;
+}
+document.addEventListener('paste',function(e){
+  if(!$('page-upload')||!$('page-upload').classList.contains('active')) return;
+  // Ignore paste into text fields (caption etc.) unless it's an image
+  var cd=e.clipboardData||window.clipboardData;
+  var file=extractClipboardImage(cd);
+  if(!file) return;
+  e.preventDefault();
+  e.stopPropagation();
+  // If crop stage is open, tear it down first so the new image owns a clean Cropper
+  var stage=$('cropStage');
+  if(stage && stage.classList.contains('open')){
+    if(cropper){ try{ cropper.destroy(); }catch(err){} cropper=null; }
+    stage.classList.remove('open');
+    document.body.style.overflow='';
   }
+  handleIncomingFile(file);
 });
 function handleIncomingFile(f){
-  originalFile=f; isVideo=f.type.startsWith('video');
+  if(!f){ toast('Không nhận được file'); return; }
+  // Clipboard files sometimes have empty type — sniff from name
+  var type=(f.type||'').toLowerCase();
+  if(!type && f.name){
+    var n=String(f.name).toLowerCase();
+    if(/\.(png|jpe?g|gif|webp|bmp|heic)$/.test(n)) type='image/'+(n.split('.').pop()==='jpg'?'jpeg':n.split('.').pop());
+    else if(/\.(mp4|mov|webm|m4v)$/.test(n)) type='video/'+(n.split('.').pop()==='mov'?'quicktime':n.split('.').pop());
+  }
+  if(!type && f.size>0){
+    // last resort: treat as image (paste screenshots)
+    type='image/png';
+  }
+  originalFile=f;
+  isVideo=type.indexOf('video/')===0;
+  revokeIncomingUrl();
   const url=URL.createObjectURL(f);
+  _incomingObjectUrl=url;
   if(isVideo){
     videoCropOffsetFrac=0.5;
     videoCropPayload=null;
     if($('videoCropSlider')) $('videoCropSlider').value=50;
     if($('videoCropRow')) $('videoCropRow').classList.add('hidden');
     if($('videoSpeedBlock')) $('videoSpeedBlock').classList.add('hidden');
+    if($('videoSpeedSlider')) $('videoSpeedSlider').value='1';
+    if($('videoSpeedVal')) $('videoSpeedVal').textContent='1.00×';
     $('previewImg').classList.add('hidden');
     var pv=$('previewVid');
     pv.classList.remove('hidden');
     pv.style.objectPosition='50% 50%';
     pv.src=url;
+    try{ pv.playbackRate=1; }catch(e){}
     try{ pv.load(); }catch(e){}
     $('uploadPlaceholder').classList.add('hidden');
     $('uploadActions').classList.remove('hidden');
     croppedBlob=f;
     originalVideoBlob=f;
     videoSpeedFactor=1;
-    videoThumbBlob=null; // captured by the previewVid 'loadeddata' listener once a frame decodes
-    if($('videoSpeedRow')) Array.prototype.forEach.call($('videoSpeedRow').querySelectorAll('button'), function(b){
-      b.classList.toggle('active', Number(b.getAttribute('data-speed'))===1);
-    });
+    videoThumbBlob=null;
     return;
   }
-  // Near-square photos skip Cropper (avoids black crop stage on already-square shots).
+  // Decode first — never open crop stage until naturalWidth is known (fixes blank crop on paste).
   const probe=new Image();
   probe.onload=function(){
     var w=probe.naturalWidth, h=probe.naturalHeight;
-    if(w>0 && isNearSquare(w, h, 0.03)){
+    if(!w || !h){
+      toast('Ảnh không hợp lệ');
+      revokeIncomingUrl();
+      return;
+    }
+    if(isNearSquare(w, h, 0.03)){
       const c=document.createElement('canvas');
       c.width=CAPTURE_SIZE; c.height=CAPTURE_SIZE;
       const ctx=c.getContext('2d');
       ctx.imageSmoothingEnabled=true;
       try{ ctx.imageSmoothingQuality='high'; }catch(e){}
-      // Center-crop if tiny aspect drift, else direct draw.
       var side=Math.min(w,h);
       var sx=(w-side)/2, sy=(h-side)/2;
       ctx.drawImage(probe, sx, sy, side, side, 0, 0, CAPTURE_SIZE, CAPTURE_SIZE);
       c.toBlob(function(b){
+        if(!b){ toast('Không xử lý được ảnh'); return; }
         croppedBlob=b;
         $('previewImg').src=URL.createObjectURL(b);
         $('previewImg').classList.remove('hidden');
@@ -3331,25 +3450,34 @@ function handleIncomingFile(f){
     }
     openCropStage(url);
   };
-  probe.onerror=function(){ openCropStage(url); };
+  probe.onerror=function(){
+    toast('Không đọc được ảnh đã dán/chọn');
+    revokeIncomingUrl();
+  };
   probe.src=url;
 }
 function openCropStage(url){
+  if(!url){ toast('Thiếu ảnh để crop'); return; }
   const stage=$('cropStage');
   const img=$('cropImg');
   if(cropper){ try{ cropper.destroy(); }catch(e){} cropper=null; }
+  // Clear handlers from any previous attempt
+  img.onload=null;
+  img.onerror=null;
   stage.classList.add('open');
   document.body.style.overflow='hidden';
-  // Reset src so onload always fires (same blob URL would skip load on some WebKits).
-  img.removeAttribute('src');
   img.style.opacity='0';
   function initCropper(){
     if(!stage.classList.contains('open')) return;
+    if(!img.naturalWidth || !img.naturalHeight){
+      toast('Ảnh crop chưa sẵn sàng');
+      cancelCrop();
+      return;
+    }
     if(cropper){ try{ cropper.destroy(); }catch(e){} cropper=null; }
-    // Layout must be open + image decoded; black crop = Cropper measured 0-size box.
     var area=stage.querySelector('.crop-area');
     if(area && area.clientHeight < 40){
-      setTimeout(initCropper, 40);
+      setTimeout(initCropper, 50);
       return;
     }
     try{
@@ -3373,19 +3501,38 @@ function openCropStage(url){
       cancelCrop();
     }
   }
+  function afterImageReady(){
+    if(!img.naturalWidth){
+      toast('Không tải được ảnh để crop');
+      cancelCrop();
+      return;
+    }
+    requestAnimationFrame(function(){
+      requestAnimationFrame(function(){ setTimeout(initCropper, 40); });
+    });
+  }
   img.onload=function(){
     img.onload=null;
-    // Double rAF so flex layout of fullscreen crop-stage settles on iOS.
-    requestAnimationFrame(function(){
-      requestAnimationFrame(function(){ setTimeout(initCropper, 30); });
-    });
+    afterImageReady();
   };
   img.onerror=function(){
     img.onerror=null;
     toast('Không tải được ảnh để crop');
     cancelCrop();
   };
-  img.src=url;
+  // Force a real load cycle: blank first, then blob URL on next tick.
+  // Same-blob reassign after removeAttribute often skips onload on desktop Chrome → black crop.
+  try{ img.removeAttribute('src'); }catch(e){}
+  img.src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+  setTimeout(function(){
+    if(!stage.classList.contains('open')) return;
+    img.src=url;
+    // Cached complete path (rare for blob, but safe)
+    if(img.complete && img.naturalWidth){
+      img.onload=null;
+      afterImageReady();
+    }
+  }, 0);
 }
 function cancelCrop(){
   $('cropStage').classList.remove('open');
@@ -3432,16 +3579,19 @@ function confirmCrop(){
 function clearUpload(){
   croppedBlob=null;originalFile=null;isVideo=false;videoCropPayload=null;videoThumbBlob=null;videoCropOffsetFrac=0.5;
   originalVideoBlob=null;videoSpeedFactor=1;
+  if(_videoSpeedTimer){ clearTimeout(_videoSpeedTimer); _videoSpeedTimer=null; }
+  _videoSpeedToken++;
+  revokeIncomingUrl();
   $('fileInput').value='';
   if($('cameraInput')) $('cameraInput').value='';
   $('previewImg').classList.add('hidden');$('previewVid').classList.add('hidden');
   $('previewVid').style.objectPosition='';
+  try{ $('previewVid').playbackRate=1; }catch(e){}
   if($('videoCropSlider')) $('videoCropSlider').value=50;
   if($('videoCropRow')) $('videoCropRow').classList.add('hidden');
   if($('videoSpeedBlock')) $('videoSpeedBlock').classList.add('hidden');
-  if($('videoSpeedRow')) Array.prototype.forEach.call($('videoSpeedRow').querySelectorAll('button'), b=>{
-    b.classList.toggle('active', Number(b.getAttribute('data-speed'))===1);
-  });
+  if($('videoSpeedSlider')) $('videoSpeedSlider').value='1';
+  if($('videoSpeedVal')) $('videoSpeedVal').textContent='1.00×';
   $('uploadActions').classList.add('hidden');
   openCapture();
 }
