@@ -151,8 +151,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "1.4"
-APP_BUILD = "2026.08.22"
+APP_VERSION = "1.5"
+APP_BUILD = "2026.08.23"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -1357,6 +1357,7 @@ body{
 .btn:active{transform:scale(.98)}
 .btn:disabled{opacity:.55;box-shadow:none}
 .btn-ghost{background:rgba(255,255,255,.08);color:var(--text);box-shadow:none}
+.btn-ghost.active{background:var(--accent);color:#111;font-weight:700}
 .input{width:100%;padding:13px 16px;border:1px solid var(--border);border-radius:16px;background:var(--surface);
   color:var(--text);font-family:inherit;font-size:15px;outline:none;transition:border-color .2s}
 .input:focus{border-color:var(--accent)}
@@ -1832,6 +1833,17 @@ body{
       <img id="previewImg" class="hidden" alt="preview">
       <video id="previewVid" class="hidden" playsinline muted loop autoplay onloadedmetadata="onPreviewVidMeta.call(this)"></video>
     </div>
+    <div class="video-crop-row hidden" id="videoCropRow">
+      <label class="label" style="margin-top:10px">Vị trí khung vuông (video)</label>
+      <input type="range" id="videoCropSlider" min="0" max="100" value="50" oninput="setVideoCropOffset(this.value)" style="width:100%">
+      <label class="label" style="margin-top:10px">Tốc độ video</label>
+      <div class="video-speed-row" id="videoSpeedRow" style="display:flex;gap:6px">
+        <button type="button" class="btn-ghost btn" style="flex:1;padding:8px 0" onclick="setVideoSpeed(0.5)" data-speed="0.5">0.5x</button>
+        <button type="button" class="btn-ghost btn active" style="flex:1;padding:8px 0" onclick="setVideoSpeed(1)" data-speed="1">1x</button>
+        <button type="button" class="btn-ghost btn" style="flex:1;padding:8px 0" onclick="setVideoSpeed(2)" data-speed="2">2x</button>
+        <button type="button" class="btn-ghost btn" style="flex:1;padding:8px 0" onclick="setVideoSpeed(4)" data-speed="4">4x</button>
+      </div>
+    </div>
     <div class="live-cam hidden" id="liveCam">
       <div class="lc-frame">
         <video id="lcVideo" playsinline webkit-playsinline muted autoplay></video>
@@ -1858,13 +1870,17 @@ body{
     </div>
     <div class="upload-actions hidden" id="uploadActions">
       <button class="btn-ghost btn" onclick="openCapture()">Đổi ảnh</button>
+      <button class="btn-ghost btn" onclick="downloadCapturedMedia()" aria-label="Tải xuống"><i class="bi bi-download"></i></button>
       <button class="btn-ghost btn" onclick="clearUpload()">Xoá</button>
     </div>
     <input type="file" id="fileInput" accept="image/*,video/*" onchange="onFilePick(event)">
     <input type="file" id="cameraInput" accept="image/*" capture="environment" class="hidden" onchange="onFilePick(event)">
     <label class="label" style="margin-top:14px">Chú thích</label>
     <input class="input" id="caption" placeholder="Viết gì đó..." maxlength="200">
-    <button class="btn" style="margin-top:14px" onclick="doUpload()" id="uploadBtn">Gửi cho tất cả bạn bè</button>
+    <div class="upload-send-row" style="display:flex;gap:8px;margin-top:14px">
+      <button class="btn" style="flex:1" onclick="doUpload()" id="uploadBtn">Gửi cho tất cả bạn bè</button>
+      <button class="btn-ghost btn" style="flex:0 0 auto;padding:0 16px" onclick="doSaveQueueOnly()" id="queueOnlyBtn" title="Lưu vào hàng đợi, không gửi ngay"><i class="bi bi-inbox"></i></button>
+    </div>
     <div class="queue-box hidden" id="queueBox">
       <div class="qb-head"><span>Hàng đợi đăng</span><span id="queueCount">0</span></div>
       <div id="queueList"></div>
@@ -1945,18 +1961,103 @@ const GOLD_BADGE="{{ gold_badge }}", CELEB_BADGE="{{ celeb_badge }}";
 const BOOT_NAME={{ (boot_name or '')|tojson }};
 const BOOT_PHOTO={{ (boot_photo or '')|tojson }};
 let croppedBlob=null, originalFile=null, isVideo=false, cropper=null;
-let videoCropPayload=null, videoThumbBlob=null;
+let videoCropPayload=null, videoThumbBlob=null, videoCropOffsetFrac=0.5;
+let originalVideoBlob=null, videoSpeedFactor=1;
+var CAN_RENDER_VIDEO_SPEED = (typeof MediaRecorder!=='undefined' &&
+  typeof document.createElement('canvas').captureStream==='function');
 /* Center-square crop metadata. Shape confirmed against a real captured request
    from binhake's own web client (HAR capture, Aug 2026): exactly {type, crop,
-   video} — no extra "view" key. */
-function buildVideoCropPayload(vw, vh){
+   video} — no extra "view" key. offsetFrac (0..1) slides the square along
+   whichever axis actually has slack (portrait video: vertical; landscape:
+   horizontal) — 0.5 is the old fixed center-crop behavior. */
+function buildVideoCropPayload(vw, vh, offsetFrac){
   if(!vw || !vh) return null;
   var side=Math.min(vw, vh);
-  var x=Math.round((vw-side)/2), y=Math.round((vh-side)/2);
+  var f=(typeof offsetFrac==='number')?offsetFrac:0.5;
+  var x=Math.round((vw-side)*f), y=Math.round((vh-side)*f);
   return JSON.stringify({type:'video', crop:{x:x,y:y,w:side,h:side}, video:{videoWidth:vw,videoHeight:vh}});
 }
+/* previewVid uses object-fit:cover, so nudging object-position with the same
+   fraction gives an exact live preview of the crop with zero extra overlay
+   math — the browser's own cover-crop rendering IS the preview. */
+function setVideoCropOffset(percent){
+  videoCropOffsetFrac = Math.max(0, Math.min(100, Number(percent)||0)) / 100;
+  const v=$('previewVid');
+  if(v){
+    v.style.objectPosition = (videoCropOffsetFrac*100) + '% ' + (videoCropOffsetFrac*100) + '%';
+    if(v.videoWidth) videoCropPayload = buildVideoCropPayload(v.videoWidth, v.videoHeight, videoCropOffsetFrac);
+  }
+}
 function onPreviewVidMeta(){
-  videoCropPayload = buildVideoCropPayload(this.videoWidth, this.videoHeight);
+  const row=$('videoCropRow');
+  if(row) row.classList.toggle('hidden', !isVideo);
+  const speedRow=$('videoSpeedRow');
+  if(speedRow) speedRow.classList.toggle('hidden', !CAN_RENDER_VIDEO_SPEED);
+  videoCropPayload = buildVideoCropPayload(this.videoWidth, this.videoHeight, videoCropOffsetFrac);
+}
+/* Speed change re-renders from the pristine original every time (never from an
+   already-sped-up result) — draws the source video onto a canvas while it
+   plays at the target playbackRate, and records that canvas via MediaRecorder.
+   This is the same "record what's on screen" trick the live-camera recorder
+   already relies on, so it needs the same browser support: no MediaRecorder /
+   canvas.captureStream means no iPhone 6 (iOS ≤13) — those just don't see the
+   speed row (CAN_RENDER_VIDEO_SPEED gates it in onPreviewVidMeta above). */
+function setVideoSpeed(x){
+  if(!isVideo || !originalVideoBlob || !CAN_RENDER_VIDEO_SPEED) return;
+  const row=$('videoSpeedRow');
+  if(row) Array.prototype.forEach.call(row.querySelectorAll('button'), b=>{
+    b.classList.toggle('active', Number(b.getAttribute('data-speed'))===x);
+  });
+  videoSpeedFactor=x;
+  if(x===1){
+    croppedBlob=originalVideoBlob;
+    $('previewVid').src=URL.createObjectURL(croppedBlob);
+    videoThumbBlob=null;
+    return;
+  }
+  renderVideoAtSpeed(x);
+}
+function renderVideoAtSpeed(x){
+  toast('Đang xử lý tốc độ '+x+'x…');
+  const srcVideo=document.createElement('video');
+  srcVideo.muted=true; srcVideo.playsInline=true; srcVideo.setAttribute('playsinline','');
+  srcVideo.src=URL.createObjectURL(originalVideoBlob);
+  srcVideo.onloadedmetadata=function(){
+    const w=srcVideo.videoWidth, h=srcVideo.videoHeight;
+    if(!w||!h){ toast('Không đọc được video gốc'); return; }
+    const canvas=document.createElement('canvas');
+    canvas.width=w; canvas.height=h;
+    const ctx=canvas.getContext('2d');
+    let stream, rec, mime;
+    try{
+      stream=canvas.captureStream(30);
+      mime = (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/mp4'))
+        ? 'video/mp4'
+        : (MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm');
+      rec=new MediaRecorder(stream, {mimeType:mime});
+    }catch(e){ toast('Trình duyệt không hỗ trợ đổi tốc độ video'); return; }
+    const chunks=[];
+    rec.ondataavailable=function(e){ if(e.data && e.data.size) chunks.push(e.data); };
+    rec.onstop=function(){
+      const outBlob=new Blob(chunks, {type:mime});
+      if(!outBlob.size){ toast('Xử lý tốc độ thất bại, thử lại'); return; }
+      croppedBlob=outBlob;
+      $('previewVid').src=URL.createObjectURL(outBlob);
+      videoThumbBlob=null;
+      toast('Xong — video '+x+'x sẵn sàng');
+    };
+    srcVideo.playbackRate=Math.min(Math.max(x,0.0625),16);
+    let drawing=true;
+    function draw(){
+      if(!drawing) return;
+      try{ ctx.drawImage(srcVideo,0,0,w,h); }catch(e){}
+      requestAnimationFrame(draw);
+    }
+    srcVideo.onplay=function(){ rec.start(); draw(); };
+    srcVideo.onended=function(){ drawing=false; try{ rec.stop(); }catch(e){} };
+    srcVideo.play().catch(function(){ toast('Không xử lý được tốc độ video'); });
+  };
+  srcVideo.onerror=function(){ toast('Không đọc được video gốc'); };
 }
 /* Locket's real API expects an actual JPEG still (a "thumb" field) alongside the
    video, matching binhake's own web client. Without a real image here the field
@@ -3111,9 +3212,39 @@ function handleIncomingFile(f){
     $('uploadPlaceholder').classList.add('hidden');
     $('uploadActions').classList.remove('hidden');
     croppedBlob=f;
+    originalVideoBlob=f;
+    videoSpeedFactor=1;
     videoThumbBlob=null; // captured by the previewVid 'loadeddata' listener once a frame decodes
     return;
   }
+  // If the picked photo is already a perfect square, skip the crop step
+  // entirely — just resize/compress it to CAPTURE_SIZE and go straight to
+  // caption. Cropper.js still runs for anything that actually needs cropping.
+  const probe=new Image();
+  probe.onload=function(){
+    if(probe.naturalWidth>0 && probe.naturalWidth===probe.naturalHeight){
+      const c=document.createElement('canvas');
+      c.width=CAPTURE_SIZE; c.height=CAPTURE_SIZE;
+      const ctx=c.getContext('2d');
+      ctx.imageSmoothingEnabled=true;
+      try{ ctx.imageSmoothingQuality='high'; }catch(e){}
+      ctx.drawImage(probe, 0, 0, CAPTURE_SIZE, CAPTURE_SIZE);
+      c.toBlob(function(b){
+        croppedBlob=b;
+        $('previewImg').src=URL.createObjectURL(b);
+        $('previewImg').classList.remove('hidden');
+        $('previewVid').classList.add('hidden');
+        $('uploadPlaceholder').classList.add('hidden');
+        $('uploadActions').classList.remove('hidden');
+      }, 'image/jpeg', CAPTURE_JPEG_Q);
+      return;
+    }
+    openCropStage(url);
+  };
+  probe.onerror=function(){ openCropStage(url); };
+  probe.src=url;
+}
+function openCropStage(url){
   $('cropImg').src=url;
   const stage=$('cropStage');
   stage.classList.add('open');
@@ -3154,10 +3285,17 @@ function confirmCrop(){
   },'image/jpeg',CAPTURE_JPEG_Q);
 }
 function clearUpload(){
-  croppedBlob=null;originalFile=null;isVideo=false;videoCropPayload=null;videoThumbBlob=null;
+  croppedBlob=null;originalFile=null;isVideo=false;videoCropPayload=null;videoThumbBlob=null;videoCropOffsetFrac=0.5;
+  originalVideoBlob=null;videoSpeedFactor=1;
   $('fileInput').value='';
   if($('cameraInput')) $('cameraInput').value='';
   $('previewImg').classList.add('hidden');$('previewVid').classList.add('hidden');
+  $('previewVid').style.objectPosition='';
+  if($('videoCropSlider')) $('videoCropSlider').value=50;
+  if($('videoCropRow')) $('videoCropRow').classList.add('hidden');
+  if($('videoSpeedRow')) Array.prototype.forEach.call($('videoSpeedRow').querySelectorAll('button'), b=>{
+    b.classList.toggle('active', Number(b.getAttribute('data-speed'))===1);
+  });
   $('uploadActions').classList.add('hidden');
   openCapture();
 }
@@ -3187,37 +3325,24 @@ function _sizeLcFrame(){
     var cam = $('liveCam');
     var frame = cam && cam.querySelector ? cam.querySelector('.lc-frame') : document.querySelector('#liveCam .lc-frame');
     if(!frame || !cam || cam.classList.contains('hidden')) return;
-    // Parent is full bleed on phone (CSS width calc 100%+32px). Prefer that.
-    var w = cam.clientWidth || cam.offsetWidth || 0;
-    if(!w){
-      // fallback: page content width
-      var page = $('page-upload');
-      w = (page && (page.clientWidth || page.offsetWidth)) || (window.innerWidth || 320);
-      // if still inside padded page and not bleed, approximate screen
-      if(w < (window.innerWidth || 0) - 8) w = window.innerWidth || w;
-    }
-    w = Math.floor(w);
-    if(w < 160) return;
-    // Full width square — do NOT cap by viewport height (that was making iPhone 6
-    // with Safari chrome stick at ~220px). User can scroll; shutter stays below.
-    frame.style.width = w + 'px';
-    frame.style.height = w + 'px';
-    frame.style.maxWidth = '100%';
-    frame.style.paddingBottom = '0';
-    frame.style.marginLeft = '0';
-    frame.style.marginRight = '0';
-    frame.classList.add('sized');
+    // The square shape itself comes ONLY from CSS (.lc-frame's padding-bottom:100%
+    // trick — width:100%, height:0, padding-bottom:100% always makes height equal
+    // width, no JS needed, works on every browser back to IE6). This used to also
+    // force explicit pixel width/height here and disable that CSS rule via a
+    // '.sized' class, but on at least one iPhone 6 that pixel math produced a
+    // portrait (not square) box — the CSS-only version doesn't have that failure
+    // mode, so this function now only re-runs the video cover-crop below.
     _coverLcVideo();
   }catch(e){}
 }
-/** Manually crop-to-cover the live video into its (always-square) frame using
- *  explicit pixel geometry instead of CSS object-fit. Old WebKit (iOS 12 /
- *  iPhone 6) has a history of getting object-fit:cover wrong on <video>
- *  inside a transformed/absolutely-positioned ancestor — the frame stays
- *  square, but the video paints at its native (often portrait, non-1:1)
- *  aspect, making the picture look like a tall rectangle squeezed in rather
- *  than a true square crop. Computing width/height/left/top by hand sidesteps
- *  that entirely: this works identically on every browser, old or new.
+/** Manually crop-to-cover the live video into its (always-square, CSS-sized)
+ *  frame using explicit pixel geometry instead of CSS object-fit. Old WebKit
+ *  (iOS 12 / iPhone 6) has a history of getting object-fit:cover wrong on
+ *  <video> inside a transformed/absolutely-positioned ancestor — the frame
+ *  itself stays square (that part is CSS, not this function's job), but the
+ *  video paints at its native aspect, making the picture look letterboxed
+ *  rather than a true square crop. Computing width/height/left/top by hand
+ *  sidesteps that: this works identically on every browser, old or new.
  */
 function _coverLcVideo(){
   try{
@@ -3263,8 +3388,11 @@ function scrollUploadCameraIntoView(){
 function openCapture(){
   if(croppedBlob){
     $('previewImg').classList.add('hidden');$('previewVid').classList.add('hidden');
+    $('previewVid').style.objectPosition='';
+    if($('videoCropRow')) $('videoCropRow').classList.add('hidden');
     $('uploadActions').classList.add('hidden');
-    croppedBlob=null;originalFile=null;isVideo=false;videoThumbBlob=null;videoCropPayload=null;
+    croppedBlob=null;originalFile=null;isVideo=false;videoThumbBlob=null;videoCropPayload=null;videoCropOffsetFrac=0.5;
+    originalVideoBlob=null;videoSpeedFactor=1;
   }
   if(isLiveCamera()){
     $('previewBox').classList.add('hidden');
@@ -3791,6 +3919,8 @@ function finishVideoCapture(){
   if(!blob.size){ toast('Không quay được video, thử lại nhé'); return; }
   const ext = mime.indexOf('mp4')>=0 ? 'mp4' : 'webm';
   croppedBlob=blob;
+  originalVideoBlob=blob;
+  videoSpeedFactor=1;
   isVideo=true;
   originalFile={name:'lc_video_'+Date.now()+'.'+ext};
   // Grab the thumb frame from the still-live feed before stopLiveCamera() tears
@@ -4051,6 +4181,45 @@ function maybeAutoCamera(){
 }
 
 /* ===================== Upload: send ===================== */
+function downloadCapturedMedia(){
+  if(!croppedBlob){toast('Chưa có ảnh/video để tải');return}
+  try{
+    const ext = isVideo ? ((croppedBlob.type||'').indexOf('mp4')>=0?'mp4':'webm') : 'jpg';
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(croppedBlob);
+    a.download='locket_'+Date.now()+'.'+ext;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(a.href), 4000);
+  }catch(e){ toast('Không tải xuống được'); }
+}
+/* Save-only: writes the job to the offline queue and stops there — no
+   flushQueue() call, so this never touches the network at all. Meant for
+   rapid back-to-back captures (chụp nhiều liên tục) where waiting on a send
+   attempt between shots would slow things down; everything queued this way
+   still goes out automatically via the ticker/focus/online listeners the next
+   time the tab is open and connected. */
+function doSaveQueueOnly(){
+  if(!croppedBlob){toast('Chọn ảnh hoặc video trước đã');return}
+  const cap=$('caption').value;
+  const filename=isVideo?(originalFile?originalFile.name:'video.mp4'):'moment.jpg';
+  const ct=(croppedBlob.type)||(isVideo?'video/mp4':'image/jpeg');
+  const btn=$('queueOnlyBtn');
+  if(btn) btn.disabled=true;
+  const p = isVideo
+    ? enqueueVideoUpload(croppedBlob, cap, filename, ct, videoCropPayload, videoThumbBlob)
+    : enqueueUpload(croppedBlob, cap, filename, ct);
+  p.then(job=>{
+    if(btn) btn.disabled=false;
+    toast('Đã lưu vào hàng đợi');
+    $('caption').value=''; clearUpload();
+  }).catch(err=>{
+    console.error(err);
+    if(btn) btn.disabled=false;
+    toast('Không lưu được vào hàng đợi');
+  });
+}
 function doUpload(){
   if(!croppedBlob){toast('Chọn ảnh hoặc video trước đã');return}
   const cap=$('caption').value,btn=$('uploadBtn');
