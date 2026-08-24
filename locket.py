@@ -152,7 +152,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
 APP_VERSION = "1.6"
-APP_BUILD = "2026.08.24b"
+APP_BUILD = "2026.08.24c"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -1686,12 +1686,33 @@ body{
 .vcrop-box{position:absolute;border:2px solid var(--accent);box-shadow:0 0 0 9999px rgba(0,0,0,.6);
   touch-action:none;cursor:move;box-sizing:border-box}
 .vcrop-box::before{content:'';position:absolute;inset:0;border:1px solid rgba(255,255,255,.35);pointer-events:none}
-.speed-presets{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 2px}
-.speed-chip{border:1px solid var(--border);background:rgba(255,255,255,.06);color:var(--text);
-  border-radius:500px;padding:7px 12px;font-size:12px;font-weight:800;font-family:inherit;cursor:pointer}
-.speed-chip.active{background:var(--accent);color:#111;border-color:var(--accent)}
-.speed-chip:active{transform:scale(.96)}
-/* noUiSlider — restyled to match app accent/dark theme */
+.speed-head{display:flex;align-items:center;justify-content:space-between;margin:10px 0 8px}
+.speed-head .label{margin:0}
+.speed-value{font-size:15px;font-weight:800;color:var(--accent);letter-spacing:.02em;min-width:3.2em;text-align:right}
+.speed-seg{display:flex;width:100%;border-radius:12px;overflow:hidden;border:1px solid var(--border);
+  background:rgba(255,255,255,.04);margin-bottom:12px}
+.speed-chip{flex:1 1 0;min-width:0;border:none;border-right:1px solid var(--border);background:transparent;
+  color:var(--text2);padding:11px 2px;font-size:12px;font-weight:800;font-family:inherit;cursor:pointer;
+  -webkit-appearance:none;appearance:none;line-height:1.1}
+.speed-chip:last-child{border-right:none}
+.speed-chip.active{background:var(--accent);color:#111}
+.speed-chip:active{opacity:.85}
+.speed-range-wrap{padding:0 2px 2px}
+.speed-range{-webkit-appearance:none;appearance:none;width:100%;height:28px;background:transparent;margin:0;padding:0;
+  touch-action:none}
+.speed-range:focus{outline:none}
+.speed-range::-webkit-slider-runnable-track{height:6px;border-radius:500px;background:rgba(255,255,255,.12)}
+.speed-range::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:24px;height:24px;border-radius:50%;
+  background:var(--accent);border:3px solid #111;box-shadow:0 1px 6px rgba(0,0,0,.45);margin-top:-9px;cursor:pointer}
+.speed-range::-moz-range-track{height:6px;border-radius:500px;background:rgba(255,255,255,.12);border:none}
+.speed-range::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:var(--accent);
+  border:3px solid #111;box-shadow:0 1px 6px rgba(0,0,0,.45);cursor:pointer}
+.speed-range-ends{display:flex;justify-content:space-between;font-size:10px;font-weight:700;color:var(--muted);margin-top:2px}
+.speed-hint{font-size:11px;color:var(--text2);font-weight:600;margin:8px 2px 0;line-height:1.35}
+.speed-busy{display:flex;align-items:center;gap:8px;margin-top:10px;padding:10px 12px;border-radius:12px;
+  background:rgba(255,184,0,.1);border:1px solid rgba(255,184,0,.28);font-size:12.5px;font-weight:700;color:var(--accent)}
+.speed-busy.hidden{display:none}
+/* noUiSlider kept for video crop trim if used elsewhere */
 .noUi-target{background:rgba(255,255,255,.08);border-radius:500px;border:none;box-shadow:none;height:6px}
 .noUi-connect{background:var(--accent)}
 .noUi-handle{width:22px !important;height:22px !important;border-radius:50%;background:var(--accent);
@@ -1859,19 +1880,25 @@ body{
       <button type="button" class="pb-queue-btn hidden" id="queueOnlyBtn" onclick="event.stopPropagation();doSaveQueueOnly()" title="Lưu vào hàng đợi, không gửi ngay" aria-label="Lưu vào hàng đợi"><i class="bi bi-inbox"></i></button>
     </div>
     <div class="video-crop-row hidden" id="videoCropRow">
-      <label class="label" style="margin-top:10px">Tốc độ / Time-lapse<span id="videoSpeedLabel" style="float:right;color:var(--accent);font-weight:800">1.0x</span></label>
-      <div class="speed-presets" id="speedPresets">
-        <button type="button" class="speed-chip" data-speed="0.5" onclick="pickVideoSpeed(0.5)">0.5x</button>
-        <button type="button" class="speed-chip active" data-speed="1" onclick="pickVideoSpeed(1)">1x</button>
-        <button type="button" class="speed-chip" data-speed="2" onclick="pickVideoSpeed(2)">2x</button>
-        <button type="button" class="speed-chip" data-speed="4" onclick="pickVideoSpeed(4)">4x</button>
-        <button type="button" class="speed-chip" data-speed="8" onclick="pickVideoSpeed(8)">8x TL</button>
-        <button type="button" class="speed-chip" data-speed="15" onclick="pickVideoSpeed(15)">15x TL</button>
+      <div class="speed-head">
+        <span class="label" style="margin:0">Tốc độ video</span>
+        <span class="speed-value" id="videoSpeedLabel">1x</span>
       </div>
-      <div id="videoSpeedSlider" style="margin:12px 6px 4px"></div>
-      <div style="font-size:11px;color:var(--text2);font-weight:600;margin:4px 2px 0;line-height:1.35">
-        Kéo thanh chỉ xem trước. Nhả tay mới xuất video mượt (giống CapCut). 4x–15x = time-lapse kiểu iPhone.
+      <div class="speed-seg" id="speedPresets" role="group" aria-label="Tốc độ">
+        <button type="button" class="speed-chip" data-speed="0.5" onclick="pickVideoSpeed(0.5)">0.5×</button>
+        <button type="button" class="speed-chip active" data-speed="1" onclick="pickVideoSpeed(1)">1×</button>
+        <button type="button" class="speed-chip" data-speed="2" onclick="pickVideoSpeed(2)">2×</button>
+        <button type="button" class="speed-chip" data-speed="3" onclick="pickVideoSpeed(3)">3×</button>
+        <button type="button" class="speed-chip" data-speed="4" onclick="pickVideoSpeed(4)">4×</button>
+        <button type="button" class="speed-chip" data-speed="8" onclick="pickVideoSpeed(8)">8×</button>
       </div>
+      <div class="speed-range-wrap">
+        <input type="range" id="videoSpeedRange" class="speed-range" min="0.5" max="8" step="0.1" value="1"
+          oninput="onSpeedRangeInput(this.value)" onchange="onSpeedRangeCommit(this.value)" aria-label="Tốc độ chi tiết">
+        <div class="speed-range-ends"><span>0.5×</span><span>8×</span></div>
+      </div>
+      <div class="speed-hint" id="speedHint">Chạm preset hoặc kéo thanh để xem trước. Video đăng lên sẽ được xuất lại cho mượt.</div>
+      <div class="speed-busy hidden" id="speedBusy"><span class="spinner light"></span> <span id="speedBusyText">Đang xuất…</span></div>
     </div>
     <div class="live-cam hidden" id="liveCam">
       <div class="lc-frame">
@@ -2145,15 +2172,15 @@ function finishVideoCropStage(cropJson){
 }
 
 /* ===================== Video speed / time-lapse =====================
-   UX like CapCut:
-   - Dragging the slider ONLY changes preview via playbackRate (smooth, no re-encode).
-   - Re-encode runs once on slider release / preset tap, using frame-sampling
-     (seek source every dt*speed, draw at fixed 30fps). That is closer to ffmpeg
-     setpts / iPhone time-lapse than playbackRate+rAF, which stuttered badly.
-   - Presets 4x / 8x / 15x are time-lapse style (drop frames, keep duration short).
+   Mobile-first:
+   - Preview: HTMLVideoElement.playbackRate only (instant, no encode).
+   - Bake for upload: continuous play at playbackRate + canvas captureStream.
+     Seek-per-frame was dropped — on phones Safari snaps to keyframes so the
+     result skipped chunks and looked broken.
+   - Downscale on phone (max 720) so MediaRecorder keeps up without dropping.
 */
 var _speedRenderToken = 0;
-var _speedPreviewOnly = false;
+var _speedBaking = false;
 
 function updateSpeedChipUI(x){
   var row = $('speedPresets');
@@ -2166,212 +2193,285 @@ function updateSpeedChipUI(x){
     if(d < bestDist){ bestDist = d; best = chips[i]; }
   }
   for(var j=0;j<chips.length;j++){
-    chips[j].classList.toggle('active', chips[j] === best && bestDist < 0.15);
+    // Strict match for discrete chips so 2x doesn't light up 3x
+    var s2 = parseFloat(chips[j].getAttribute('data-speed'));
+    chips[j].classList.toggle('active', Math.abs(s2 - x) < 0.05);
   }
 }
 
 function setSpeedLabel(x){
   var lbl = $('videoSpeedLabel');
   if(!lbl) return;
-  var t = (Math.round(x * 100) / 100);
-  lbl.textContent = (t % 1 === 0 ? t.toFixed(0) : t.toFixed(2)) + 'x';
+  var t = Math.round(x * 10) / 10;
+  lbl.textContent = (Math.abs(t - Math.round(t)) < 0.05 ? Math.round(t) : t.toFixed(1)) + '×';
+}
+
+function setSpeedBusy(on, msg){
+  var box = $('speedBusy');
+  var txt = $('speedBusyText');
+  if(txt && msg) txt.textContent = msg;
+  if(box) box.classList.toggle('hidden', !on);
+  _speedBaking = !!on;
+}
+
+function syncSpeedRange(x){
+  var r = $('videoSpeedRange');
+  if(r) r.value = String(x);
+}
+
+function applyPreviewSpeed(x){
+  var pv = $('previewVid');
+  if(!pv || !isVideo) return;
+  try{
+    pv.playbackRate = Math.min(Math.max(x, 0.0625), 16);
+  }catch(e){}
+  // Keep looping so user can judge the speed
+  try{ if(pv.paused){ var p=pv.play(); if(p&&p.catch) p.catch(function(){}); } }catch(e){}
+}
+
+function onSpeedRangeInput(v){
+  var x = parseFloat(v);
+  if(!isFinite(x)) return;
+  videoSpeedFactor = x;
+  setSpeedLabel(x);
+  updateSpeedChipUI(x);
+  applyPreviewSpeed(x);
+}
+
+function onSpeedRangeCommit(v){
+  setVideoSpeed(parseFloat(v));
 }
 
 function initVideoSpeedSlider(){
-  const el=$('videoSpeedSlider');
-  if(!el || videoSpeedSliderObj || typeof noUiSlider==='undefined') return;
-  noUiSlider.create(el, {
-    start:[1], connect:[true,false], range:{min:0.25, max:15},
-    step:0.05, tooltips:false,
-  });
-  videoSpeedSliderObj=el.noUiSlider;
-  // Live preview only — never re-encode while dragging (that was the stutter).
-  videoSpeedSliderObj.on('update', function(values){
-    const x=parseFloat(values[0]);
-    setSpeedLabel(x);
-    updateSpeedChipUI(x);
-    var pv = $('previewVid');
-    if(pv && isVideo){
-      try{
-        pv.playbackRate = Math.min(Math.max(x, 0.0625), 16);
-      }catch(e){}
-    }
-  });
-  // Commit: re-encode once when user releases the handle.
-  videoSpeedSliderObj.on('change', function(values){
-    setVideoSpeed(parseFloat(values[0]));
-  });
+  // Native range — more reliable touch UI than noUiSlider on iOS
+  syncSpeedRange(videoSpeedFactor || 1);
+  setSpeedLabel(videoSpeedFactor || 1);
+  updateSpeedChipUI(videoSpeedFactor || 1);
+  // Keep legacy handle null so old noUi paths no-op
+  videoSpeedSliderObj = null;
 }
 
 function pickVideoSpeed(x){
   x = Number(x);
   if(!isFinite(x) || x <= 0) return;
-  if(videoSpeedSliderObj){
-    try{ videoSpeedSliderObj.set(x); }catch(e){}
-  }
+  syncSpeedRange(x);
   setSpeedLabel(x);
   updateSpeedChipUI(x);
   setVideoSpeed(x);
 }
 
 function setVideoSpeed(x){
-  if(!isVideo || !originalVideoBlob || !CAN_RENDER_VIDEO_SPEED) return;
-  x = Math.min(Math.max(Number(x)||1, 0.25), 16);
-  videoSpeedFactor=x;
+  if(!isVideo || !originalVideoBlob) return;
+  x = Math.min(Math.max(Number(x)||1, 0.5), 8);
+  videoSpeedFactor = x;
   setSpeedLabel(x);
   updateSpeedChipUI(x);
-  var pv = $('previewVid');
-  if(pv){
-    try{ pv.playbackRate = Math.min(Math.max(x, 0.0625), 16); }catch(e){}
-  }
-  if(Math.abs(x-1)<0.02){
-    croppedBlob=originalVideoBlob;
+  syncSpeedRange(x);
+  applyPreviewSpeed(x);
+
+  if(Math.abs(x - 1) < 0.05){
+    // Restore pristine original for upload
+    _speedRenderToken++;
+    setSpeedBusy(false);
+    croppedBlob = originalVideoBlob;
+    videoThumbBlob = null;
+    var pv = $('previewVid');
     if(pv){
-      var was = pv.currentTime || 0;
-      pv.src=URL.createObjectURL(croppedBlob);
-      pv.onloadedmetadata = function(){
-        try{ pv.currentTime = Math.min(was, (pv.duration||0)*0.99); }catch(e){}
-        try{ pv.playbackRate = 1; }catch(e){}
-        var p=pv.play(); if(p&&p.catch) p.catch(function(){});
-      };
+      var cur = pv.currentTime || 0;
+      // Only reset src if we previously swapped in a baked blob
+      if(pv.dataset && pv.dataset.baked === '1'){
+        pv.src = URL.createObjectURL(originalVideoBlob);
+        pv.dataset.baked = '0';
+        pv.onloadedmetadata = function(){
+          try{ pv.currentTime = Math.min(cur, (pv.duration||0)*0.99); }catch(e){}
+          applyPreviewSpeed(1);
+        };
+      } else {
+        applyPreviewSpeed(1);
+      }
     }
-    videoThumbBlob=null;
     return;
   }
-  renderVideoAtSpeed(x);
-}
 
-function _seekVideo(video, t){
-  return new Promise(function(resolve){
-    if(!isFinite(t)){ resolve(); return; }
-    var done = false;
-    function finish(){
-      if(done) return;
-      done = true;
-      video.removeEventListener('seeked', finish);
-      video.removeEventListener('error', finish);
-      resolve();
-    }
-    video.addEventListener('seeked', finish);
-    video.addEventListener('error', finish);
-    try{
-      var d = video.duration;
-      if(isFinite(d) && d > 0) t = Math.min(Math.max(0, t), Math.max(0, d - 0.04));
-      if(Math.abs((video.currentTime||0) - t) < 0.001){ finish(); return; }
-      video.currentTime = t;
-    }catch(e){ finish(); }
-    // Safari sometimes never fires seeked on tiny seeks
-    setTimeout(finish, 400);
-  });
+  if(!CAN_RENDER_VIDEO_SPEED){
+    toast('Máy này chỉ xem trước tốc độ — đăng lên vẫn là 1× (cần iOS 14.3+ / Chrome)');
+    return;
+  }
+  // Preview stays live via playbackRate; bake in background for the upload blob
+  renderVideoAtSpeed(x);
 }
 
 function renderVideoAtSpeed(x){
   var token = ++_speedRenderToken;
-  toast('Đang xuất '+x.toFixed(2).replace(/\.?0+$/,'')+'x (mượt)…');
-  const srcVideo=document.createElement('video');
-  srcVideo.muted=true;
-  srcVideo.playsInline=true;
-  srcVideo.setAttribute('playsinline','');
-  srcVideo.preload='auto';
-  srcVideo.src=URL.createObjectURL(originalVideoBlob);
+  setSpeedBusy(true, 'Đang xuất ' + (Math.round(x*10)/10) + '×…');
 
-  srcVideo.onloadedmetadata=function(){
+  var srcVideo = document.createElement('video');
+  srcVideo.muted = true;
+  srcVideo.playsInline = true;
+  srcVideo.setAttribute('playsinline', '');
+  srcVideo.setAttribute('webkit-playsinline', '');
+  srcVideo.preload = 'auto';
+  // Do NOT loop the source during bake — onended ends the recorder
+  srcVideo.loop = false;
+  srcVideo.src = URL.createObjectURL(originalVideoBlob);
+
+  function fail(msg){
     if(token !== _speedRenderToken) return;
-    const w=srcVideo.videoWidth, h=srcVideo.videoHeight;
-    const dur=srcVideo.duration;
-    if(!w||!h||!dur||!isFinite(dur)){ toast('Không đọc được video gốc'); return; }
+    setSpeedBusy(false);
+    toast(msg || 'Không xuất được video');
+  }
 
-    const outFps = 30;
-    // Cap export length so a 60s clip at 0.25x doesn't become a 4-minute encode
-    const maxOutSec = 20;
-    const idealOut = dur / x;
-    const outDur = Math.min(idealOut, maxOutSec);
-    // If capped, effectively raise speed so full content still fits
-    const effectiveX = dur / outDur;
-    const totalFrames = Math.max(2, Math.round(outDur * outFps));
+  srcVideo.onerror = function(){ fail('Không đọc được video gốc'); };
 
-    const canvas=document.createElement('canvas');
-    canvas.width=w; canvas.height=h;
-    const ctx=canvas.getContext('2d', {alpha:false});
-    let stream, rec, mime;
+  srcVideo.onloadedmetadata = function(){
+    if(token !== _speedRenderToken) return;
+    var w0 = srcVideo.videoWidth, h0 = srcVideo.videoHeight;
+    var dur = srcVideo.duration;
+    if(!w0 || !h0 || !dur || !isFinite(dur)){ fail('Không đọc được video gốc'); return; }
+
+    // Phone: downscale so encoder keeps realtime; large 1080 canvases drop frames → stutter/missing bits
+    var maxSide = (typeof IS_PHONE !== 'undefined' && IS_PHONE) ? 720 : 1080;
+    var scale = Math.min(1, maxSide / Math.max(w0, h0));
+    var w = Math.max(2, Math.round(w0 * scale / 2) * 2);
+    var h = Math.max(2, Math.round(h0 * scale / 2) * 2);
+
+    var canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    var ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+    try{ ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'medium'; }catch(e){}
+
+    var outFps = (typeof IS_PHONE !== 'undefined' && IS_PHONE) ? 24 : 30;
+    var stream, rec, mime;
     try{
-      // 0 = manual frames when requestFrame exists; else fixed 30
-      var canRequest = false;
-      try{
-        stream=canvas.captureStream(0);
-        var tracks = stream.getVideoTracks();
-        canRequest = !!(tracks[0] && typeof tracks[0].requestFrame === 'function');
-        if(!canRequest){
-          stream.getTracks().forEach(function(t){ try{t.stop()}catch(e){} });
-          stream=canvas.captureStream(outFps);
-        }
-      }catch(e1){
-        stream=canvas.captureStream(outFps);
-        canRequest = false;
+      stream = canvas.captureStream(outFps);
+      if(MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/mp4')){
+        mime = 'video/mp4';
+      } else if(MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/webm;codecs=vp8')){
+        mime = 'video/webm;codecs=vp8';
+      } else if(MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/webm')){
+        mime = 'video/webm';
+      } else {
+        mime = '';
       }
-      mime = (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/mp4;codecs=avc1'))
-        ? 'video/mp4;codecs=avc1'
-        : (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/mp4'))
-          ? 'video/mp4'
-          : (MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm');
-      try{
-        rec=new MediaRecorder(stream, {mimeType:mime, videoBitsPerSecond: 3500000});
-      }catch(e2){
-        rec=new MediaRecorder(stream, {mimeType:mime});
-      }
-    }catch(e){ toast('Trình duyệt không hỗ trợ đổi tốc độ video'); return; }
+      var recOpts = mime ? { mimeType: mime } : {};
+      // Lower bitrate on phone — fewer dropped frames under load
+      recOpts.videoBitsPerSecond = (typeof IS_PHONE !== 'undefined' && IS_PHONE) ? 1800000 : 3200000;
+      try{ rec = new MediaRecorder(stream, recOpts); }
+      catch(e1){ rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined); }
+    }catch(e){ fail('Trình duyệt không hỗ trợ xuất video tốc độ'); return; }
 
-    const chunks=[];
-    rec.ondataavailable=function(e){ if(e.data && e.data.size) chunks.push(e.data); };
-    rec.onstop=function(){
+    var chunks = [];
+    rec.ondataavailable = function(e){ if(e.data && e.data.size) chunks.push(e.data); };
+    rec.onerror = function(){ fail('Lỗi khi ghi video'); };
+
+    rec.onstop = function(){
+      try{ stream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){}
+      try{ URL.revokeObjectURL(srcVideo.src); }catch(e){}
       if(token !== _speedRenderToken) return;
-      const outBlob=new Blob(chunks, {type: mime.indexOf('mp4')>=0 ? 'video/mp4' : 'video/webm'});
-      if(!outBlob.size){ toast('Xử lý tốc độ thất bại, thử lại'); return; }
-      croppedBlob=outBlob;
-      var pv=$('previewVid');
+      var outType = (mime && mime.indexOf('mp4') >= 0) ? 'video/mp4' : 'video/webm';
+      var outBlob = new Blob(chunks, { type: outType });
+      setSpeedBusy(false);
+      if(!outBlob.size){ toast('Xuất tốc độ thất bại, thử lại'); return; }
+      croppedBlob = outBlob;
+      videoThumbBlob = null;
+      // Do NOT replace preview src with baked blob on phone — switching src feels janky
+      // and the live playbackRate preview is already correct. Keep original for preview.
+      var pv = $('previewVid');
       if(pv){
-        pv.src=URL.createObjectURL(outBlob);
-        pv.onloadedmetadata=function(){
-          try{ pv.playbackRate = 1; }catch(e){}
-          var p=pv.play(); if(p&&p.catch) p.catch(function(){});
-        };
+        // Mark that upload blob is baked; preview still uses original + playbackRate
+        try{ pv.dataset.baked = '0'; }catch(e){}
+        applyPreviewSpeed(x);
       }
-      videoThumbBlob=null;
-      toast('Xong — '+x.toFixed(2).replace(/\.?0+$/,'')+'x sẵn sàng');
+      toast('Đã xuất ' + (Math.round(x*10)/10) + '× — sẵn sàng đăng');
     };
 
-    // Frame-sample path (CapCut / iPhone TL style): for each output frame i,
-    // seek source to (i/outFps)*effectiveX and draw. Even spacing → no stutter.
-    (async function(){
+    var drawing = false;
+    var rafId = 0;
+    var vfcId = 0;
+
+    function paint(){
+      if(!drawing || token !== _speedRenderToken) return;
+      try{ ctx.drawImage(srcVideo, 0, 0, w, h); }catch(e){}
+    }
+
+    function loopRaf(){
+      if(!drawing) return;
+      paint();
+      rafId = requestAnimationFrame(loopRaf);
+    }
+
+    function loopVfc(now, meta){
+      if(!drawing) return;
+      paint();
       try{
-        rec.start(200);
-        // Warm first frame
-        await _seekVideo(srcVideo, 0);
-        for(var i=0; i<totalFrames; i++){
-          if(token !== _speedRenderToken){
-            try{ rec.stop(); }catch(e){}
-            return;
-          }
-          var t = Math.min(dur - 0.001, (i / outFps) * effectiveX);
-          await _seekVideo(srcVideo, t);
-          try{ ctx.drawImage(srcVideo, 0, 0, w, h); }catch(e){}
-          if(canRequest){
-            try{ stream.getVideoTracks()[0].requestFrame(); }catch(e){}
-          }
-          // Pace slightly under 30fps wall-clock so encoder keeps up on phones
-          if(i % 3 === 2) await new Promise(function(r){ setTimeout(r, 0); });
-        }
-        // Hold last frame a beat so MediaRecorder flushes
-        await new Promise(function(r){ setTimeout(r, 80); });
-        try{ rec.stop(); }catch(e){}
-      }catch(err){
-        console.error(err);
-        if(token === _speedRenderToken) toast('Không xử lý được tốc độ video');
-        try{ rec.stop(); }catch(e){}
+        vfcId = srcVideo.requestVideoFrameCallback(loopVfc);
+      }catch(e){
+        loopRaf();
       }
-    })();
+    }
+
+    function stopBake(){
+      drawing = false;
+      try{ if(rafId) cancelAnimationFrame(rafId); }catch(e){}
+      try{ if(vfcId && srcVideo.cancelVideoFrameCallback) srcVideo.cancelVideoFrameCallback(vfcId); }catch(e){}
+      try{ if(rec && rec.state === 'recording') rec.stop(); }catch(e){}
+    }
+
+    srcVideo.onended = function(){
+      // One extra paint of last frame then stop
+      paint();
+      setTimeout(function(){
+        if(token !== _speedRenderToken) return;
+        stopBake();
+      }, 60);
+    };
+
+    // Cap bake wall time so a long clip at low speed can't hang forever
+    var maxMs = Math.min(45000, Math.ceil((dur / x) * 1000) + 3000);
+    var killTimer = setTimeout(function(){
+      if(token !== _speedRenderToken) return;
+      try{ srcVideo.pause(); }catch(e){}
+      stopBake();
+    }, maxMs);
+
+    srcVideo.onplay = function(){
+      if(token !== _speedRenderToken) return;
+      drawing = true;
+      try{ rec.start(250); }catch(e){ fail('Không bắt đầu ghi được'); return; }
+      if(typeof srcVideo.requestVideoFrameCallback === 'function'){
+        try{ vfcId = srcVideo.requestVideoFrameCallback(loopVfc); }
+        catch(e){ loopRaf(); }
+      } else {
+        loopRaf();
+      }
+    };
+
+    // Set rate BEFORE play so the first frames are already accelerated
+    try{ srcVideo.playbackRate = Math.min(Math.max(x, 0.0625), 16); }catch(e){}
+    // Wait until we can play through a bit — reduces early black/missing frames on cellular
+    var startPlay = function(){
+      if(token !== _speedRenderToken) return;
+      var p = srcVideo.play();
+      if(p && p.catch) p.catch(function(){ fail('Không phát được video để xuất'); });
+    };
+    if(srcVideo.readyState >= 3){
+      startPlay();
+    } else {
+      srcVideo.addEventListener('canplay', function onCan(){
+        srcVideo.removeEventListener('canplay', onCan);
+        startPlay();
+      });
+      // Fallback if canplay never fires
+      setTimeout(startPlay, 1200);
+    }
+
+    // Clear kill timer when stopped cleanly
+    var origOnStop = rec.onstop;
+    rec.onstop = function(ev){
+      clearTimeout(killTimer);
+      if(typeof origOnStop === 'function') origOnStop.call(rec, ev);
+    };
   };
-  srcVideo.onerror=function(){ if(token === _speedRenderToken) toast('Không đọc được video gốc'); };
 }
 
 /* Locket's real API expects an actual JPEG still (a "thumb" field) alongside the
@@ -3584,18 +3684,21 @@ function finalizeVideoSelection(blob, cropJson, filename){
   videoSpeedFactor=1;
   videoCropPayload=cropJson;
   videoThumbBlob=null;
+  _speedRenderToken++;
+  setSpeedBusy(false);
   $('previewImg').classList.add('hidden');
   $('previewVid').classList.remove('hidden');
   var pv=$('previewVid');
   pv.src=URL.createObjectURL(blob);
+  try{ pv.dataset.baked = '0'; }catch(e){}
   try{ pv.playbackRate = 1; }catch(e){}
   $('uploadPlaceholder').classList.add('hidden');
   $('uploadActions').classList.remove('hidden');
   if($('queueOnlyBtn')) $('queueOnlyBtn').classList.remove('hidden');
   initVideoSpeedSlider();
-  if(videoSpeedSliderObj) try{ videoSpeedSliderObj.set(1); }catch(e){}
   setSpeedLabel(1);
   updateSpeedChipUI(1);
+  syncSpeedRange(1);
 }
 function openCropStage(url){
   $('cropImg').src=url;
@@ -4550,6 +4653,7 @@ function downloadCapturedMedia(){
    still goes out automatically via the ticker/focus/online listeners the next
    time the tab is open and connected. */
 function doSaveQueueOnly(){
+  if(_speedBaking){toast('Đang xuất tốc độ video, đợi xong rồi lưu');return}
   if(!croppedBlob){toast('Chọn ảnh hoặc video trước đã');return}
   const cap=$('caption').value;
   const filename=isVideo?(originalFile?originalFile.name:'video.mp4'):'moment.jpg';
@@ -4570,6 +4674,7 @@ function doSaveQueueOnly(){
   });
 }
 function doUpload(){
+  if(_speedBaking){toast('Đang xuất tốc độ video, đợi xong rồi đăng');return}
   if(!croppedBlob){toast('Chọn ảnh hoặc video trước đã');return}
   const cap=$('caption').value,btn=$('uploadBtn');
   const filename=isVideo?(originalFile?originalFile.name:'video.mp4'):'moment.jpg';
