@@ -151,8 +151,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "1.5"
-APP_BUILD = "2026.08.23"
+APP_VERSION = "1.6"
+APP_BUILD = "2026.08.24"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -1553,9 +1553,15 @@ body{
 .preview-hint{position:absolute;top:50%;left:0;right:0;-webkit-transform:translateY(-50%);transform:translateY(-50%);
   text-align:center;color:var(--text2);font-weight:700;font-size:13px;padding:0 20px}
 .preview-hint i{opacity:.6;margin-bottom:10px;display:inline-block}
+.pb-queue-btn{position:absolute;top:10px;right:10px;z-index:5;width:34px;height:34px;border-radius:50%;
+  background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.15);color:var(--text);
+  display:flex;align-items:center;justify-content:center;font-size:15px;cursor:pointer;backdrop-filter:blur(4px)}
+.pb-queue-btn:active{background:rgba(0,0,0,.75)}
 #fileInput,#cameraInput{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0,0,0,0)}
-.upload-actions{display:flex;margin-top:10px}
-.upload-actions .btn-ghost{flex:1;font-size:13px;padding:10px;margin:0 4px}
+.upload-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.upload-actions .btn-ghost{flex:1 1 auto;min-width:0;font-size:13px;padding:10px 8px;margin:0;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.upload-actions .btn-ghost.icon-only{flex:0 0 auto;width:44px;padding:10px 0;text-align:center}
 
 /* ---------- Live camera — redesigned, native feel ---------- */
 .live-cam{width:100%;margin:0 0 4px}
@@ -1675,6 +1681,19 @@ body{
 .cropper-line{background:var(--accent)}
 .crop-footer{flex-shrink:0;padding:12px 16px 20px;background:#000}
 .viewer{z-index:10000}
+.vcrop-area{flex:1;min-height:0;position:relative;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.vcrop-area video{max-width:100%;max-height:100%;display:block}
+.vcrop-box{position:absolute;border:2px solid var(--accent);box-shadow:0 0 0 9999px rgba(0,0,0,.6);
+  touch-action:none;cursor:move;box-sizing:border-box}
+.vcrop-box::before{content:'';position:absolute;inset:0;border:1px solid rgba(255,255,255,.35);pointer-events:none}
+/* noUiSlider — restyled to match app accent/dark theme */
+.noUi-target{background:rgba(255,255,255,.08);border-radius:500px;border:none;box-shadow:none;height:6px}
+.noUi-connect{background:var(--accent)}
+.noUi-handle{width:22px !important;height:22px !important;border-radius:50%;background:var(--accent);
+  border:3px solid #111;box-shadow:0 1px 4px rgba(0,0,0,.4);top:-9px !important;right:-11px !important;cursor:grab}
+.noUi-handle::before,.noUi-handle::after{display:none}
+.noUi-tooltip{background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:12px;font-weight:700;
+  border-radius:8px;padding:2px 8px}
 
 /* ---------- Nav ---------- */
 .nav{position:fixed;bottom:0;left:0;right:0;max-width:640px;margin:0 auto;background:rgba(0,0,0,.92);
@@ -1832,17 +1851,11 @@ body{
       </div>
       <img id="previewImg" class="hidden" alt="preview">
       <video id="previewVid" class="hidden" playsinline muted loop autoplay onloadedmetadata="onPreviewVidMeta.call(this)"></video>
+      <button type="button" class="pb-queue-btn hidden" id="queueOnlyBtn" onclick="event.stopPropagation();doSaveQueueOnly()" title="Lưu vào hàng đợi, không gửi ngay" aria-label="Lưu vào hàng đợi"><i class="bi bi-inbox"></i></button>
     </div>
     <div class="video-crop-row hidden" id="videoCropRow">
-      <label class="label" style="margin-top:10px">Vị trí khung vuông (video)</label>
-      <input type="range" id="videoCropSlider" min="0" max="100" value="50" oninput="setVideoCropOffset(this.value)" style="width:100%">
-      <label class="label" style="margin-top:10px">Tốc độ video</label>
-      <div class="video-speed-row" id="videoSpeedRow" style="display:flex;gap:6px">
-        <button type="button" class="btn-ghost btn" style="flex:1;padding:8px 0" onclick="setVideoSpeed(0.5)" data-speed="0.5">0.5x</button>
-        <button type="button" class="btn-ghost btn active" style="flex:1;padding:8px 0" onclick="setVideoSpeed(1)" data-speed="1">1x</button>
-        <button type="button" class="btn-ghost btn" style="flex:1;padding:8px 0" onclick="setVideoSpeed(2)" data-speed="2">2x</button>
-        <button type="button" class="btn-ghost btn" style="flex:1;padding:8px 0" onclick="setVideoSpeed(4)" data-speed="4">4x</button>
-      </div>
+      <label class="label" style="margin-top:10px">Tốc độ video<span id="videoSpeedLabel" style="float:right;color:var(--accent);font-weight:800">1.0x</span></label>
+      <div id="videoSpeedSlider" style="margin:14px 6px 6px"></div>
     </div>
     <div class="live-cam hidden" id="liveCam">
       <div class="lc-frame">
@@ -1870,17 +1883,14 @@ body{
     </div>
     <div class="upload-actions hidden" id="uploadActions">
       <button class="btn-ghost btn" onclick="openCapture()">Đổi ảnh</button>
-      <button class="btn-ghost btn" onclick="downloadCapturedMedia()" aria-label="Tải xuống"><i class="bi bi-download"></i></button>
+      <button class="btn-ghost btn icon-only" onclick="downloadCapturedMedia()" aria-label="Tải xuống"><i class="bi bi-download"></i></button>
       <button class="btn-ghost btn" onclick="clearUpload()">Xoá</button>
     </div>
     <input type="file" id="fileInput" accept="image/*,video/*" onchange="onFilePick(event)">
     <input type="file" id="cameraInput" accept="image/*" capture="environment" class="hidden" onchange="onFilePick(event)">
     <label class="label" style="margin-top:14px">Chú thích</label>
     <input class="input" id="caption" placeholder="Viết gì đó..." maxlength="200">
-    <div class="upload-send-row" style="display:flex;gap:8px;margin-top:14px">
-      <button class="btn" style="flex:1" onclick="doUpload()" id="uploadBtn">Gửi cho tất cả bạn bè</button>
-      <button class="btn-ghost btn" style="flex:0 0 auto;padding:0 16px" onclick="doSaveQueueOnly()" id="queueOnlyBtn" title="Lưu vào hàng đợi, không gửi ngay"><i class="bi bi-inbox"></i></button>
-    </div>
+    <button class="btn" style="margin-top:14px;width:100%" onclick="doUpload()" id="uploadBtn">Gửi cho tất cả bạn bè</button>
     <div class="queue-box hidden" id="queueBox">
       <div class="qb-head"><span>Hàng đợi đăng</span><span id="queueCount">0</span></div>
       <div id="queueList"></div>
@@ -1942,6 +1952,19 @@ body{
     <div class="crop-footer"><div style="text-align:center;color:var(--text2);font-size:12px">Kéo, phóng to/nhỏ để căn ảnh vuông</div></div>
   </div>
 
+  <div class="crop-stage" id="videoCropStage">
+    <div class="crop-header">
+      <button class="cancel" onclick="cancelVideoCrop()">Huỷ</button>
+      <span>Crop video 1:1</span>
+      <button onclick="confirmVideoCrop()">Xong</button>
+    </div>
+    <div class="vcrop-area" id="vcropArea">
+      <video id="vcropVideo" playsinline muted loop autoplay></video>
+      <div class="vcrop-box" id="vcropBox"></div>
+    </div>
+    <div class="crop-footer"><div style="text-align:center;color:var(--text2);font-size:12px">Kéo khung vuông để chọn phần video muốn giữ</div></div>
+  </div>
+
   <div class="viewer hidden" id="viewerStage"></div>
 
   {% endif %}
@@ -1955,45 +1978,160 @@ body{
   </div>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/noUiSlider/15.7.1/nouislider.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/noUiSlider/15.7.1/nouislider.min.js"></script>
 <script>
 const $=id=>document.getElementById(id);
 const GOLD_BADGE="{{ gold_badge }}", CELEB_BADGE="{{ celeb_badge }}";
 const BOOT_NAME={{ (boot_name or '')|tojson }};
 const BOOT_PHOTO={{ (boot_photo or '')|tojson }};
 let croppedBlob=null, originalFile=null, isVideo=false, cropper=null;
-let videoCropPayload=null, videoThumbBlob=null, videoCropOffsetFrac=0.5;
-let originalVideoBlob=null, videoSpeedFactor=1;
+let videoCropPayload=null, videoThumbBlob=null;
+let originalVideoBlob=null, videoSpeedFactor=1, videoSpeedSliderObj=null;
 var CAN_RENDER_VIDEO_SPEED = (typeof MediaRecorder!=='undefined' &&
   typeof document.createElement('canvas').captureStream==='function');
-/* Center-square crop metadata. Shape confirmed against a real captured request
-   from binhake's own web client (HAR capture, Aug 2026): exactly {type, crop,
-   video} — no extra "view" key. offsetFrac (0..1) slides the square along
-   whichever axis actually has slack (portrait video: vertical; landscape:
-   horizontal) — 0.5 is the old fixed center-crop behavior. */
-function buildVideoCropPayload(vw, vh, offsetFrac){
-  if(!vw || !vh) return null;
-  var side=Math.min(vw, vh);
-  var f=(typeof offsetFrac==='number')?offsetFrac:0.5;
-  var x=Math.round((vw-side)*f), y=Math.round((vh-side)*f);
-  return JSON.stringify({type:'video', crop:{x:x,y:y,w:side,h:side}, video:{videoWidth:vw,videoHeight:vh}});
+/* Crop metadata shape confirmed against a real captured request from
+   binhake's own web client (HAR capture, Aug 2026): exactly {type, crop,
+   video} — no extra "view" key. x/y/w/h are in the video's own native pixels
+   (not CSS/displayed pixels) — the crop modal below does that conversion. */
+function videoCropJson(vw, vh, x, y, side){
+  return JSON.stringify({type:'video', crop:{x:Math.round(x),y:Math.round(y),w:Math.round(side),h:Math.round(side)}, video:{videoWidth:vw,videoHeight:vh}});
 }
-/* previewVid uses object-fit:cover, so nudging object-position with the same
-   fraction gives an exact live preview of the crop with zero extra overlay
-   math — the browser's own cover-crop rendering IS the preview. */
-function setVideoCropOffset(percent){
-  videoCropOffsetFrac = Math.max(0, Math.min(100, Number(percent)||0)) / 100;
-  const v=$('previewVid');
-  if(v){
-    v.style.objectPosition = (videoCropOffsetFrac*100) + '% ' + (videoCropOffsetFrac*100) + '%';
-    if(v.videoWidth) videoCropPayload = buildVideoCropPayload(v.videoWidth, v.videoHeight, videoCropOffsetFrac);
-  }
+function centerVideoCropJson(vw, vh){
+  var side=Math.min(vw, vh);
+  return videoCropJson(vw, vh, (vw-side)/2, (vh-side)/2, side);
 }
 function onPreviewVidMeta(){
-  const row=$('videoCropRow');
-  if(row) row.classList.toggle('hidden', !isVideo);
-  const speedRow=$('videoSpeedRow');
-  if(speedRow) speedRow.classList.toggle('hidden', !CAN_RENDER_VIDEO_SPEED);
-  videoCropPayload = buildVideoCropPayload(this.videoWidth, this.videoHeight, videoCropOffsetFrac);
+  // Some iOS versions leave a freshly-assigned <video src> paused on a black
+  // frame until something explicitly calls play() — autoplay alone isn't
+  // always enough right after a programmatic src change. This is the actual
+  // fix for the preview going black.
+  var v=this;
+  var p=v.play();
+  if(p && p.catch) p.catch(function(){});
+  const speedRow=$('videoCropRow');
+  if(speedRow) speedRow.classList.toggle('hidden', !(isVideo && CAN_RENDER_VIDEO_SPEED));
+}
+
+/* ===================== Video crop stage (custom — Cropper.js only handles
+   <img>, there's no real off-the-shelf library for cropping a live <video>
+   element, so this is a small hand-built drag-to-position overlay). ===== */
+var _vcrop = {rect:null, dragging:false, startX:0, startY:0, boxLeft:0, boxTop:0, onDone:null, blob:null};
+function getVideoContentRect(video){
+  var cw=video.clientWidth, ch=video.clientHeight;
+  var vw=video.videoWidth, vh=video.videoHeight;
+  if(!cw||!ch||!vw||!vh) return null;
+  var scale=Math.min(cw/vw, ch/vh);
+  var rw=vw*scale, rh=vh*scale;
+  return {left:(cw-rw)/2, top:(ch-rh)/2, width:rw, height:rh, scale:scale, vw:vw, vh:vh};
+}
+function openVideoCropStage(blob, onDone){
+  _vcrop.blob=blob; _vcrop.onDone=onDone;
+  const v=$('vcropVideo');
+  v.src=URL.createObjectURL(blob);
+  v.onloadedmetadata=function(){
+    var p=v.play(); if(p&&p.catch) p.catch(function(){});
+    if(v.videoWidth>0 && v.videoWidth===v.videoHeight){
+      // Already square — skip the crop UI entirely, per request.
+      finishVideoCropStage(centerVideoCropJson(v.videoWidth, v.videoHeight));
+      return;
+    }
+    $('videoCropStage').classList.add('open');
+    document.body.style.overflow='hidden';
+    requestAnimationFrame(function(){ requestAnimationFrame(initVcropBox); });
+  };
+  v.onerror=function(){ toast('Không đọc được video'); if(_vcrop.onDone) _vcrop.onDone(centerVideoCropJson(1,1)); };
+}
+function initVcropBox(){
+  const v=$('vcropVideo'), box=$('vcropBox');
+  const cr=getVideoContentRect(v);
+  if(!cr){ return; }
+  const side=Math.min(cr.width, cr.height);
+  box.style.width=side+'px';
+  box.style.height=side+'px';
+  box.style.left=(cr.left+(cr.width-side)/2)+'px';
+  box.style.top=(cr.top+(cr.height-side)/2)+'px';
+  bindVcropDrag();
+}
+function bindVcropDrag(){
+  const box=$('vcropBox');
+  if(box._bound) return;
+  box._bound=true;
+  function start(clientX, clientY){
+    _vcrop.dragging=true;
+    _vcrop.startX=clientX; _vcrop.startY=clientY;
+    _vcrop.boxLeft=parseFloat(box.style.left)||0;
+    _vcrop.boxTop=parseFloat(box.style.top)||0;
+  }
+  function move(clientX, clientY){
+    if(!_vcrop.dragging) return;
+    const v=$('vcropVideo');
+    const cr=getVideoContentRect(v);
+    if(!cr) return;
+    const side=box.clientWidth;
+    let left=_vcrop.boxLeft+(clientX-_vcrop.startX);
+    let top=_vcrop.boxTop+(clientY-_vcrop.startY);
+    left=Math.max(cr.left, Math.min(cr.left+cr.width-side, left));
+    top=Math.max(cr.top, Math.min(cr.top+cr.height-side, top));
+    box.style.left=left+'px';
+    box.style.top=top+'px';
+  }
+  function end(){ _vcrop.dragging=false; }
+  box.addEventListener('touchstart', function(e){ var t=e.touches[0]; start(t.clientX,t.clientY); e.preventDefault(); }, {passive:false});
+  box.addEventListener('touchmove', function(e){ var t=e.touches[0]; move(t.clientX,t.clientY); e.preventDefault(); }, {passive:false});
+  box.addEventListener('touchend', end, {passive:true});
+  box.addEventListener('mousedown', function(e){ start(e.clientX,e.clientY); e.preventDefault(); });
+  window.addEventListener('mousemove', function(e){ if(_vcrop.dragging) move(e.clientX,e.clientY); });
+  window.addEventListener('mouseup', end);
+}
+function cancelVideoCrop(){
+  $('videoCropStage').classList.remove('open');
+  document.body.style.overflow='';
+  try{ $('vcropVideo').pause(); }catch(e){}
+  $('fileInput').value='';
+  if($('cameraInput')) $('cameraInput').value='';
+  _vcrop.blob=null; _vcrop.onDone=null;
+}
+function confirmVideoCrop(){
+  const v=$('vcropVideo'), box=$('vcropBox');
+  const cr=getVideoContentRect(v);
+  let cropJson;
+  if(cr){
+    const boxLeft=parseFloat(box.style.left)||cr.left, boxTop=parseFloat(box.style.top)||cr.top;
+    const nativeX=(boxLeft-cr.left)/cr.scale, nativeY=(boxTop-cr.top)/cr.scale;
+    const nativeSide=box.clientWidth/cr.scale;
+    cropJson=videoCropJson(v.videoWidth, v.videoHeight, nativeX, nativeY, nativeSide);
+  }else{
+    cropJson=centerVideoCropJson(v.videoWidth||1, v.videoHeight||1);
+  }
+  $('videoCropStage').classList.remove('open');
+  document.body.style.overflow='';
+  try{ v.pause(); }catch(e){}
+  finishVideoCropStage(cropJson);
+}
+function finishVideoCropStage(cropJson){
+  const blob=_vcrop.blob, cb=_vcrop.onDone;
+  _vcrop.blob=null; _vcrop.onDone=null;
+  if(cb) cb(cropJson, blob);
+}
+
+/* ===================== Video speed (0.25x–4x, smooth slider via noUiSlider) */
+function initVideoSpeedSlider(){
+  const el=$('videoSpeedSlider');
+  if(!el || videoSpeedSliderObj || typeof noUiSlider==='undefined') return;
+  noUiSlider.create(el, {
+    start:[1], connect:[true,false], range:{min:0.25, max:4},
+    step:0.05, tooltips:false,
+  });
+  videoSpeedSliderObj=el.noUiSlider;
+  videoSpeedSliderObj.on('update', function(values){
+    const x=parseFloat(values[0]);
+    const lbl=$('videoSpeedLabel');
+    if(lbl) lbl.textContent=x.toFixed(2).replace(/0$/,'').replace(/\.$/,'.0')+'x';
+  });
+  videoSpeedSliderObj.on('change', function(values){
+    setVideoSpeed(parseFloat(values[0]));
+  });
 }
 /* Speed change re-renders from the pristine original every time (never from an
    already-sped-up result) — draws the source video onto a canvas while it
@@ -2001,15 +2139,11 @@ function onPreviewVidMeta(){
    This is the same "record what's on screen" trick the live-camera recorder
    already relies on, so it needs the same browser support: no MediaRecorder /
    canvas.captureStream means no iPhone 6 (iOS ≤13) — those just don't see the
-   speed row (CAN_RENDER_VIDEO_SPEED gates it in onPreviewVidMeta above). */
+   speed row (CAN_RENDER_VIDEO_SPEED gate above). */
 function setVideoSpeed(x){
   if(!isVideo || !originalVideoBlob || !CAN_RENDER_VIDEO_SPEED) return;
-  const row=$('videoSpeedRow');
-  if(row) Array.prototype.forEach.call(row.querySelectorAll('button'), b=>{
-    b.classList.toggle('active', Number(b.getAttribute('data-speed'))===x);
-  });
   videoSpeedFactor=x;
-  if(x===1){
+  if(Math.abs(x-1)<0.001){
     croppedBlob=originalVideoBlob;
     $('previewVid').src=URL.createObjectURL(croppedBlob);
     videoThumbBlob=null;
@@ -2018,7 +2152,7 @@ function setVideoSpeed(x){
   renderVideoAtSpeed(x);
 }
 function renderVideoAtSpeed(x){
-  toast('Đang xử lý tốc độ '+x+'x…');
+  toast('Đang xử lý tốc độ '+x.toFixed(2)+'x…');
   const srcVideo=document.createElement('video');
   srcVideo.muted=true; srcVideo.playsInline=true; srcVideo.setAttribute('playsinline','');
   srcVideo.src=URL.createObjectURL(originalVideoBlob);
@@ -2044,7 +2178,7 @@ function renderVideoAtSpeed(x){
       croppedBlob=outBlob;
       $('previewVid').src=URL.createObjectURL(outBlob);
       videoThumbBlob=null;
-      toast('Xong — video '+x+'x sẵn sàng');
+      toast('Xong — video '+x.toFixed(2)+'x sẵn sàng');
     };
     srcVideo.playbackRate=Math.min(Math.max(x,0.0625),16);
     let drawing=true;
@@ -3207,14 +3341,7 @@ function handleIncomingFile(f){
   originalFile=f; isVideo=f.type.startsWith('video');
   const url=URL.createObjectURL(f);
   if(isVideo){
-    $('previewImg').classList.add('hidden');
-    $('previewVid').classList.remove('hidden'); $('previewVid').src=url;
-    $('uploadPlaceholder').classList.add('hidden');
-    $('uploadActions').classList.remove('hidden');
-    croppedBlob=f;
-    originalVideoBlob=f;
-    videoSpeedFactor=1;
-    videoThumbBlob=null; // captured by the previewVid 'loadeddata' listener once a frame decodes
+    openVideoCropStage(f, function(cropJson, blob){ finalizeVideoSelection(blob, cropJson, f.name); });
     return;
   }
   // If the picked photo is already a perfect square, skip the crop step
@@ -3236,6 +3363,7 @@ function handleIncomingFile(f){
         $('previewVid').classList.add('hidden');
         $('uploadPlaceholder').classList.add('hidden');
         $('uploadActions').classList.remove('hidden');
+        if($('queueOnlyBtn')) $('queueOnlyBtn').classList.remove('hidden');
       }, 'image/jpeg', CAPTURE_JPEG_Q);
       return;
     }
@@ -3243,6 +3371,23 @@ function handleIncomingFile(f){
   };
   probe.onerror=function(){ openCropStage(url); };
   probe.src=url;
+}
+function finalizeVideoSelection(blob, cropJson, filename){
+  isVideo=true;
+  if(!originalFile) originalFile={name: filename || ('video_'+Date.now()+'.mp4')};
+  croppedBlob=blob;
+  originalVideoBlob=blob;
+  videoSpeedFactor=1;
+  videoCropPayload=cropJson;
+  videoThumbBlob=null;
+  $('previewImg').classList.add('hidden');
+  $('previewVid').classList.remove('hidden');
+  $('previewVid').src=URL.createObjectURL(blob);
+  $('uploadPlaceholder').classList.add('hidden');
+  $('uploadActions').classList.remove('hidden');
+  if($('queueOnlyBtn')) $('queueOnlyBtn').classList.remove('hidden');
+  initVideoSpeedSlider();
+  if(videoSpeedSliderObj) videoSpeedSliderObj.set(1);
 }
 function openCropStage(url){
   $('cropImg').src=url;
@@ -3278,6 +3423,7 @@ function confirmCrop(){
     $('previewVid').classList.add('hidden');
     $('uploadPlaceholder').classList.add('hidden');
     $('uploadActions').classList.remove('hidden');
+    if($('queueOnlyBtn')) $('queueOnlyBtn').classList.remove('hidden');
     $('cropStage').classList.remove('open');
     document.body.style.overflow='';
     if(btn){btn.disabled=false;btn.textContent='Xong'}
@@ -3285,17 +3431,14 @@ function confirmCrop(){
   },'image/jpeg',CAPTURE_JPEG_Q);
 }
 function clearUpload(){
-  croppedBlob=null;originalFile=null;isVideo=false;videoCropPayload=null;videoThumbBlob=null;videoCropOffsetFrac=0.5;
+  croppedBlob=null;originalFile=null;isVideo=false;videoCropPayload=null;videoThumbBlob=null;
   originalVideoBlob=null;videoSpeedFactor=1;
   $('fileInput').value='';
   if($('cameraInput')) $('cameraInput').value='';
   $('previewImg').classList.add('hidden');$('previewVid').classList.add('hidden');
-  $('previewVid').style.objectPosition='';
-  if($('videoCropSlider')) $('videoCropSlider').value=50;
   if($('videoCropRow')) $('videoCropRow').classList.add('hidden');
-  if($('videoSpeedRow')) Array.prototype.forEach.call($('videoSpeedRow').querySelectorAll('button'), b=>{
-    b.classList.toggle('active', Number(b.getAttribute('data-speed'))===1);
-  });
+  if($('queueOnlyBtn')) $('queueOnlyBtn').classList.add('hidden');
+  if(videoSpeedSliderObj) videoSpeedSliderObj.set(1);
   $('uploadActions').classList.add('hidden');
   openCapture();
 }
@@ -3388,11 +3531,12 @@ function scrollUploadCameraIntoView(){
 function openCapture(){
   if(croppedBlob){
     $('previewImg').classList.add('hidden');$('previewVid').classList.add('hidden');
-    $('previewVid').style.objectPosition='';
     if($('videoCropRow')) $('videoCropRow').classList.add('hidden');
+    if($('queueOnlyBtn')) $('queueOnlyBtn').classList.add('hidden');
     $('uploadActions').classList.add('hidden');
-    croppedBlob=null;originalFile=null;isVideo=false;videoThumbBlob=null;videoCropPayload=null;videoCropOffsetFrac=0.5;
+    croppedBlob=null;originalFile=null;isVideo=false;videoThumbBlob=null;videoCropPayload=null;
     originalVideoBlob=null;videoSpeedFactor=1;
+    if(videoSpeedSliderObj) videoSpeedSliderObj.set(1);
   }
   if(isLiveCamera()){
     $('previewBox').classList.add('hidden');
@@ -3750,6 +3894,7 @@ function finishLiveStill(blob){
   $('previewImg').classList.remove('hidden');
   $('previewVid').classList.add('hidden');
   $('uploadActions').classList.remove('hidden');
+  if($('queueOnlyBtn')) $('queueOnlyBtn').classList.remove('hidden');
   stopLiveCamera();
   $('liveCam').classList.add('hidden');
   $('previewBox').classList.remove('hidden');
@@ -3918,23 +4063,19 @@ function finishVideoCapture(){
   lcRecorder=null;
   if(!blob.size){ toast('Không quay được video, thử lại nhé'); return; }
   const ext = mime.indexOf('mp4')>=0 ? 'mp4' : 'webm';
-  croppedBlob=blob;
-  originalVideoBlob=blob;
-  videoSpeedFactor=1;
-  isVideo=true;
-  originalFile={name:'lc_video_'+Date.now()+'.'+ext};
+  const filename='lc_video_'+Date.now()+'.'+ext;
   // Grab the thumb frame from the still-live feed before stopLiveCamera() tears
   // down the stream — drawImage() below captures synchronously, so this is safe
   // even though the actual JPEG encode (toBlob) finishes asynchronously after.
-  videoThumbBlob=null;
-  captureVideoThumb($('lcVideo')).then(function(b){ videoThumbBlob=b; });
-  $('previewVid').src=URL.createObjectURL(blob);
-  $('previewVid').classList.remove('hidden');
-  $('previewImg').classList.add('hidden');
-  $('uploadActions').classList.remove('hidden');
+  var thumbP = captureVideoThumb($('lcVideo'));
   stopLiveCamera();
   $('liveCam').classList.add('hidden');
   $('previewBox').classList.remove('hidden');
+  originalFile={name:filename};
+  openVideoCropStage(blob, function(cropJson, croppedBlobOut){
+    finalizeVideoSelection(croppedBlobOut, cropJson, filename);
+    thumbP.then(function(b){ videoThumbBlob=b; });
+  });
 }
 
 /* ===================== Offline upload queue (IndexedDB) ===================== */
@@ -4504,7 +4645,9 @@ const PRE=[
   '/',
   'https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css',
   'https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.css',
-  'https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js'
+  'https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js',
+  'https://cdnjs.cloudflare.com/ajax/libs/noUiSlider/15.7.1/nouislider.min.css',
+  'https://cdnjs.cloudflare.com/ajax/libs/noUiSlider/15.7.1/nouislider.min.js'
 ];
 self.addEventListener('install',e=>{
   e.waitUntil(caches.open(CACHE).then(c=>c.addAll(PRE)).then(()=>self.skipWaiting()));
@@ -4547,6 +4690,12 @@ self.addEventListener('fetch',e=>{
   }
 });
 """
+    # Tie the cache name to the app version/build so a deploy automatically
+    # evicts everything an old tab had cached, instead of silently serving
+    # stale JS to a returning visitor (this bit the video/camera fixes above —
+    # same-origin fetches are network-first already, but cached CDN libs and
+    # the pre-cache list itself were still keyed to a name that never changed).
+    js = js.replace("const CACHE='locket-mini-v1';", "const CACHE='locket-mini-%s-%s';" % (APP_VERSION, APP_BUILD))
     resp = Response(js, mimetype="application/javascript")
     resp.headers["Service-Worker-Allowed"] = "/"
     resp.headers["Cache-Control"] = "no-cache"
