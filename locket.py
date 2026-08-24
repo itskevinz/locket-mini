@@ -152,7 +152,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
 APP_VERSION = "1.6"
-APP_BUILD = "2026.08.24c"
+APP_BUILD = "2026.08.24d"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -1852,7 +1852,7 @@ body{
     <div class="switch-row">
       <div>
         <div class="sw-text">Camera trực tiếp</div>
-        <div class="sw-sub">Thay khung chọn ảnh bằng camera Locket gốc, chụp là xong</div>
+        <div class="sw-sub">Camera trong web — không lưu vào thư viện máy (khác app Camera hệ thống)</div>
       </div>
       <label class="switch"><input type="checkbox" id="liveCameraSwitch" onchange="toggleLiveCamera(this.checked)"><span class="slider"></span></label>
     </div>
@@ -2274,7 +2274,7 @@ function setVideoSpeed(x){
     _speedRenderToken++;
     setSpeedBusy(false);
     croppedBlob = originalVideoBlob;
-    videoThumbBlob = null;
+    refreshVideoThumb();
     var pv = $('previewVid');
     if(pv){
       var cur = pv.currentTime || 0;
@@ -2373,7 +2373,8 @@ function renderVideoAtSpeed(x){
       setSpeedBusy(false);
       if(!outBlob.size){ toast('Xuất tốc độ thất bại, thử lại'); return; }
       croppedBlob = outBlob;
-      videoThumbBlob = null;
+      // Re-capture still AFTER bake so Locket gets a real frame (not 16x16 black)
+      refreshVideoThumb();
       // Do NOT replace preview src with baked blob on phone — switching src feels janky
       // and the live playbackRate preview is already correct. Keep original for preview.
       var pv = $('previewVid');
@@ -2482,17 +2483,77 @@ function renderVideoAtSpeed(x){
 function captureVideoThumb(videoEl){
   return new Promise(function(resolve){
     try{
-      if(!videoEl || !videoEl.videoWidth || !videoEl.videoHeight){ resolve(null); return; }
-      var vw=videoEl.videoWidth, vh=videoEl.videoHeight;
-      var side=Math.min(vw,vh);
-      var sx=(vw-side)/2, sy=(vh-side)/2;
-      var c=document.createElement('canvas');
-      c.width=CAPTURE_SIZE; c.height=CAPTURE_SIZE;
-      var ctx=c.getContext('2d');
-      ctx.drawImage(videoEl, sx, sy, side, side, 0, 0, CAPTURE_SIZE, CAPTURE_SIZE);
-      c.toBlob(function(b){ resolve(b); }, 'image/jpeg', CAPTURE_JPEG_Q);
+      if(!videoEl){ resolve(null); return; }
+
+      function paint(){
+        try{
+          var vw=videoEl.videoWidth, vh=videoEl.videoHeight;
+          if(!vw || !vh){ resolve(null); return; }
+          var side=Math.min(vw,vh);
+          var sx=(vw-side)/2, sy=(vh-side)/2;
+          var c=document.createElement('canvas');
+          c.width=CAPTURE_SIZE; c.height=CAPTURE_SIZE;
+          var ctx=c.getContext('2d');
+          ctx.imageSmoothingEnabled=true;
+          try{ ctx.imageSmoothingQuality='high'; }catch(e){}
+          ctx.drawImage(videoEl, sx, sy, side, side, 0, 0, CAPTURE_SIZE, CAPTURE_SIZE);
+          c.toBlob(function(b){ resolve(b||null); }, 'image/jpeg', CAPTURE_JPEG_Q);
+        }catch(e){ resolve(null); }
+      }
+
+      var ready = videoEl.readyState >= 2 && videoEl.videoWidth > 0;
+      if(ready){
+        var dur = videoEl.duration;
+        // Avoid pure-black first frame: nudge slightly into the clip when at 0
+        if((!videoEl.currentTime || videoEl.currentTime < 0.05) && isFinite(dur) && dur > 0.2){
+          var target = Math.min(0.15, dur * 0.05);
+          var done = false;
+          var finish = function(){
+            if(done) return;
+            done = true;
+            try{ videoEl.removeEventListener('seeked', onSeek); }catch(e){}
+            paint();
+          };
+          var onSeek = function(){ finish(); };
+          videoEl.addEventListener('seeked', onSeek);
+          try{ videoEl.currentTime = target; }catch(e){ finish(); }
+          setTimeout(finish, 450);
+        } else {
+          paint();
+        }
+        return;
+      }
+
+      var settled = false;
+      var onReady = function(){
+        if(settled) return;
+        settled = true;
+        try{ videoEl.removeEventListener('loadeddata', onReady); }catch(e){}
+        try{ videoEl.removeEventListener('loadedmetadata', onReady); }catch(e){}
+        paint();
+      };
+      videoEl.addEventListener('loadeddata', onReady);
+      videoEl.addEventListener('loadedmetadata', onReady);
+      setTimeout(onReady, 900);
     }catch(e){ resolve(null); }
   });
+}
+
+/** Re-grab JPEG still from the preview <video> after crop / speed bake / restore 1x. */
+function refreshVideoThumb(){
+  var pv = $('previewVid');
+  if(!pv || !isVideo) return Promise.resolve(null);
+  return captureVideoThumb(pv).then(function(b){
+    if(b) videoThumbBlob = b;
+    return b;
+  });
+}
+
+/** Ensure we have a real still before queue/upload (never ship null → 16x16 black server fallback). */
+function ensureVideoThumb(){
+  if(!isVideo) return Promise.resolve(null);
+  if(videoThumbBlob) return Promise.resolve(videoThumbBlob);
+  return refreshVideoThumb();
 }
 let friendsCache=null, momentsLoaded=false, meLoaded=false;
 let momentsCache=[], momentsUpdatedAt=0, momentsPollTimer=null;
@@ -3683,7 +3744,8 @@ function finalizeVideoSelection(blob, cropJson, filename){
   originalVideoBlob=blob;
   videoSpeedFactor=1;
   videoCropPayload=cropJson;
-  videoThumbBlob=null;
+  // Keep prior thumb if caller already captured one (live record); else null until loadeddata/refresh
+  if(!videoThumbBlob) videoThumbBlob=null;
   _speedRenderToken++;
   setSpeedBusy(false);
   $('previewImg').classList.add('hidden');
@@ -3699,6 +3761,8 @@ function finalizeVideoSelection(blob, cropJson, filename){
   setSpeedLabel(1);
   updateSpeedChipUI(1);
   syncSpeedRange(1);
+  // Always grab a still from the finalized clip (full square, not black)
+  refreshVideoThumb();
 }
 function openCropStage(url){
   $('cropImg').src=url;
@@ -3763,7 +3827,12 @@ let lcCaptureMode='photo', lcRecorder=null, lcRecordedChunks=[], lcRecordTimer=n
 const LC_MAX_RECORD_MS=15000;
 
 function isLiveCamera(){
-  try{ return localStorage.getItem('locket_live_camera')==='1'; }catch(e){ return false; }
+  try{
+    var v = localStorage.getItem('locket_live_camera');
+    // Default ON: in-page camera stays in memory (no Gallery save from system Camera app)
+    if(v === null || v === undefined || v === '') return true;
+    return v === '1';
+  }catch(e){ return true; }
 }
 function toggleLiveCamera(on){
   try{ localStorage.setItem('locket_live_camera', on?'1':'0'); }catch(e){}
@@ -4660,18 +4729,25 @@ function doSaveQueueOnly(){
   const ct=(croppedBlob.type)||(isVideo?'video/mp4':'image/jpeg');
   const btn=$('queueOnlyBtn');
   if(btn) btn.disabled=true;
-  const p = isVideo
-    ? enqueueVideoUpload(croppedBlob, cap, filename, ct, videoCropPayload, videoThumbBlob)
-    : enqueueUpload(croppedBlob, cap, filename, ct);
-  p.then(job=>{
-    if(btn) btn.disabled=false;
-    toast('Đã lưu vào hàng đợi');
-    $('caption').value=''; clearUpload();
-  }).catch(err=>{
-    console.error(err);
-    if(btn) btn.disabled=false;
-    toast('Không lưu được vào hàng đợi');
-  });
+  const afterThumb = function(){
+    const p = isVideo
+      ? enqueueVideoUpload(croppedBlob, cap, filename, ct, videoCropPayload, videoThumbBlob)
+      : enqueueUpload(croppedBlob, cap, filename, ct);
+    p.then(job=>{
+      if(btn) btn.disabled=false;
+      toast('Đã lưu vào hàng đợi');
+      $('caption').value=''; clearUpload();
+    }).catch(err=>{
+      console.error(err);
+      if(btn) btn.disabled=false;
+      toast('Không lưu được vào hàng đợi');
+    });
+  };
+  if(isVideo){
+    ensureVideoThumb().then(afterThumb).catch(afterThumb);
+  } else {
+    afterThumb();
+  }
 }
 function doUpload(){
   if(_speedBaking){toast('Đang xuất tốc độ video, đợi xong rồi đăng');return}
@@ -4691,6 +4767,7 @@ function doUpload(){
     // connection here does lose the video — that's the honest tradeoff on
     // devices too old to safely persist it locally.
     btn.innerHTML='<span class="spinner"></span> Đang xử lý...';btn.disabled=true;
+    const sendDirect=function(){
     const fd=new FormData();
     fd.append('file',croppedBlob,filename);
     fd.append('caption',cap);
@@ -4707,6 +4784,8 @@ function doUpload(){
         finishFail(d&&d.error||'Đăng thất bại');
       }
     }).catch(()=>finishFail(navigator.onLine?'Lỗi mạng khi đăng, thử lại':'Mất mạng — video này không lưu được offline trên máy này, thử lại khi có mạng'));
+    };
+    ensureVideoThumb().then(sendDirect).catch(sendDirect);
   };
 
   if(isVideo){
@@ -4714,7 +4793,9 @@ function doUpload(){
     // (or no connection at all) no longer loses the video or shows a bare error —
     // it sits in the queue and the ticker/focus/online listeners retry it.
     btn.disabled=true;
-    enqueueVideoUpload(croppedBlob, cap, filename, ct, videoCropPayload, videoThumbBlob).then(job=>{
+    ensureVideoThumb().then(function(){
+      return enqueueVideoUpload(croppedBlob, cap, filename, ct, videoCropPayload, videoThumbBlob);
+    }).then(job=>{
       btn.innerHTML='Gửi cho tất cả bạn bè';btn.disabled=false;
       toast('Đã lưu — đang gửi...');
       $('caption').value=''; clearUpload();
