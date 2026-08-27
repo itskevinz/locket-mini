@@ -14,6 +14,7 @@ Requires: pip install flask requests pillow websocket-client
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -118,6 +119,15 @@ REFRESH_URL = f"https://securetoken.googleapis.com/v1/token?key={FIREBASE_API_KE
 BINHAKE_API = "https://locket.binhake.dev/server/"
 WS_URL = "wss://locket.binhake.dev/server/"
 
+# Official Locket API (fallback when binhake uploadMedia is down).
+# Captured via HTTP Toolkit from Android app 1.237.0 (2026-08-26):
+#   1) resumable upload → firebasestorage bucket locket-img
+#   2) POST https://api.locketcamera.com/postMomentV2
+LOCKET_API = "https://api.locketcamera.com"
+STORAGE_BUCKET = "locket-img"
+FIREBASE_STORAGE_BASE = f"https://firebasestorage.googleapis.com/v0/b/{STORAGE_BUCKET}/o"
+
+
 # Moments live-cache (per local_id). Avoids re-fetching the full history every tab open.
 _MOMENTS_LOCK = threading.Lock()
 _MOMENTS_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -152,7 +162,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
 APP_VERSION = "1.6"
-APP_BUILD = "2026.08.24d"
+APP_BUILD = "2026.08.27a"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -1043,6 +1053,197 @@ def stop_moments_live(local_id: str):
             ws.close()
         except Exception:
             pass
+
+
+
+def _random_storage_name(ext: str = "webp") -> str:
+    # Official client uses 20-char alphanumeric ids (e.g. f1q6Vca6JuumOlGtunpQ.webp)
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    return "".join(alphabet[b % len(alphabet)] for b in os.urandom(20)) + f".{ext}"
+
+
+def _locket_api_headers(s: LocketSession) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {s.id_token}",
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept-Encoding": "gzip",
+        "User-Agent": "okhttp/4.12.0",
+        "Connection": "Keep-Alive",
+    }
+
+
+def _firebase_storage_headers(s: LocketSession, content_type: str) -> Dict[str, str]:
+    # App Check failed on the captured emulator but uploads still succeeded with
+    # this placeholder token — include it so the request shape matches production.
+    return {
+        "Authorization": f"Firebase {s.id_token}",
+        "Content-Type": "application/json",
+        "Accept-Encoding": "gzip",
+        "User-Agent": IOS_UA,
+        "X-Firebase-Storage-Version": "Android/21.0.1",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Type": content_type,
+        "X-Goog-Upload-Protocol": "resumable",
+        "x-firebase-gmpid": FIREBASE_GMPID,
+        "x-firebase-appcheck": "eyJlcnJvciI6IlVOS05PV05fRVJST1IifQ==",
+    }
+
+
+def _to_webp_or_jpeg(data: bytes, content_type: str) -> Tuple[bytes, str, str]:
+    """Prefer webp (matches official Android client). Fall back to JPEG."""
+    ct = (content_type or "").lower()
+    if "webp" in ct and data[:4] == b"RIFF":
+        return data, "image/webp", "webp"
+    try:
+        img = Image.open(io.BytesIO(data))
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        # Official moments are square thumbs ~1080; keep our compress size.
+        w, h = img.size
+        if w != h:
+            side = min(w, h)
+            left, top = (w - side) // 2, (h - side) // 2
+            img = img.crop((left, top, left + side, top + side))
+        max_side = globals().get('_LOCKET_MAX_SIDE', 1080)
+        if img.size[0] > max_side:
+            img = img.resize((max_side, max_side), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="WEBP", quality=85, method=4)
+        out = buf.getvalue()
+        if out:
+            return out, "image/webp", "webp"
+    except Exception as e:
+        logger.debug("webp convert skipped: %s", e)
+    # JPEG path
+    if data[:3] == b"\xff\xd8\xff":
+        return data, "image/jpeg", "jpg"
+    try:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=88, optimize=True)
+        return buf.getvalue(), "image/jpeg", "jpg"
+    except Exception:
+        return data, content_type or "application/octet-stream", "bin"
+
+
+def upload_to_firebase_storage(s: LocketSession, data: bytes, content_type: str,
+                                object_name: str, timeout: int = 60
+                                ) -> Tuple[str, str, List[Dict[str, Any]]]:
+    """Resumable upload to locket-img. Returns (download_url, md5_hex, debug).
+
+    Flow from Android HAR:
+      POST .../o?name=...&uploadType=resumable  (X-Goog-Upload-Command: start)
+      POST same URL with upload_id             (upload, finalize) + binary body
+      Response carries downloadTokens → public URL with ?alt=media&token=...
+    """
+    debug: List[Dict[str, Any]] = []
+    from urllib.parse import quote
+    name_q = quote(object_name, safe="")
+    start_url = f"{FIREBASE_STORAGE_BASE}?name={name_q}&uploadType=resumable"
+    headers = _firebase_storage_headers(s, content_type)
+    meta = {"contentType": content_type, "cacheControl": "public, max-age=604800"}
+
+    debug.append(make_debug("send", "storage:start", "POST", start_url,
+                             {"name": object_name, "contentType": content_type}))
+    t0 = time.time()
+    r = requests.post(start_url, headers=headers, json=meta, timeout=timeout)
+    dt = time.time() - t0
+    console_log("STORAGE START", "POST", start_url, meta, r.status_code, r.text, dt)
+    debug.append(make_debug("recv" if r.ok else "error", "storage:start", "POST", start_url,
+                             None, r.status_code, r.text, dt))
+    r.raise_for_status()
+    upload_url = r.headers.get("X-Goog-Upload-URL") or r.headers.get("x-goog-upload-url")
+    if not upload_url:
+        raise LocketError("Firebase Storage did not return X-Goog-Upload-URL")
+
+    put_headers = {
+        "Authorization": f"Firebase {s.id_token}",
+        "Content-Type": content_type,
+        "Content-Length": str(len(data)),
+        "X-Goog-Upload-Command": "upload, finalize",
+        "X-Goog-Upload-Offset": "0",
+        "X-Goog-Upload-Protocol": "resumable",
+        "User-Agent": IOS_UA,
+    }
+    debug.append(make_debug("send", "storage:upload", "POST", upload_url,
+                             {"bytes": len(data), "contentType": content_type}))
+    t1 = time.time()
+    r2 = requests.post(upload_url, headers=put_headers, data=data, timeout=timeout)
+    dt2 = time.time() - t1
+    console_log("STORAGE UPLOAD", "POST", upload_url[:120],
+                {"bytes": len(data)}, r2.status_code, r2.text[:400], dt2)
+    debug.append(make_debug("recv" if r2.ok else "error", "storage:upload", "POST", upload_url,
+                             None, r2.status_code, r2.text, dt2))
+    r2.raise_for_status()
+    info = r2.json() if r2.text else {}
+    token = info.get("downloadTokens") or ""
+    if not token:
+        raise LocketError("Storage upload missing downloadTokens")
+    # Public media URL (same shape official postMomentV2 expects)
+    media_url = (
+        f"https://firebasestorage.googleapis.com/v0/b/{STORAGE_BUCKET}/o/"
+        f"{name_q}?alt=media&token={token}"
+    )
+    md5_hex = hashlib.md5(data).hexdigest()
+    return media_url, md5_hex, debug
+
+
+def post_moment_v2(s: LocketSession, thumbnail_url: str, md5_hex: str,
+                   caption: str = "", recipients: Optional[List[str]] = None,
+                   timeout: int = 30) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Official Locket post endpoint (api.locketcamera.com/postMomentV2)."""
+    debug: List[Dict[str, Any]] = []
+    overlays: List[Dict[str, Any]] = []
+    cap = (caption or "").strip()
+    if cap:
+        overlays.append({
+            "overlay_id": "caption:standard",
+            "overlay_type": "caption",
+            "data": {
+                "text_color": "#FFFFFFE6",
+                "text": cap,
+                "type": "standard",
+                "max_lines": 4,
+                "background": {"colors": [], "material_blur": "ultra_thin"},
+            },
+            "alt_text": cap,
+        })
+    payload = {
+        "data": {
+            "thumbnail_url": thumbnail_url,
+            "recipients": recipients if recipients is not None else [],
+            "overlays": overlays,
+            "md5": md5_hex,
+        }
+    }
+    url = f"{LOCKET_API}/postMomentV2"
+    headers = _locket_api_headers(s)
+    debug.append(make_debug("send", "locket:postMomentV2", "POST", url,
+                             {**payload, "data": {**payload["data"], "thumbnail_url": thumbnail_url[:80] + "…"}}))
+    t0 = time.time()
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    dt = time.time() - t0
+    console_log("LOCKET postMomentV2", "POST", url,
+                {"md5": md5_hex, "caption": cap[:40], "thumb": thumbnail_url[:80]},
+                r.status_code, r.text, dt)
+    debug.append(make_debug("recv" if r.ok else "error", "locket:postMomentV2", "POST", url,
+                             None, r.status_code, r.text, dt))
+    r.raise_for_status()
+    return r.json(), debug
+
+
+def upload_media_official(s: LocketSession, data: bytes, content_type: str = "image/jpeg",
+                           caption: str = "", timeout: int = 90
+                           ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Photo post via official Firebase Storage + postMomentV2 (binhake fallback)."""
+    debug: List[Dict[str, Any]] = []
+    blob, ct, ext = _to_webp_or_jpeg(data, content_type)
+    object_name = f"users/{s.local_id}/moments/thumbnails/{_random_storage_name(ext)}"
+    media_url, md5_hex, d1 = upload_to_firebase_storage(s, blob, ct, object_name, timeout=timeout)
+    debug.extend(d1)
+    result, d2 = post_moment_v2(s, media_url, md5_hex, caption=caption, timeout=min(30, timeout))
+    debug.extend(d2)
+    return result, debug
 
 
 def upload_media(s: LocketSession, data: bytes, filename: str, content_type: str,
@@ -5329,11 +5530,33 @@ def api_upload():
                 thumb_data = buf.getvalue()
                 thumb_name = "thumb.jpg"
                 thumb_type = "image/jpeg"
-            result, _dbg = upload_media(s, raw, filename, ct, caption=caption, crop_payload=crop_payload,
-                                         thumb_data=thumb_data, thumb_name=thumb_name, thumb_type=thumb_type)
+            try:
+                result, _dbg = upload_media(s, raw, filename, ct, caption=caption, crop_payload=crop_payload,
+                                             thumb_data=thumb_data, thumb_name=thumb_name, thumb_type=thumb_type)
+            except Exception as e_vid:
+                logger.error("binhake video upload failed: %s", e_vid)
+                # Official HAR only captured photo/webp posts; video needs a
+                # separate media path we don't have yet. Surface a clear error.
+                raise LocketError(
+                    f"Đăng video qua binhake thất bại: {e_vid}. "
+                    "API chính thức cho video chưa được bắt trong HAR — thử ảnh hoặc thử lại sau."
+                ) from e_vid
         else:
             data, filename = compress_image(raw)
-            result, _dbg = upload_media(s, data, filename, "image/jpeg", caption=caption)
+            # Prefer official Locket API (Firebase Storage + postMomentV2) because
+            # binhake uploadMedia has been unreliable. Fall back to binhake if
+            # official path fails (e.g. token/storage policy change).
+            try:
+                result, _dbg = upload_media_official(s, data, "image/jpeg", caption=caption)
+            except Exception as e_off:
+                logger.warning("official postMomentV2 failed (%s) — trying binhake uploadMedia", e_off)
+                try:
+                    result, _dbg = upload_media(s, data, filename, "image/jpeg", caption=caption)
+                except Exception as e_bh:
+                    logger.error("binhake uploadMedia also failed: %s", e_bh)
+                    raise LocketError(
+                        f"Đăng ảnh thất bại (official: {e_off}; binhake: {e_bh})"
+                    ) from e_bh
         if dedupe_key:
             with _UPLOAD_DEDUPE_LOCK:
                 _UPLOAD_DEDUPE[dedupe_key] = {"at": time.time(), "pending": False, "result": result}
