@@ -162,7 +162,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
 APP_VERSION = "1.6"
-APP_BUILD = "2026.08.27a"
+APP_BUILD = "2026.08.28a"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -1063,12 +1063,16 @@ def _random_storage_name(ext: str = "webp") -> str:
 
 
 def _locket_api_headers(s: LocketSession) -> Dict[str, str]:
+    # Shape matches Android 1.237.0 HAR (okhttp). Firebase-Instance-ID-Token is
+    # present on every real client call; a stable placeholder is enough for
+    # postMomentV2 (auth is the Bearer idToken).
     return {
         "Authorization": f"Bearer {s.id_token}",
         "Content-Type": "application/json; charset=utf-8",
         "Accept-Encoding": "gzip",
         "User-Agent": "okhttp/4.12.0",
         "Connection": "Keep-Alive",
+        "Firebase-Instance-ID-Token": f"web_{s.local_id[:16]}:locket-mini",
     }
 
 
@@ -1188,10 +1192,46 @@ def upload_to_firebase_storage(s: LocketSession, data: bytes, content_type: str,
     return media_url, md5_hex, debug
 
 
+def _locket_analytics() -> Dict[str, Any]:
+    """Minimal analytics block matching Android 1.237.0 postMomentV2 HAR.
+    Server ignores most fields; omitting the whole object caused intermittent 4xx
+    on some builds, so we always send a stable shape."""
+    return {
+        "google_analytics": {"app_instance_id": "locket-mini-web"},
+        "amplitude": {
+            "device_id": "locket-mini-web",
+            "session_id": int(time.time() * 1000),
+        },
+        "android_version": "1.237.0",
+        "android_build": "584",
+        "platform": "android",
+        "experiments": {
+            "android_flag_2": 800,
+            "android_flag_1": 0,
+            "android_flag_9": 0,
+            "android_flag_8": 807,
+            "android_flag_7": 200,
+            "android_flag_6": 200,
+            "android_flag_5": 403,
+            "android_flag_4": 100,
+            "android_flag_10": 0,
+            "android_flag_3": 0,
+        },
+    }
+
+
 def post_moment_v2(s: LocketSession, thumbnail_url: str, md5_hex: str,
                    caption: str = "", recipients: Optional[List[str]] = None,
                    timeout: int = 30) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Official Locket post endpoint (api.locketcamera.com/postMomentV2)."""
+    """Official Locket post endpoint (api.locketcamera.com/postMomentV2).
+
+    Payload shape captured from Android 1.237.0 (2026-08-26 HAR):
+      data.thumbnail_url  — public Firebase Storage URL (?alt=media&token=…)
+      data.recipients     — [] = all friends
+      data.overlays       — caption overlay (type=standard) when text present
+      data.md5            — md5 hex of uploaded bytes
+      data.analytics      — required-ish wrapper the real client always sends
+    """
     debug: List[Dict[str, Any]] = []
     overlays: List[Dict[str, Any]] = []
     cap = (caption or "").strip()
@@ -1204,12 +1244,13 @@ def post_moment_v2(s: LocketSession, thumbnail_url: str, md5_hex: str,
                 "text": cap,
                 "type": "standard",
                 "max_lines": 4,
-                "background": {"colors": [], "material_blur": "ultra_thin"},
+                "background": {"colors": [], "material_blur": "regular"},
             },
             "alt_text": cap,
         })
     payload = {
         "data": {
+            "analytics": _locket_analytics(),
             "thumbnail_url": thumbnail_url,
             "recipients": recipients if recipients is not None else [],
             "overlays": overlays,
@@ -1734,6 +1775,12 @@ body{
 .queue-item .qi-status.uploading{color:#4ea8ff}
 .queue-item .qi-status.error{color:#ff6b6b}
 .queue-item .qi-status.done{color:#3ddc84}
+.queue-item .qi-del{flex-shrink:0;margin-left:10px;width:32px;height:32px;border-radius:50%;
+  border:1px solid var(--border);background:rgba(255,255,255,.04);color:var(--text2);
+  font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;padding:0}
+.queue-item .qi-del:active{background:rgba(255,80,80,.25);color:#ff6b6b;border-color:rgba(255,80,80,.4)}
+.queue-item .qi-del:disabled{opacity:.4;pointer-events:none}
 .offline-banner{display:none;padding:10px 14px;margin-bottom:12px;border-radius:12px;
   background:rgba(255,184,0,.12);border:1px solid rgba(255,184,0,.3);font-size:12.5px;font-weight:700;color:var(--accent)}
 .offline-banner.show{display:block}
@@ -4745,15 +4792,43 @@ async function renderQueue(){
   jobs.forEach(j=>{
     const row=document.createElement('div');
     row.className='queue-item';
-    const thumb=j.preview||'';
+    const thumb=j.preview||j.thumbDataUrl||'';
+    const busy = j.status==='uploading';
     row.innerHTML=`
       ${thumb?`<img src="${esc(thumb)}" alt="">`:`<div style="width:44px;height:44px;border-radius:10px;background:#222"></div>`}
       <div class="qi-info">
         <div class="qi-title">${esc(j.caption||'(không chú thích)')}</div>
         <div class="qi-status ${esc(j.status)}">${esc(statusLabel(j.status))}${j.error?': '+esc(j.error):''}</div>
-      </div>`;
+      </div>
+      <button type="button" class="qi-del" data-qid="${esc(j.id)}" title="Xóa khỏi hàng đợi" aria-label="Xóa khỏi hàng đợi" ${busy?'disabled':''}>×</button>`;
     list.appendChild(row);
   });
+  // One delegated listener — avoid rebinding on every re-render
+  if(!list._qiDelBound){
+    list._qiDelBound=true;
+    list.addEventListener('click', function(ev){
+      var btn=ev.target.closest && ev.target.closest('.qi-del');
+      if(!btn) return;
+      ev.preventDefault();
+      var id=btn.getAttribute('data-qid');
+      if(!id) return;
+      btn.disabled=true;
+      removeQueueJob(id);
+    });
+  }
+}
+async function removeQueueJob(id){
+  try{
+    // Cancel in-flight mark so flushQueue will not restart it mid-delete
+    _inFlightJobs.delete(id);
+    await qDel(id);
+    toast('Đã xóa khỏi hàng đợi');
+    await renderQueue();
+  }catch(e){
+    console.warn(e);
+    toast('Không xóa được');
+    await renderQueue();
+  }
 }
 async function enqueueUpload(blob, caption, filename, contentType){
   const id='j_'+Date.now()+'_'+Math.random().toString(36).slice(2,8);
@@ -5543,13 +5618,12 @@ def api_upload():
                 ) from e_vid
         else:
             data, filename = compress_image(raw)
-            # Prefer official Locket API (Firebase Storage + postMomentV2) because
-            # binhake uploadMedia has been unreliable. Fall back to binhake if
-            # official path fails (e.g. token/storage policy change).
+            # Official path primary (Firebase Storage + postMomentV2 from Android HAR).
+            # binhake uploadMedia is broken upstream — keep as silent last-resort only.
             try:
                 result, _dbg = upload_media_official(s, data, "image/jpeg", caption=caption)
             except Exception as e_off:
-                logger.warning("official postMomentV2 failed (%s) — trying binhake uploadMedia", e_off)
+                logger.warning("official postMomentV2 failed (%s) — last-resort binhake", e_off)
                 try:
                     result, _dbg = upload_media(s, data, filename, "image/jpeg", caption=caption)
                 except Exception as e_bh:
