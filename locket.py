@@ -162,7 +162,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
 APP_VERSION = "1.6"
-APP_BUILD = "2026.08.28a"
+APP_BUILD = "2026.08.28b"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -523,21 +523,211 @@ def get_self_info(s: LocketSession) -> Tuple[Dict[str, Any], List[Dict[str, Any]
     return info, debug
 
 
+def _friends_sparse(friends: List[Dict[str, Any]]) -> bool:
+    """True when list is empty or almost all entries lack name/avatar (binhake
+    returning bare UIDs)."""
+    if not friends:
+        return True
+    rich = 0
+    for p in friends:
+        has_name = bool((p.get("first_name") or p.get("last_name") or p.get("username") or "").strip())
+        has_pic = bool((p.get("profile_picture_url") or "").strip())
+        if has_name or has_pic:
+            rich += 1
+    # If fewer than 20% have any profile field, treat as broken upstream
+    return rich < max(1, len(friends) // 5)
+
+
+def list_friend_uids_firestore(s: LocketSession, timeout: int = 25
+                                 ) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """Official friends list via Firestore REST (same source the Android app
+    listens on). Returns friend UIDs only — profiles come from fetchUserV2."""
+    debug: List[Dict[str, Any]] = []
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/locket-4252a/"
+        f"databases/(default)/documents/users/{s.local_id}/friends"
+        f"?pageSize=300"
+    )
+    headers = {
+        "Authorization": f"Bearer {s.id_token}",
+        "Accept": "application/json",
+        "User-Agent": "okhttp/4.12.0",
+    }
+    debug.append(make_debug("send", "firestore:friends", "GET", url, None))
+    t0 = time.time()
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout)
+        dt = time.time() - t0
+        console_log("FIRESTORE friends", "GET", url, None, r.status_code, r.text[:400], dt)
+        debug.append(make_debug("recv" if r.ok else "error", "firestore:friends", "GET", url,
+                                 None, r.status_code, r.text, dt))
+        r.raise_for_status()
+        body = r.json() if r.text else {}
+    except Exception as e:
+        dt = time.time() - t0
+        debug.append(make_debug("error", "firestore:friends", "GET", url, None, None, None, dt, e))
+        raise LocketError(f"Firestore friends list failed: {e}") from e
+
+    uids: List[str] = []
+    seen = set()
+    for doc in (body.get("documents") or []):
+        if not isinstance(doc, dict):
+            continue
+        fields = doc.get("fields") or {}
+        # doc name ends with /friends/{friendUid}; field "user" is the canonical uid
+        uid = None
+        user_f = fields.get("user")
+        if isinstance(user_f, dict) and "stringValue" in user_f:
+            uid = user_f["stringValue"]
+        if not uid:
+            name = doc.get("name") or ""
+            if "/friends/" in name:
+                uid = name.rsplit("/friends/", 1)[-1]
+        if uid and uid not in seen:
+            seen.add(uid)
+            uids.append(uid)
+    # pagination
+    next_token = body.get("nextPageToken")
+    while next_token:
+        page_url = url + f"&pageToken={next_token}"
+        try:
+            r2 = requests.get(page_url, headers=headers, timeout=timeout)
+            r2.raise_for_status()
+            body2 = r2.json() if r2.text else {}
+            for doc in (body2.get("documents") or []):
+                if not isinstance(doc, dict):
+                    continue
+                fields = doc.get("fields") or {}
+                uid = None
+                user_f = fields.get("user")
+                if isinstance(user_f, dict) and "stringValue" in user_f:
+                    uid = user_f["stringValue"]
+                if not uid:
+                    name = doc.get("name") or ""
+                    if "/friends/" in name:
+                        uid = name.rsplit("/friends/", 1)[-1]
+                if uid and uid not in seen:
+                    seen.add(uid)
+                    uids.append(uid)
+            next_token = body2.get("nextPageToken")
+        except Exception as e:
+            logger.warning("firestore friends page skip: %s", e)
+            break
+    logger.info("firestore friends → %d uids", len(uids))
+    return uids, debug
+
+
+def fetch_user_v2(s: LocketSession, user_uid: str, timeout: int = 15
+                   ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """POST api.locketcamera.com/fetchUserV2 — profile for one friend uid."""
+    debug: List[Dict[str, Any]] = []
+    url = f"{LOCKET_API}/fetchUserV2"
+    payload = {"data": {"user_uid": user_uid, "analytics": _locket_analytics()}}
+    headers = _locket_api_headers(s)
+    debug.append(make_debug("send", "locket:fetchUserV2", "POST", url, {"user_uid": user_uid}))
+    t0 = time.time()
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    dt = time.time() - t0
+    # keep console quiet for bulk fan-out (only log failures)
+    if not r.ok:
+        console_log("LOCKET fetchUserV2 FAIL", "POST", url, {"user_uid": user_uid},
+                    r.status_code, r.text[:300], dt)
+    debug.append(make_debug("recv" if r.ok else "error", "locket:fetchUserV2", "POST", url,
+                             None, r.status_code, r.text, dt))
+    r.raise_for_status()
+    body = r.json() if r.text else {}
+    data = body
+    if isinstance(body, dict):
+        result = body.get("result")
+        if isinstance(result, dict) and isinstance(result.get("data"), dict):
+            data = result["data"]
+        elif isinstance(body.get("data"), dict):
+            data = body["data"]
+    return _normalize_user(data if isinstance(data, dict) else {"uid": user_uid}), debug
+
+
+def get_friends_official(s: LocketSession, timeout: int = 45
+                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Firestore friend UIDs + parallel fetchUserV2 profiles (official path)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    debug: List[Dict[str, Any]] = []
+    uids, d1 = list_friend_uids_firestore(s, timeout=min(25, timeout))
+    debug.extend(d1)
+    if not uids:
+        return [], debug
+
+    friends: List[Dict[str, Any]] = []
+    # Cap concurrency so Vercel / Firebase don't rate-limit us
+    workers = min(10, max(4, len(uids)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(fetch_user_v2, s, uid, min(12, timeout)): uid for uid in uids}
+        for fut in as_completed(futs):
+            uid = futs[fut]
+            try:
+                profile, d = fut.result()
+                debug.extend(d)
+                if not profile.get("uid"):
+                    profile["uid"] = uid
+                friends.append(profile)
+            except Exception as e:
+                logger.warning("fetchUserV2 %s failed: %s", uid[:8], e)
+                friends.append(_normalize_user({"uid": uid}))
+
+    def sort_key(p):
+        name = (f"{p.get('first_name','')} {p.get('last_name','')}").strip() or p.get("username") or p.get("uid") or ""
+        return name.casefold()
+
+    celebs = sorted([p for p in friends if p.get("celebrity")], key=sort_key)
+    normals = sorted([p for p in friends if not p.get("celebrity")], key=sort_key)
+    logger.info("official friends resolved %d/%d profiles",
+                sum(1 for p in friends if p.get("first_name") or p.get("username") or p.get("profile_picture_url")),
+                len(friends))
+    return celebs + normals, debug
+
+
 def get_friends(s: LocketSession) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """action=getFriendsList_v3 — full friend list with profiles, already
-    server-side (binhake resolves profiles for us, no N+1 fan-out needed)."""
-    debug = [make_debug("send", "binhake:getFriendsList_v3", "POST", BINHAKE_API, {"action": "getFriendsList_v3"})]
-    data, dbg = binhake_call("getFriendsList_v3", s)
-    debug.append(dbg)
-    raw_list = None
-    if isinstance(data, dict):
-        for path in (data.get("data"), data.get("friends"), (data.get("result") or {}).get("data")):
-            if isinstance(path, list):
-                raw_list = path
-                break
-    if raw_list is None:
-        raw_list = []
-    friends = [_normalize_user(u) for u in raw_list if isinstance(u, dict)]
+    """Friends with full profiles. Prefer official (Firestore + fetchUserV2)
+    when binhake returns bare UIDs or fails — binhake getFriendsList_v3 has
+    been sparse/broken on some accounts."""
+    debug: List[Dict[str, Any]] = []
+    friends: List[Dict[str, Any]] = []
+
+    # 1) try binhake first (fast when healthy)
+    try:
+        debug.append(make_debug("send", "binhake:getFriendsList_v3", "POST", BINHAKE_API,
+                                 {"action": "getFriendsList_v3"}))
+        data, dbg = binhake_call("getFriendsList_v3", s)
+        debug.append(dbg)
+        raw_list = None
+        if isinstance(data, dict):
+            for path in (data.get("data"), data.get("friends"),
+                         (data.get("result") or {}).get("data") if isinstance(data.get("result"), dict) else None):
+                if isinstance(path, list):
+                    raw_list = path
+                    break
+        if raw_list is None:
+            raw_list = []
+        friends = [_normalize_user(u) for u in raw_list if isinstance(u, dict)]
+    except Exception as e:
+        logger.warning("binhake getFriendsList_v3 failed: %s", e)
+        debug.append(make_debug("error", "binhake:getFriendsList_v3", "POST", BINHAKE_API,
+                                 None, None, None, None, e))
+        friends = []
+
+    # 2) official fallback when binhake empty/sparse
+    if _friends_sparse(friends):
+        logger.info("friends sparse (%d) — falling back to official Firestore+fetchUserV2",
+                    len(friends))
+        try:
+            off, d2 = get_friends_official(s)
+            debug.extend(d2)
+            if off:
+                friends = off
+        except Exception as e:
+            logger.error("official friends failed: %s", e)
+            debug.append(make_debug("error", "official:friends", "GET",
+                                     "firestore+fetchUserV2", None, None, None, None, e))
+            # keep whatever binhake gave us (uids only) rather than empty
 
     def sort_key(p):
         name = (f"{p.get('first_name','')} {p.get('last_name','')}").strip() or p.get("username") or p.get("uid") or ""
