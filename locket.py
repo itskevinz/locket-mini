@@ -860,118 +860,248 @@ def _parse_latest_moment_payload(body: Any) -> Tuple[List[Dict[str, Any]], Any]:
     return [x for x in items_raw if isinstance(x, dict)], status
 
 
-def get_moments_official(s: LocketSession, timeout: int = 45,
-                          max_items: int = 120, max_pages: int = 40
-                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Official Locket feed with pagination (same strategy as locketlam).
-
-    getLatestMomentV2 without sync_token often returns only the single newest
-    moment. To load a full grid we page by setting:
-        data.sync_token = <canonical_uid of last item from previous page>
-    until the server returns empty / 304 or we hit max_items / max_pages.
-
-    Mirrors locketlam MomentsModule.get_shared_moments_by_user pagination,
-    but without excluded_users so we keep the mixed friends feed.
-    """
-    debug: List[Dict[str, Any]] = []
+def _latest_moment_page(s: LocketSession, *, sync_token: Optional[str] = None,
+                         excluded_users: Optional[List[str]] = None,
+                         timeout: int = 20
+                         ) -> Tuple[List[Dict[str, Any]], Any, Dict[str, Any]]:
+    """One page of getLatestMomentV2. Returns (raw_items, status, debug_entry)."""
     url = f"{LOCKET_API}/getLatestMomentV2"
+    data_body: Dict[str, Any] = {
+        "should_count_missed_moments": True,
+        "include_group_moments": True,
+        "analytics": _locket_analytics(),
+    }
+    if sync_token:
+        data_body["sync_token"] = sync_token
+    if excluded_users is not None:
+        data_body["excluded_users"] = excluded_users
+    payload = {"data": data_body}
     headers = _locket_api_headers(s)
-    analytics = _locket_analytics()
+    t0 = time.time()
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    dt = time.time() - t0
+    dbg = make_debug(
+        "recv" if r.ok else "error",
+        "locket:getLatestMomentV2",
+        "POST", url,
+        {
+            "sync_token": (str(sync_token)[:16] + "…") if sync_token else None,
+            "excluded": len(excluded_users) if excluded_users is not None else None,
+        },
+        r.status_code, r.text, dt,
+    )
+    if not r.ok:
+        console_log("LOCKET getLatestMomentV2 FAIL", "POST", url,
+                    {"sync": bool(sync_token), "excl": len(excluded_users or [])},
+                    r.status_code, r.text[:300], dt)
+        r.raise_for_status()
+    body = r.json() if r.text else {}
+    items, status = _parse_latest_moment_payload(body)
+    return items, status, dbg
 
-    items: List[Dict[str, Any]] = []
+
+def _paginate_latest_for_user(s: LocketSession, target_uid: str,
+                               other_friend_uids: List[str],
+                               limit: int = 30, max_pages: int = 12,
+                               timeout: int = 18
+                               ) -> List[Dict[str, Any]]:
+    """History for one friend — same strategy as locketlam get_shared_moments_by_user.
+
+    exclude every other friend so the feed stream is only that user's posts,
+    then walk backward with sync_token = last canonical_uid.
+    """
+    out: List[Dict[str, Any]] = []
     seen: set = set()
     sync_token: Optional[str] = None
-    t0 = time.time()
-
-    for page in range(max_pages):
-        data_body: Dict[str, Any] = {
-            "should_count_missed_moments": True,
-            "include_group_moments": True,
-            "analytics": analytics,
-        }
-        if sync_token:
-            data_body["sync_token"] = sync_token
-        payload = {"data": data_body}
-
-        debug.append(make_debug(
-            "send", f"locket:getLatestMomentV2:p{page}", "POST", url,
-            {"sync_token": (sync_token[:16] + "…") if sync_token else None,
-             "page": page},
-        ))
+    for _ in range(max_pages):
         try:
-            r = requests.post(url, headers=headers, json=payload,
-                              timeout=max(12, min(25, timeout)))
+            page_raw, status, _ = _latest_moment_page(
+                s, sync_token=sync_token,
+                excluded_users=other_friend_uids,
+                timeout=timeout,
+            )
         except Exception as e:
-            debug.append(make_debug("error", f"locket:getLatestMomentV2:p{page}",
-                                     "POST", url, None, None, None, None, e))
-            logger.warning("getLatestMomentV2 page %d error: %s", page, e)
-            if page == 0:
-                raise
+            logger.debug("paginate user %s stop: %s", target_uid[:8], e)
             break
-
-        dt = time.time() - t0
-        console_log(
-            f"LOCKET getLatestMomentV2 p{page}", "POST", url,
-            {"sync_token": (sync_token[:16] + "…") if sync_token else None},
-            r.status_code, r.text[:400], dt,
-        )
-        debug.append(make_debug(
-            "recv" if r.ok else "error", f"locket:getLatestMomentV2:p{page}",
-            "POST", url, None, r.status_code, r.text, dt,
-        ))
-        if not r.ok:
-            if page == 0:
-                r.raise_for_status()
-            break
-
-        try:
-            body = r.json() if r.text else {}
-        except ValueError:
-            break
-
-        page_raw, status = _parse_latest_moment_payload(body)
         if status == 304 or not page_raw:
             break
-
         new_on_page = 0
         last_mid = None
         for raw_m in page_raw:
-            mid = (
+            mid = str(
                 raw_m.get("canonical_uid")
                 or raw_m.get("id")
                 or raw_m.get("moment_uid")
                 or raw_m.get("md5")
+                or ""
             )
+            if mid and mid in seen:
+                continue
             if mid:
-                mid = str(mid)
-                if mid in seen:
-                    continue
                 seen.add(mid)
                 last_mid = mid
+            # Keep only moments authored by target (API may still leak others)
+            author = raw_m.get("user")
+            if isinstance(author, dict):
+                author = author.get("uid") or author.get("user_id") or author.get("id")
+            if author and str(author) != str(target_uid):
+                # still advance cursor
+                continue
             norm = _normalize_moment_official(raw_m)
             if not (norm.get("thumbnail_url") or norm.get("video_url") or norm.get("url")):
                 continue
-            items.append(norm)
+            if not norm.get("user"):
+                norm["user"] = target_uid
+            out.append(norm)
             new_on_page += 1
-            if len(items) >= max_items:
-                break
+            if len(out) >= limit:
+                return out
+        if not last_mid or new_on_page == 0:
+            break
+        sync_token = last_mid
+    return out
 
-        # Advance cursor: last NEW canonical_uid on this page (locketlam style)
-        if last_mid:
-            sync_token = last_mid
-        else:
-            # No new ids — stop to avoid infinite loop
+
+def get_moments_official(s: LocketSession, timeout: int = 55,
+                          max_items: int = 150, max_pages: int = 30
+                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Full friends feed without binhake.
+
+    Why not a single getLatestMomentV2?
+      That endpoint (locketlam client.moments.get_latest) is the *widget* feed —
+      often just the single newest moment. History is recovered the way locketlam
+      does in get_shared_moments_by_user:
+        1) optional global pages with sync_token
+        2) per-friend pages with excluded_users = everyone else + sync_token walk
+
+    Returns merged, deduped, date-sorted moments for the Moments grid.
+    """
+    debug: List[Dict[str, Any]] = []
+    items: List[Dict[str, Any]] = []
+    seen: set = set()
+    t0 = time.time()
+
+    def _ingest(raw_list: List[Dict[str, Any]]) -> int:
+        added = 0
+        for raw_m in raw_list:
+            norm = _normalize_moment_official(raw_m)
+            mid = _moment_key(norm)
+            if mid in seen:
+                continue
+            if not (norm.get("thumbnail_url") or norm.get("video_url") or norm.get("url")):
+                continue
+            seen.add(mid)
+            items.append(norm)
+            added += 1
+        return added
+
+    # ---------- Phase 1: global feed pages (fast path) ----------
+    sync_token: Optional[str] = None
+    for page in range(min(8, max_pages)):
+        try:
+            page_raw, status, dbg = _latest_moment_page(
+                s, sync_token=sync_token, excluded_users=None,
+                timeout=min(20, timeout),
+            )
+            debug.append(dbg)
+        except Exception as e:
+            debug.append(make_debug("error", "locket:getLatestMomentV2:global",
+                                     "POST", f"{LOCKET_API}/getLatestMomentV2",
+                                     None, None, None, None, e))
+            logger.warning("global getLatestMomentV2 failed: %s", e)
+            break
+        if status == 304 or not page_raw:
+            break
+        added = _ingest(page_raw)
+        last_mid = None
+        for raw_m in page_raw:
+            mid = raw_m.get("canonical_uid") or raw_m.get("id") or raw_m.get("moment_uid")
+            if mid:
+                last_mid = str(mid)
+        if not last_mid or added == 0:
+            break
+        sync_token = last_mid
+        if len(items) >= max_items:
+            break
+        if time.time() - t0 > 12:
             break
 
-        if new_on_page == 0 or len(items) >= max_items:
-            break
+    logger.info("getLatestMomentV2 global → %d items", len(items))
 
-        # Soft time budget so a force-refresh does not hang the request forever
-        if time.time() - t0 > max(20, timeout):
-            logger.info("getLatestMomentV2 stop: time budget (got %d)", len(items))
-            break
+    # ---------- Phase 2: per-friend history (locketlam strategy) ----------
+    # Always run when we have few items; also run lightly to fill the grid.
+    need_more = len(items) < max(12, max_items // 4)
+    if need_more or len(items) < 40:
+        friend_uids: List[str] = []
+        try:
+            friend_uids, d_fr = list_friend_uids_firestore(s, timeout=min(20, timeout))
+            debug.extend(d_fr)
+        except Exception as e:
+            logger.warning("friend uids for moments fan-out failed: %s", e)
+            # Fallback: friends already cached via get_friends path
+            try:
+                friends, d2 = get_friends(s)
+                debug.extend(d2)
+                friend_uids = [f.get("uid") for f in friends if f.get("uid")]
+            except Exception as e2:
+                logger.warning("get_friends fallback failed: %s", e2)
 
-    logger.info("getLatestMomentV2 → %d items (%d pages)", len(items), page + 1 if items or page == 0 else page)
+        # Cap how many friends we walk so the request stays within budget
+        # Prefer friends who already appear in the global feed first, then the rest
+        already_authors = set()
+        for m in items:
+            u = m.get("user")
+            if isinstance(u, dict):
+                u = u.get("uid")
+            if u:
+                already_authors.add(str(u))
+        ordered = [u for u in friend_uids if u in already_authors] + \
+                  [u for u in friend_uids if u not in already_authors]
+        # Self may also have moments on the feed
+        if s.local_id and s.local_id not in ordered:
+            ordered = [s.local_id] + ordered
+
+        max_friends = 25 if need_more else 12
+        per_friend_limit = 20 if need_more else 8
+        budget_left = max(8.0, timeout - (time.time() - t0))
+        targets = ordered[:max_friends]
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _job(uid: str) -> List[Dict[str, Any]]:
+            others = [x for x in friend_uids if x != uid]
+            return _paginate_latest_for_user(
+                s, uid, others,
+                limit=per_friend_limit,
+                max_pages=10 if need_more else 4,
+                timeout=min(15, max(8, int(budget_left / 3))),
+            )
+
+        workers = min(6, max(2, len(targets)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_job, uid): uid for uid in targets}
+            for fut in as_completed(futs):
+                uid = futs[fut]
+                try:
+                    got = fut.result()
+                    n = _ingest(got)
+                    if n:
+                        logger.info("moments from %s → +%d (total %d)", uid[:8], n, len(items))
+                except Exception as e:
+                    logger.debug("friend moments %s failed: %s", uid[:8], e)
+                if len(items) >= max_items:
+                    break
+                if time.time() - t0 > timeout:
+                    break
+
+    # Sort newest first
+    def sort_ts(m):
+        d = m.get("date") or {}
+        return (d.get("_seconds") if isinstance(d, dict) else 0) or 0
+
+    items.sort(key=sort_ts, reverse=True)
+    items = items[:max_items]
+    logger.info("get_moments_official total → %d items in %.1fs", len(items), time.time() - t0)
     return items, debug
 
 
@@ -1324,7 +1454,7 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
     try:
         # 1) Official Locket API — full friend feed in one request
         try:
-            items, _ = get_moments_official(s, timeout=min(50, max(20, timeout)), max_items=120, max_pages=40)
+            items, _ = get_moments_official(s, timeout=min(70, max(30, timeout)), max_items=150, max_pages=30)
         except Exception as e_off:
             logger.warning("moments official getLatestMomentV2 failed (%s)", e_off)
             items = []
