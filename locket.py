@@ -784,20 +784,74 @@ def _extract_moments_list(data: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _moment_timestamp(m: Dict[str, Any]) -> int:
+    """Unix seconds for sorting — handles every shape Locket / locketlam returns.
+
+    Priority matches what the real client stores on moments:
+      date._seconds | date.seconds | timestamp | created_at | createTime
+    Milliseconds (> 1e12) are converted to seconds.
+    """
+    if not isinstance(m, dict):
+        return 0
+
+    def _as_sec(v) -> int:
+        if v is None:
+            return 0
+        if isinstance(v, (int, float)):
+            x = float(v)
+            if x > 1e12:  # ms
+                return int(x / 1000)
+            if x > 1e9:   # sec
+                return int(x)
+            return int(x) if x > 0 else 0
+        if isinstance(v, str) and v.strip():
+            s = v.strip()
+            try:
+                if s.isdigit() or (s.replace(".", "", 1).isdigit()):
+                    return _as_sec(float(s))
+            except Exception:
+                pass
+            try:
+                from datetime import datetime
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                return int(datetime.fromisoformat(s).timestamp())
+            except Exception:
+                return 0
+        if isinstance(v, dict):
+            for k in ("_seconds", "seconds", "secondsValue", "_secondsValue"):
+                if k in v:
+                    return _as_sec(v.get(k))
+            # Firestore-style nested
+            if "timestampValue" in v:
+                return _as_sec(v.get("timestampValue"))
+        return 0
+
+    for key in ("date", "timestamp", "created_at", "createTime", "updated_at"):
+        sec = _as_sec(m.get(key))
+        if sec:
+            return sec
+    return 0
+
+
 def _normalize_moment_official(m: Dict[str, Any]) -> Dict[str, Any]:
-    """Map getLatestMomentV2 item → shape the web UI already understands."""
+    """Map getLatestMomentV2 item → shape the web UI already understands.
+
+    Preserves overlays/caption/md5 from the raw payload; only fills aliases
+    the Moments grid reads (thumbnail_url, video_url, user string, date._seconds).
+    """
     if not isinstance(m, dict):
         return {}
     out = dict(m)
-    # Ensure stable id fields the frontend / merge logic use
-    if not out.get("canonical_uid") and out.get("id"):
-        out["canonical_uid"] = out["id"]
+    # Stable ids
+    if not out.get("canonical_uid"):
+        out["canonical_uid"] = out.get("id") or out.get("moment_uid") or out.get("md5") or ""
     if not out.get("name") and out.get("canonical_uid"):
         out["name"] = f"moments/{out['canonical_uid']}"
-    # user can be a string uid or a nested object
+    # user → plain uid string (UI + author filter)
     u = out.get("user")
     if isinstance(u, dict):
-        out["user"] = u.get("uid") or u.get("user_id") or u.get("id") or u
+        out["user"] = u.get("uid") or u.get("user_id") or u.get("id") or ""
         if not out.get("first_name"):
             out["first_name"] = u.get("first_name") or u.get("firstName") or ""
         if not out.get("last_name"):
@@ -807,36 +861,31 @@ def _normalize_moment_official(m: Dict[str, Any]) -> Dict[str, Any]:
                 u.get("profile_picture_url") or u.get("profilePictureUrl")
                 or u.get("photo_url") or u.get("photoUrl") or ""
             )
-    # date → {_seconds} when only a timestamp string / number is present
-    d = out.get("date")
-    if d is None:
-        ts = out.get("timestamp") or out.get("created_at") or out.get("createTime")
-        if isinstance(ts, (int, float)):
-            out["date"] = {"_seconds": int(ts if ts > 1e12 else ts)}
-        elif isinstance(ts, str) and ts:
-            try:
-                from datetime import datetime
-                if ts.endswith("Z"):
-                    ts = ts.replace("Z", "+00:00")
-                out["date"] = {"_seconds": int(datetime.fromisoformat(ts).timestamp())}
-            except Exception:
-                out["date"] = {"_seconds": 0}
-    elif isinstance(d, (int, float)):
-        out["date"] = {"_seconds": int(d if d > 1e12 else d)}
-    elif isinstance(d, str):
-        try:
-            from datetime import datetime
-            tss = d.replace("Z", "+00:00") if d.endswith("Z") else d
-            out["date"] = {"_seconds": int(datetime.fromisoformat(tss).timestamp())}
-        except Exception:
-            out["date"] = {"_seconds": 0}
+    # date always {_seconds: int} so grid + sort are consistent
+    sec = _moment_timestamp(out)
+    out["date"] = {"_seconds": sec}
+    if not out.get("timestamp"):
+        out["timestamp"] = sec
     # media aliases
     if not out.get("thumbnail_url"):
-        out["thumbnail_url"] = out.get("thumbnailUrl") or out.get("url") or out.get("image_url") or ""
+        out["thumbnail_url"] = (
+            out.get("thumbnailUrl") or out.get("image_url") or out.get("imageUrl")
+            or out.get("url") or ""
+        )
     if not out.get("video_url"):
         out["video_url"] = out.get("videoUrl") or out.get("video") or ""
     if not out.get("url") and out.get("thumbnail_url"):
         out["url"] = out["thumbnail_url"]
+    # caption from overlays if missing (locketlam keeps both)
+    if not out.get("caption") and isinstance(out.get("overlays"), list):
+        for ov in out["overlays"]:
+            if not isinstance(ov, dict):
+                continue
+            data = ov.get("data") if isinstance(ov.get("data"), dict) else ov
+            text = (data or {}).get("text") or ov.get("alt_text") or ""
+            if text:
+                out["caption"] = text
+                break
     return out
 
 
@@ -1048,13 +1097,16 @@ def get_moments_official(s: LocketSession, timeout: int = 60,
                 logger.info("moments budget exhausted at %d items", len(items))
                 break
 
-    def sort_ts(m):
-        d = m.get("date") or {}
-        return (d.get("_seconds") if isinstance(d, dict) else 0) or 0
-
-    items.sort(key=sort_ts, reverse=True)
+    # Interleaved feed: many moments per person + others + self, newest first
+    # (locketlam returns per-user lists; the app is responsible for time-sort merge)
+    items.sort(key=_moment_timestamp, reverse=True)
     items = items[:max_items]
-    logger.info("moments (locketlam-style) total → %d in %.1fs", len(items), time.time() - t0)
+    logger.info(
+        "moments feed → %d items from %d authors in %.1fs",
+        len(items),
+        len({str(m.get("user") or "") for m in items}),
+        time.time() - t0,
+    )
     return items, debug
 
 
@@ -1257,10 +1309,7 @@ def _merge_moments(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]
         if k not in seen:
             seen.add(k)
             out.append(m)
-    def sort_ts(m):
-        d = m.get("date") or {}
-        return (d.get("_seconds") if isinstance(d, dict) else 0) or 0
-    out.sort(key=sort_ts, reverse=True)
+    out.sort(key=_moment_timestamp, reverse=True)
     return out
 
 
