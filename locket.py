@@ -161,8 +161,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "1.6"
-APP_BUILD = "2026.08.28b"
+APP_VERSION = "1.7"
+APP_BUILD = "2026.10.16"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -784,13 +784,115 @@ def _extract_moments_list(data: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _normalize_moment_official(m: Dict[str, Any]) -> Dict[str, Any]:
+    """Map getLatestMomentV2 item → shape the web UI already understands."""
+    if not isinstance(m, dict):
+        return {}
+    out = dict(m)
+    # Ensure stable id fields the frontend / merge logic use
+    if not out.get("canonical_uid") and out.get("id"):
+        out["canonical_uid"] = out["id"]
+    if not out.get("name") and out.get("canonical_uid"):
+        out["name"] = f"moments/{out['canonical_uid']}"
+    # user can be a string uid or a nested object
+    u = out.get("user")
+    if isinstance(u, dict):
+        out["user"] = u.get("uid") or u.get("user_id") or u.get("id") or u
+        if not out.get("first_name"):
+            out["first_name"] = u.get("first_name") or u.get("firstName") or ""
+        if not out.get("last_name"):
+            out["last_name"] = u.get("last_name") or u.get("lastName") or ""
+        if not out.get("profile_picture_url"):
+            out["profile_picture_url"] = (
+                u.get("profile_picture_url") or u.get("profilePictureUrl")
+                or u.get("photo_url") or u.get("photoUrl") or ""
+            )
+    # date → {_seconds} when only a timestamp string / number is present
+    d = out.get("date")
+    if d is None:
+        ts = out.get("timestamp") or out.get("created_at") or out.get("createTime")
+        if isinstance(ts, (int, float)):
+            out["date"] = {"_seconds": int(ts if ts > 1e12 else ts)}
+        elif isinstance(ts, str) and ts:
+            try:
+                from datetime import datetime
+                if ts.endswith("Z"):
+                    ts = ts.replace("Z", "+00:00")
+                out["date"] = {"_seconds": int(datetime.fromisoformat(ts).timestamp())}
+            except Exception:
+                out["date"] = {"_seconds": 0}
+    elif isinstance(d, (int, float)):
+        out["date"] = {"_seconds": int(d if d > 1e12 else d)}
+    elif isinstance(d, str):
+        try:
+            from datetime import datetime
+            tss = d.replace("Z", "+00:00") if d.endswith("Z") else d
+            out["date"] = {"_seconds": int(datetime.fromisoformat(tss).timestamp())}
+        except Exception:
+            out["date"] = {"_seconds": 0}
+    # media aliases
+    if not out.get("thumbnail_url"):
+        out["thumbnail_url"] = out.get("thumbnailUrl") or out.get("url") or out.get("image_url") or ""
+    if not out.get("video_url"):
+        out["video_url"] = out.get("videoUrl") or out.get("video") or ""
+    if not out.get("url") and out.get("thumbnail_url"):
+        out["url"] = out["thumbnail_url"]
+    return out
+
+
+def get_moments_official(s: LocketSession, timeout: int = 35
+                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Official Locket feed: POST api.locketcamera.com/getLatestMomentV2.
+
+    Same endpoint locketlam uses (client.moments.get_latest). No binhake dependency.
+    Returns the newest shared moments from friends in one request.
+    """
+    debug: List[Dict[str, Any]] = []
+    url = f"{LOCKET_API}/getLatestMomentV2"
+    payload = {
+        "data": {
+            "should_count_missed_moments": True,
+            "analytics": _locket_analytics(),
+        }
+    }
+    headers = _locket_api_headers(s)
+    debug.append(make_debug("send", "locket:getLatestMomentV2", "POST", url,
+                             {"should_count_missed_moments": True}))
+    t0 = time.time()
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        dt = time.time() - t0
+        console_log("LOCKET getLatestMomentV2", "POST", url,
+                    {"should_count_missed_moments": True}, r.status_code, r.text[:500], dt)
+        debug.append(make_debug("recv" if r.ok else "error", "locket:getLatestMomentV2",
+                                 "POST", url, None, r.status_code, r.text, dt))
+        r.raise_for_status()
+        body = r.json() if r.text else {}
+        # Response shapes seen: {result:{data:[...]}} or {data:[...]} or top-level list
+        raw: Any = body
+        if isinstance(body, dict):
+            result = body.get("result")
+            if isinstance(result, dict) and "data" in result:
+                raw = result.get("data")
+            elif "data" in body:
+                raw = body.get("data")
+        items_raw = raw if isinstance(raw, list) else ([raw] if isinstance(raw, dict) else [])
+        items = [_normalize_moment_official(x) for x in items_raw if isinstance(x, dict)]
+        # Drop empty shells without media
+        items = [m for m in items if m.get("thumbnail_url") or m.get("video_url") or m.get("url")]
+        logger.info("getLatestMomentV2 → %d items", len(items))
+        return items, debug
+    except Exception as e:
+        dt = time.time() - t0
+        debug.append(make_debug("error", "locket:getLatestMomentV2", "POST", url,
+                                 None, None, None, dt, e))
+        logger.warning("getLatestMomentV2 failed: %s", e)
+        raise
+
+
 def get_moments_http(s: LocketSession, page_token=None, client_target: str = "all",
                       timeout: int = 35) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """HTTP action=getMoments — same payload binhake posts.html uses via requestServerJson.
-
-    Prefer this on serverless (Vercel): outbound WebSocket is flaky and data on WS
-    often arrives only after 25–35s of heartbeats. HTTP returns in one request.
-    """
+    """Legacy binhake HTTP getMoments — kept only as last-resort fallback."""
     debug: List[Dict[str, Any]] = []
     extra = {
         "id": None,
@@ -1108,8 +1210,12 @@ def _ensure_moments_state(local_id: str) -> Dict[str, Any]:
         return st
 
 
-def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int = 55) -> List[Dict[str, Any]]:
-    """One-shot WS fetch and merge into state. Single-flight per user."""
+def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int = 35) -> List[Dict[str, Any]]:
+    """One-shot official feed fetch and merge into state. Single-flight per user.
+
+    Primary path: api.locketcamera.com/getLatestMomentV2 (same as locketlam
+    client.moments.get_latest). No binhake / WebSocket required.
+    """
     started_here = False
     with st["lock"]:
         if st.get("fetching"):
@@ -1120,7 +1226,7 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
 
     if not started_here:
         # Another request is fetching — wait briefly for it, then return whatever is cached
-        deadline = time.time() + 10
+        deadline = time.time() + 12
         while time.time() < deadline:
             with st["lock"]:
                 if not st.get("fetching"):
@@ -1131,18 +1237,18 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
 
     items: List[Dict[str, Any]] = []
     try:
-        # 1) HTTP first — works on Vercel/serverless, matches binhake requestServerJson
+        # 1) Official Locket API — full friend feed in one request
         try:
-            items, _ = get_moments_http(s, timeout=min(35, max(12, timeout)))
-        except Exception as e_http:
-            logger.warning("moments HTTP failed (%s) — falling back to WebSocket", e_http)
+            items, _ = get_moments_official(s, timeout=min(30, max(10, timeout)))
+        except Exception as e_off:
+            logger.warning("moments official getLatestMomentV2 failed (%s)", e_off)
             items = []
-        # 2) WS fallback if HTTP returned nothing (some accounts/servers only push via WS)
+        # 2) Last-resort binhake HTTP only if official returned nothing
         if not items:
             try:
-                items, _ = get_moments_ws(s, timeout=timeout)
-            except Exception as e_ws:
-                logger.error("moments WS fallback failed: %s", e_ws)
+                items, _ = get_moments_http(s, timeout=min(25, max(10, timeout)))
+            except Exception as e_http:
+                logger.warning("moments binhake fallback failed: %s", e_http)
                 items = []
     except Exception as e:
         logger.error("moments fetch failed: %s", e)
@@ -1152,20 +1258,21 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
         st["fetching"] = False
         st["last_fetch_at"] = time.time()
         if items:
+            # Official feed is the authoritative newest set — prefer replace-when-fresh
+            # but still merge so we don't drop older items already shown offline.
             st["items"] = _merge_moments(st.get("items") or [], items)
             st["updated_at"] = time.time()
             st["bootstrapped"] = True
         elif not st.get("bootstrapped"):
-            # First boot failed with empty — still mark so we don't tight-loop
             st["bootstrapped"] = True
         return list(st.get("items") or [])
 
 
 def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, Any]]:
-    """Return cached moments; kick off initial fetch + live listener if needed.
+    """Return cached moments; fetch via official getLatestMomentV2 when cold/forced.
 
-    force=True always hits binhake via one-shot WebSocket (used when user re-opens
-    the Moments tab). Soft path returns memory cache when warm.
+    force=True always hits the official API (used when user re-opens Moments).
+    Soft path returns memory cache when warm (<25s).
     """
     st = _ensure_moments_state(s.local_id)
 
@@ -1179,26 +1286,17 @@ def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, 
         if warm:
             return list(st["items"])
 
-    out = _fetch_and_store_moments(s, st, timeout=55)
-
-    # Start long-lived listener if not running (best-effort on long-lived hosts;
-    # on serverless the thread dies with the worker — poll/force still work).
-    th = st.get("thread")
-    if th is None or not th.is_alive():
-        st["stop"].clear()
-        th = threading.Thread(target=_live_moments_loop, args=(s, st), daemon=True)
-        st["thread"] = th
-        th.start()
-
+    out = _fetch_and_store_moments(s, st, timeout=35)
+    # Live binhake WS listener is optional now — official poll covers freshness.
+    # Keep it only if already running; do not start a new one (serverless-safe).
     return out
 
 
 def poll_new_moments(s: LocketSession, since: float = 0) -> Tuple[List[Dict[str, Any]], float]:
     """Return moments if cache advanced past `since`.
 
-    Avoid force-refresh on every poll: binhake needs ~30s for getNewMoments, so a
-    force pull here would make every 8s client poll hang 30s+. Only force when the
-    cache is completely empty (first load / cold serverless instance).
+    Official getLatestMomentV2 is fast (~1–3s), so we can refresh on cold start
+    and background-refresh when stale without the old 30s binhake WS hang.
     """
     st = _ensure_moments_state(s.local_id)
     now = time.time()
@@ -1206,15 +1304,13 @@ def poll_new_moments(s: LocketSession, since: float = 0) -> Tuple[List[Dict[str,
         last = st.get("last_fetch_at") or st.get("updated_at") or 0
         has_data = bool(st.get("items"))
         fetching = bool(st.get("fetching"))
-    # Cold start only — never block a poll for a 30s upstream wait when we already
-    # have moments (live WS / previous force will refresh in background).
     if not has_data and not fetching:
         try:
             get_moments_cached(s, force=True)
         except Exception as e:
             logger.warning("poll refresh failed: %s", e)
-    elif has_data and (now - last) > 90:
-        # Stale but non-empty: kick a background force without blocking this response
+    elif has_data and (now - last) > 60:
+        # Stale: background refresh via official API (non-blocking)
         try:
             th = threading.Thread(
                 target=lambda: get_moments_cached(s, force=True),
