@@ -785,30 +785,26 @@ def _extract_moments_list(data: Any) -> List[Dict[str, Any]]:
 
 
 def _moment_timestamp(m: Dict[str, Any]) -> int:
-    """Unix seconds for sorting — handles every shape Locket / locketlam returns.
-
-    Priority matches what the real client stores on moments:
-      date._seconds | date.seconds | timestamp | created_at | createTime
-    Milliseconds (> 1e12) are converted to seconds.
-    """
+    """Unix seconds. Real Locket payloads use date as milliseconds (e.g. 1792164530909)."""
     if not isinstance(m, dict):
         return 0
 
     def _as_sec(v) -> int:
         if v is None:
             return 0
+        if isinstance(v, bool):
+            return 0
         if isinstance(v, (int, float)):
             x = float(v)
-            if x > 1e12:  # ms
-                return int(x / 1000)
-            if x > 1e9:   # sec
+            if x > 1e12:  # milliseconds
+                return int(x / 1000.0)
+            if x > 1e9:   # seconds
                 return int(x)
             return int(x) if x > 0 else 0
         if isinstance(v, str) and v.strip():
             s = v.strip()
             try:
-                if s.isdigit() or (s.replace(".", "", 1).isdigit()):
-                    return _as_sec(float(s))
+                return _as_sec(float(s))
             except Exception:
                 pass
             try:
@@ -819,36 +815,58 @@ def _moment_timestamp(m: Dict[str, Any]) -> int:
             except Exception:
                 return 0
         if isinstance(v, dict):
-            for k in ("_seconds", "seconds", "secondsValue", "_secondsValue"):
-                if k in v:
-                    return _as_sec(v.get(k))
-            # Firestore-style nested
+            for k in ("_seconds", "seconds", "secondsValue"):
+                if k in v and v[k] is not None:
+                    return _as_sec(v[k])
             if "timestampValue" in v:
-                return _as_sec(v.get("timestampValue"))
+                return _as_sec(v["timestampValue"])
         return 0
 
-    for key in ("date", "timestamp", "created_at", "createTime", "updated_at"):
+    for key in ("date", "createTime", "updateTime", "timestamp", "created_at", "createTime"):
         sec = _as_sec(m.get(key))
         if sec:
             return sec
     return 0
 
 
-def _normalize_moment_official(m: Dict[str, Any]) -> Dict[str, Any]:
-    """Map getLatestMomentV2 item → shape the web UI already understands.
+def _normalize_overlays(overlays: Any) -> List[Dict[str, Any]]:
+    """API sometimes returns overlays as a single object, sometimes as a list."""
+    if overlays is None:
+        return []
+    if isinstance(overlays, list):
+        return [x for x in overlays if isinstance(x, dict)]
+    if isinstance(overlays, dict):
+        # Real getLatestMomentV2: one caption object at top level
+        if overlays.get("overlay_type") or overlays.get("type") or overlays.get("text"):
+            return [overlays]
+        # map of id -> overlay
+        out = []
+        for v in overlays.values():
+            if isinstance(v, dict) and (v.get("text") or v.get("overlay_type") or v.get("type")):
+                out.append(v)
+        return out
+    return []
 
-    Preserves overlays/caption/md5 from the raw payload; only fills aliases
-    the Moments grid reads (thumbnail_url, video_url, user string, date._seconds).
+
+def _normalize_moment_official(m: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize both official camelCase and binhake/snake_case moment payloads.
+
+    Real official / CDN shape (from live capture):
+      thumbnailUrl, videoUrl, date=<ms int>, overlays=<object>, user=<uid str>
+    Binhake / cached shape:
+      thumbnail_url, video_url, date={_seconds,_nanoseconds}, overlays=[...]
     """
     if not isinstance(m, dict):
         return {}
     out = dict(m)
-    # Stable ids
-    if not out.get("canonical_uid"):
-        out["canonical_uid"] = out.get("id") or out.get("moment_uid") or out.get("md5") or ""
-    if not out.get("name") and out.get("canonical_uid"):
-        out["name"] = f"moments/{out['canonical_uid']}"
-    # user → plain uid string (UI + author filter)
+
+    # ids
+    cid = out.get("canonical_uid") or out.get("id") or out.get("moment_uid") or out.get("md5") or ""
+    out["canonical_uid"] = cid
+    if not out.get("name") and cid:
+        out["name"] = f"moments/{cid}"
+
+    # user → plain uid
     u = out.get("user")
     if isinstance(u, dict):
         out["user"] = u.get("uid") or u.get("user_id") or u.get("id") or ""
@@ -861,31 +879,54 @@ def _normalize_moment_official(m: Dict[str, Any]) -> Dict[str, Any]:
                 u.get("profile_picture_url") or u.get("profilePictureUrl")
                 or u.get("photo_url") or u.get("photoUrl") or ""
             )
-    # date always {_seconds: int} so grid + sort are consistent
+
+    # media — camelCase first (official), then snake_case
+    thumb = (
+        out.get("thumbnail_url") or out.get("thumbnailUrl")
+        or out.get("image_url") or out.get("imageUrl") or out.get("url") or ""
+    )
+    # strip erroneous :443 that some CDN URLs embed
+    if isinstance(thumb, str):
+        thumb = thumb.replace("cdn.locketcamera.com:443", "cdn.locketcamera.com")
+        thumb = thumb.replace("firebasestorage.googleapis.com:443", "firebasestorage.googleapis.com")
+    out["thumbnail_url"] = thumb
+    out["url"] = out.get("url") or thumb
+
+    vurl = out.get("video_url") or out.get("videoUrl") or out.get("video") or ""
+    if isinstance(vurl, str):
+        vurl = vurl.replace("cdn.locketcamera.com:443", "cdn.locketcamera.com")
+        vurl = vurl.replace("firebasestorage.googleapis.com:443", "firebasestorage.googleapis.com")
+    out["video_url"] = vurl
+
+    # date always {_seconds, _nanoseconds} for the web UI timeAgo()
     sec = _moment_timestamp(out)
-    out["date"] = {"_seconds": sec}
-    if not out.get("timestamp"):
-        out["timestamp"] = sec
-    # media aliases
-    if not out.get("thumbnail_url"):
-        out["thumbnail_url"] = (
-            out.get("thumbnailUrl") or out.get("image_url") or out.get("imageUrl")
-            or out.get("url") or ""
-        )
-    if not out.get("video_url"):
-        out["video_url"] = out.get("videoUrl") or out.get("video") or ""
-    if not out.get("url") and out.get("thumbnail_url"):
-        out["url"] = out["thumbnail_url"]
-    # caption from overlays if missing (locketlam keeps both)
-    if not out.get("caption") and isinstance(out.get("overlays"), list):
-        for ov in out["overlays"]:
-            if not isinstance(ov, dict):
-                continue
-            data = ov.get("data") if isinstance(ov.get("data"), dict) else ov
-            text = (data or {}).get("text") or ov.get("alt_text") or ""
+    ns = 0
+    raw_date = out.get("date")
+    if isinstance(raw_date, (int, float)) and float(raw_date) > 1e12:
+        ns = int((float(raw_date) % 1000) * 1_000_000)
+    elif isinstance(raw_date, dict) and "_nanoseconds" in raw_date:
+        try:
+            ns = int(raw_date.get("_nanoseconds") or 0)
+        except Exception:
+            ns = 0
+    out["date"] = {"_seconds": sec, "_nanoseconds": ns}
+    out["timestamp"] = sec
+
+    # overlays → list; caption text
+    ovs = _normalize_overlays(out.get("overlays"))
+    out["overlays"] = ovs
+    if not out.get("caption"):
+        for ov in ovs:
+            text = ov.get("text") or ov.get("alt_text") or ""
+            if not text and isinstance(ov.get("data"), dict):
+                text = ov["data"].get("text") or ""
             if text:
                 out["caption"] = text
                 break
+
+    if out.get("from_celebrity") is None and out.get("isCelebrity") is not None:
+        out["from_celebrity"] = bool(out.get("isCelebrity"))
+
     return out
 
 
@@ -990,123 +1031,133 @@ def get_shared_moments_by_user(s: LocketSession, user_uid: str,
 def get_moments_official(s: LocketSession, timeout: int = 60,
                           max_items: int = 200, max_pages: int = 30
                           ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Full moments grid — follows locketlam exactly.
+    """Build the Moments grid the same way a full feed looks in production.
 
-    Steps (same as library usage):
-      1. get_latest()          → getLatestMomentV2 once (newest feed slice)
-      2. get_all_friends()     → Firestore friend UIDs
-      3. for each friend: get_shared_moments_by_user(uid) with excluded_users + sync_token
-      4. also fetch own moments the same way
-      5. merge / dedupe / sort by date
+    Live payloads (cdn.locketcamera.com / getLatestMomentV2) already return a
+    time-ordered `data` list with MANY moments, multiple per friend, interleaved:
+      date is ms int, thumbnailUrl/videoUrl camelCase, overlays is one object.
 
-    No binhake. No invented pagination on the global feed.
+    Strategy:
+      1) getLatestMomentV2 once — take the full `data` list, normalize, sort
+      2) Page with sync_token while new ids keep arriving
+      3) If still sparse (< ~friends count), fan-out get_shared_moments_by_user
+      4) Caller may still fall back to binhake getMoments for deep history
     """
     debug: List[Dict[str, Any]] = []
     items: List[Dict[str, Any]] = []
     seen: set = set()
     t0 = time.time()
 
-    def _add(m: Dict[str, Any]) -> None:
-        if not isinstance(m, dict):
-            return
-        norm = _normalize_moment_official(m) if "thumbnail_url" in m or "canonical_uid" in m else m
+    def _add_raw(raw: Dict[str, Any]) -> bool:
+        norm = _normalize_moment_official(raw)
         if not (norm.get("thumbnail_url") or norm.get("video_url") or norm.get("url")):
-            return
+            return False
         k = _moment_key(norm)
         if k in seen:
-            return
+            return False
         seen.add(k)
         items.append(norm)
+        return True
 
-    # ----- 1) get_latest (locketlam client.moments.get_latest) -----
-    try:
-        res = _locket_post_api(
-            s, "getLatestMomentV2",
-            {"should_count_missed_moments": True},
-            timeout=min(20, timeout),
-        )
-        debug.append(make_debug("recv", "locket:get_latest", "POST",
-                                 f"{LOCKET_API}/getLatestMomentV2",
-                                 None, 200, str(res)[:500], None))
-        for m in (res.get("data") or [] if isinstance(res, dict) else []):
-            _add(m)
-        logger.info("locketlam get_latest → %d", len(items))
-    except Exception as e:
-        logger.warning("get_latest failed: %s", e)
-        debug.append(make_debug("error", "locket:get_latest", "POST",
-                                 f"{LOCKET_API}/getLatestMomentV2",
-                                 None, None, None, None, e))
+    # ----- Phase 1+2: getLatestMomentV2 + sync_token pages -----
+    sync_token = None
+    for page in range(max_pages):
+        payload: Dict[str, Any] = {
+            "should_count_missed_moments": True,
+            "include_group_moments": True,
+        }
+        if sync_token:
+            payload["sync_token"] = sync_token
+        try:
+            res = _locket_post_api(s, "getLatestMomentV2", payload, timeout=min(25, timeout))
+        except Exception as e:
+            logger.warning("getLatestMomentV2 page %d failed: %s", page, e)
+            debug.append(make_debug("error", f"locket:getLatestMomentV2:p{page}",
+                                     "POST", f"{LOCKET_API}/getLatestMomentV2",
+                                     None, None, None, None, e))
+            break
 
-    # ----- 2) friend UIDs (locketlam friends.get_all_friends → Firestore) -----
+        data = res.get("data") if isinstance(res, dict) else None
+        if not isinstance(data, list) or not data:
+            # Some gateways wrap list one level deeper
+            if isinstance(res, dict) and isinstance(res.get("result"), dict):
+                data = res["result"].get("data")
+            if not isinstance(data, list) or not data:
+                break
+
+        debug.append(make_debug("recv", f"locket:getLatestMomentV2:p{page}",
+                                 "POST", f"{LOCKET_API}/getLatestMomentV2",
+                                 {"n": len(data), "sync": bool(sync_token)},
+                                 200, f"{len(data)} items", None))
+
+        new_count = 0
+        last_mid = None
+        for raw in data:
+            if not isinstance(raw, dict):
+                continue
+            mid = raw.get("canonical_uid") or raw.get("id")
+            if mid:
+                last_mid = str(mid)
+            if _add_raw(raw):
+                new_count += 1
+
+        logger.info("getLatestMomentV2 p%d → +%d (total %d, batch %d)",
+                    page, new_count, len(items), len(data))
+
+        if new_count == 0 or not last_mid:
+            break
+        if isinstance(res, dict) and res.get("status") == 304:
+            break
+        sync_token = last_mid
+        if len(items) >= max_items:
+            break
+        if time.time() - t0 > min(35, timeout * 0.6):
+            break
+
+    # ----- Phase 3: per-friend fill if still thin (locketlam get_shared_moments_by_user) -----
     friend_uids: List[str] = []
     try:
-        friend_uids, d_fr = list_friend_uids_firestore(s, timeout=min(20, timeout))
+        friend_uids, d_fr = list_friend_uids_firestore(s, timeout=min(15, timeout))
         debug.extend(d_fr)
     except Exception as e:
-        logger.warning("list_friend_uids_firestore failed: %s", e)
-        try:
-            friends, d2 = get_friends(s)
-            debug.extend(d2)
-            friend_uids = [f.get("uid") for f in (friends or []) if f.get("uid")]
-        except Exception as e2:
-            logger.warning("get_friends fallback failed: %s", e2)
+        logger.warning("friend uids: %s", e)
 
-    # Include self so own posted moments appear in the grid
-    targets = list(friend_uids)
-    if s.local_id and s.local_id not in targets:
-        targets = [s.local_id] + targets
+    # Heuristic: full feed usually has >= min(friends, 20) items and often >1 per active friend
+    sparse = len(items) < max(8, min(len(friend_uids), 25) // 2)
+    if sparse and friend_uids:
+        logger.info("feed sparse (%d items / %d friends) — per-friend sync_token walk",
+                    len(items), len(friend_uids))
+        targets = list(friend_uids)
+        if s.local_id and s.local_id not in targets:
+            targets = [s.local_id] + targets
+        targets = targets[:35]
+        per_limit = 15
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    if not targets:
-        logger.warning("no friend uids — returning get_latest only (%d)", len(items))
-        return items, debug
+        def _job(uid: str) -> List[Dict[str, Any]]:
+            return get_shared_moments_by_user(
+                s, uid, friend_uids, limit=per_limit,
+                timeout=min(15, max(8, int(timeout / 3))),
+            )
 
-    # ----- 3) per-friend get_shared_moments_by_user (locketlam) -----
-    # Cap concurrency; each friend walks sync_token until empty
-    per_limit = max(5, max_items // max(1, min(len(targets), 30)))
-    per_limit = min(30, per_limit)
-    budget = max(15.0, timeout - (time.time() - t0))
+        with ThreadPoolExecutor(max_workers=min(8, max(2, len(targets)))) as pool:
+            futs = {pool.submit(_job, u): u for u in targets}
+            for fut in as_completed(futs):
+                uid = futs[fut]
+                try:
+                    for m in fut.result() or []:
+                        _add_raw(m)
+                except Exception as e:
+                    logger.debug("per-friend %s: %s", uid[:8], e)
+                if len(items) >= max_items or time.time() - t0 > timeout:
+                    break
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    def _job(uid: str) -> List[Dict[str, Any]]:
-        return get_shared_moments_by_user(
-            s, uid, friend_uids,
-            limit=per_limit,
-            timeout=min(18, max(10, int(budget / 2))),
-        )
-
-    # Process at most 40 friends to stay within request budget
-    targets = targets[:40]
-    workers = min(8, max(2, len(targets)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_job, uid): uid for uid in targets}
-        for fut in as_completed(futs):
-            uid = futs[fut]
-            try:
-                got = fut.result()
-                before = len(items)
-                for m in got:
-                    _add(m)
-                logger.info("shared moments %s → %d (+%d total %d)",
-                            uid[:8], len(got), len(items) - before, len(items))
-            except Exception as e:
-                logger.debug("shared moments %s failed: %s", uid[:8], e)
-            if len(items) >= max_items:
-                break
-            if time.time() - t0 > timeout:
-                logger.info("moments budget exhausted at %d items", len(items))
-                break
-
-    # Interleaved feed: many moments per person + others + self, newest first
-    # (locketlam returns per-user lists; the app is responsible for time-sort merge)
     items.sort(key=_moment_timestamp, reverse=True)
     items = items[:max_items]
-    logger.info(
-        "moments feed → %d items from %d authors in %.1fs",
-        len(items),
-        len({str(m.get("user") or "") for m in items}),
-        time.time() - t0,
-    )
+    logger.info("get_moments_official → %d items, %d authors, %.1fs",
+                len(items),
+                len({str(m.get("user") or "") for m in items}),
+                time.time() - t0)
     return items, debug
 
 
@@ -1454,19 +1505,34 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
 
     items: List[Dict[str, Any]] = []
     try:
-        # 1) Official Locket API — full friend feed in one request
+        # 1) Official getLatestMomentV2 (full data[] when available) + optional per-friend fill
         try:
-            items, _ = get_moments_official(s, timeout=min(70, max(30, timeout)), max_items=150, max_pages=30)
+            items, _ = get_moments_official(
+                s, timeout=min(70, max(30, timeout)), max_items=200, max_pages=30,
+            )
         except Exception as e_off:
-            logger.warning("moments official getLatestMomentV2 failed (%s)", e_off)
+            logger.warning("moments official failed (%s)", e_off)
             items = []
-        # 2) Last-resort binhake HTTP only if official returned nothing
-        if not items:
+        # 2) binhake getMoments — still the densest full history feed; use when official is empty/sparse
+        if len(items) < 12:
             try:
-                items, _ = get_moments_http(s, timeout=min(25, max(10, timeout)))
+                bh, _ = get_moments_http(s, timeout=min(30, max(12, timeout)))
+                if bh:
+                    # merge binhake into official (prefer more complete set)
+                    by_key = {_moment_key(m): m for m in items}
+                    for m in bh:
+                        flat = flatten_firestore(m) if isinstance(m, dict) and "fields" in m else m
+                        if not isinstance(flat, dict):
+                            continue
+                        norm = _normalize_moment_official(flat)
+                        k = _moment_key(norm)
+                        if k not in by_key and (norm.get("thumbnail_url") or norm.get("video_url")):
+                            by_key[k] = norm
+                    items = list(by_key.values())
+                    items.sort(key=_moment_timestamp, reverse=True)
+                    logger.info("merged binhake → %d items", len(items))
             except Exception as e_http:
                 logger.warning("moments binhake fallback failed: %s", e_http)
-                items = []
     except Exception as e:
         logger.error("moments fetch failed: %s", e)
         items = []
@@ -1906,6 +1972,8 @@ _ALLOWED_IMG_HOSTS = (
     "storage.googleapis.com",
     "lh3.googleusercontent.com",
     "googleusercontent.com",
+    "cdn.locketcamera.com",
+    "locketcamera.com",
     "locket.binhake.dev",
 )
 # cache key = (url, max_side) → (ts, bytes, mime)
