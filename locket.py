@@ -840,54 +840,139 @@ def _normalize_moment_official(m: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def get_moments_official(s: LocketSession, timeout: int = 35
-                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Official Locket feed: POST api.locketcamera.com/getLatestMomentV2.
+def _parse_latest_moment_payload(body: Any) -> Tuple[List[Dict[str, Any]], Any]:
+    """Extract data list + optional status from getLatestMomentV2 JSON body."""
+    status = None
+    raw: Any = body
+    if isinstance(body, dict):
+        status = body.get("status")
+        result = body.get("result")
+        if isinstance(result, dict):
+            if status is None:
+                status = result.get("status")
+            if "data" in result:
+                raw = result.get("data")
+            else:
+                raw = result
+        elif "data" in body:
+            raw = body.get("data")
+    items_raw = raw if isinstance(raw, list) else ([raw] if isinstance(raw, dict) else [])
+    return [x for x in items_raw if isinstance(x, dict)], status
 
-    Same endpoint locketlam uses (client.moments.get_latest). No binhake dependency.
-    Returns the newest shared moments from friends in one request.
+
+def get_moments_official(s: LocketSession, timeout: int = 45,
+                          max_items: int = 120, max_pages: int = 40
+                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Official Locket feed with pagination (same strategy as locketlam).
+
+    getLatestMomentV2 without sync_token often returns only the single newest
+    moment. To load a full grid we page by setting:
+        data.sync_token = <canonical_uid of last item from previous page>
+    until the server returns empty / 304 or we hit max_items / max_pages.
+
+    Mirrors locketlam MomentsModule.get_shared_moments_by_user pagination,
+    but without excluded_users so we keep the mixed friends feed.
     """
     debug: List[Dict[str, Any]] = []
     url = f"{LOCKET_API}/getLatestMomentV2"
-    payload = {
-        "data": {
-            "should_count_missed_moments": True,
-            "analytics": _locket_analytics(),
-        }
-    }
     headers = _locket_api_headers(s)
-    debug.append(make_debug("send", "locket:getLatestMomentV2", "POST", url,
-                             {"should_count_missed_moments": True}))
+    analytics = _locket_analytics()
+
+    items: List[Dict[str, Any]] = []
+    seen: set = set()
+    sync_token: Optional[str] = None
     t0 = time.time()
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+
+    for page in range(max_pages):
+        data_body: Dict[str, Any] = {
+            "should_count_missed_moments": True,
+            "include_group_moments": True,
+            "analytics": analytics,
+        }
+        if sync_token:
+            data_body["sync_token"] = sync_token
+        payload = {"data": data_body}
+
+        debug.append(make_debug(
+            "send", f"locket:getLatestMomentV2:p{page}", "POST", url,
+            {"sync_token": (sync_token[:16] + "…") if sync_token else None,
+             "page": page},
+        ))
+        try:
+            r = requests.post(url, headers=headers, json=payload,
+                              timeout=max(12, min(25, timeout)))
+        except Exception as e:
+            debug.append(make_debug("error", f"locket:getLatestMomentV2:p{page}",
+                                     "POST", url, None, None, None, None, e))
+            logger.warning("getLatestMomentV2 page %d error: %s", page, e)
+            if page == 0:
+                raise
+            break
+
         dt = time.time() - t0
-        console_log("LOCKET getLatestMomentV2", "POST", url,
-                    {"should_count_missed_moments": True}, r.status_code, r.text[:500], dt)
-        debug.append(make_debug("recv" if r.ok else "error", "locket:getLatestMomentV2",
-                                 "POST", url, None, r.status_code, r.text, dt))
-        r.raise_for_status()
-        body = r.json() if r.text else {}
-        # Response shapes seen: {result:{data:[...]}} or {data:[...]} or top-level list
-        raw: Any = body
-        if isinstance(body, dict):
-            result = body.get("result")
-            if isinstance(result, dict) and "data" in result:
-                raw = result.get("data")
-            elif "data" in body:
-                raw = body.get("data")
-        items_raw = raw if isinstance(raw, list) else ([raw] if isinstance(raw, dict) else [])
-        items = [_normalize_moment_official(x) for x in items_raw if isinstance(x, dict)]
-        # Drop empty shells without media
-        items = [m for m in items if m.get("thumbnail_url") or m.get("video_url") or m.get("url")]
-        logger.info("getLatestMomentV2 → %d items", len(items))
-        return items, debug
-    except Exception as e:
-        dt = time.time() - t0
-        debug.append(make_debug("error", "locket:getLatestMomentV2", "POST", url,
-                                 None, None, None, dt, e))
-        logger.warning("getLatestMomentV2 failed: %s", e)
-        raise
+        console_log(
+            f"LOCKET getLatestMomentV2 p{page}", "POST", url,
+            {"sync_token": (sync_token[:16] + "…") if sync_token else None},
+            r.status_code, r.text[:400], dt,
+        )
+        debug.append(make_debug(
+            "recv" if r.ok else "error", f"locket:getLatestMomentV2:p{page}",
+            "POST", url, None, r.status_code, r.text, dt,
+        ))
+        if not r.ok:
+            if page == 0:
+                r.raise_for_status()
+            break
+
+        try:
+            body = r.json() if r.text else {}
+        except ValueError:
+            break
+
+        page_raw, status = _parse_latest_moment_payload(body)
+        if status == 304 or not page_raw:
+            break
+
+        new_on_page = 0
+        last_mid = None
+        for raw_m in page_raw:
+            mid = (
+                raw_m.get("canonical_uid")
+                or raw_m.get("id")
+                or raw_m.get("moment_uid")
+                or raw_m.get("md5")
+            )
+            if mid:
+                mid = str(mid)
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                last_mid = mid
+            norm = _normalize_moment_official(raw_m)
+            if not (norm.get("thumbnail_url") or norm.get("video_url") or norm.get("url")):
+                continue
+            items.append(norm)
+            new_on_page += 1
+            if len(items) >= max_items:
+                break
+
+        # Advance cursor: last NEW canonical_uid on this page (locketlam style)
+        if last_mid:
+            sync_token = last_mid
+        else:
+            # No new ids — stop to avoid infinite loop
+            break
+
+        if new_on_page == 0 or len(items) >= max_items:
+            break
+
+        # Soft time budget so a force-refresh does not hang the request forever
+        if time.time() - t0 > max(20, timeout):
+            logger.info("getLatestMomentV2 stop: time budget (got %d)", len(items))
+            break
+
+    logger.info("getLatestMomentV2 → %d items (%d pages)", len(items), page + 1 if items or page == 0 else page)
+    return items, debug
 
 
 def get_moments_http(s: LocketSession, page_token=None, client_target: str = "all",
@@ -1210,7 +1295,7 @@ def _ensure_moments_state(local_id: str) -> Dict[str, Any]:
         return st
 
 
-def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int = 35) -> List[Dict[str, Any]]:
+def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int = 55) -> List[Dict[str, Any]]:
     """One-shot official feed fetch and merge into state. Single-flight per user.
 
     Primary path: api.locketcamera.com/getLatestMomentV2 (same as locketlam
@@ -1239,7 +1324,7 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
     try:
         # 1) Official Locket API — full friend feed in one request
         try:
-            items, _ = get_moments_official(s, timeout=min(30, max(10, timeout)))
+            items, _ = get_moments_official(s, timeout=min(50, max(20, timeout)), max_items=120, max_pages=40)
         except Exception as e_off:
             logger.warning("moments official getLatestMomentV2 failed (%s)", e_off)
             items = []
@@ -1286,7 +1371,7 @@ def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, 
         if warm:
             return list(st["items"])
 
-    out = _fetch_and_store_moments(s, st, timeout=35)
+    out = _fetch_and_store_moments(s, st, timeout=55)
     # Live binhake WS listener is optional now — official poll covers freshness.
     # Keep it only if already running; do not start a new one (serverless-safe).
     return out
