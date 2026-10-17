@@ -23,6 +23,9 @@ import os
 import sys
 import time
 import uuid
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -146,6 +149,11 @@ def _dedupe_prune(now: float) -> None:
 IOS_UA = "com.locket.Locket/1.100.0 iPhone/18.2 hw/iPhone14_3"
 FIREBASE_GMPID = "1:641029076083:ios:cc8eb46290d69b234fa606"
 IOS_BUNDLE = "com.locket.Locket"
+LOCKET_IOS_APP_VERSION = "2.68.0"
+LOCKET_IOS_BUILD = "2523"
+LOCKET_IOS_UA = f"{IOS_BUNDLE}/{LOCKET_IOS_APP_VERSION} iPhone/18.1.0 hw/iPhone16,1"
+FEED_FULL_PAGES = 12
+FEED_REFRESH_PAGES = 2
 
 WEB_UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
@@ -161,8 +169,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "1.7"
-APP_BUILD = "2026.10.16"
+APP_VERSION = "1.8"
+APP_BUILD = "2026.10.17"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -489,33 +497,39 @@ def _normalize_user(u: Dict[str, Any]) -> Dict[str, Any]:
         "profile_picture_url": pic,
         "celebrity": bool(_first(u, "celebrity", "is_celebrity", default=False)),
         "badge": _first(u, "badge", "badge_type", default="") or "",
-        "streak": _first(u, "streak", "streak_count", "streakCount", "current_streak", default=0),
+        "streak": _find_streak(u) or 0,
     }
 
 
 def get_self_info(s: LocketSession) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """action=getInfo — confirmed real shape:
-    {"success":true,"data":{"displayName":"...","photoUrl":"..."},
-     "streak":{"count":396,"last_updated_yyyymmdd":20260804}}
-    Note streak sits at the TOP level, as a sibling of "data" — not inside it."""
-    debug = [make_debug("send", "binhake:getInfo", "POST", BINHAKE_API, {"action": "getInfo"})]
-    data, dbg = binhake_call("getInfo", s)
-    debug.append(dbg)
+    debug: List[Dict[str, Any]] = []
+    info: Dict[str, Any] = {}
+    try:
+        info, d = fetch_user_v2(s, s.local_id)
+        debug.extend(d)
+    except Exception as e:
+        logger.warning("fetchUserV2 self failed: %s", e)
 
-    body = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else (data or {})
-    info = _normalize_user(body)
+    streak = info.get("streak") or 0
+    if not streak:
+        try:
+            streak = _find_streak(fetch_firestore_user_doc(s)) or 0
+        except Exception as e:
+            logger.debug("firestore user doc failed: %s", e)
+    if not streak:
+        try:
+            data, dbg = binhake_call("getInfo", s)
+            debug.append(dbg)
+            if isinstance(data, dict):
+                streak = _find_streak({"streak": data.get("streak")}) or 0
+                if not info.get("first_name"):
+                    body = data.get("data") if isinstance(data.get("data"), dict) else {}
+                    info = {**_normalize_user(body), **{k: v for k, v in info.items() if v}}
+        except Exception as e:
+            logger.debug("binhake getInfo failed: %s", e)
 
-    streak_val = 0
-    if isinstance(data, dict):
-        streak_obj = data.get("streak")
-        if isinstance(streak_obj, dict):
-            streak_val = _first(streak_obj, "count", "streak", "value", default=0)
-        elif isinstance(streak_obj, (int, float)):
-            streak_val = streak_obj
-        elif not streak_val:
-            streak_val = _first(data, "streak_count", "streakCount", default=0)
-    info["streak"] = streak_val or 0
-
+    info["streak"] = streak
+    info["uid"] = s.local_id
     if not info.get("first_name") and not info.get("username"):
         info["first_name"] = s.display_name
     if not info.get("profile_picture_url"):
@@ -619,31 +633,21 @@ def list_friend_uids_firestore(s: LocketSession, timeout: int = 25
 
 def fetch_user_v2(s: LocketSession, user_uid: str, timeout: int = 15
                    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """POST api.locketcamera.com/fetchUserV2 — profile for one friend uid."""
-    debug: List[Dict[str, Any]] = []
-    url = f"{LOCKET_API}/fetchUserV2"
-    payload = {"data": {"user_uid": user_uid, "analytics": _locket_analytics()}}
-    headers = _locket_api_headers(s)
-    debug.append(make_debug("send", "locket:fetchUserV2", "POST", url, {"user_uid": user_uid}))
-    t0 = time.time()
-    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-    dt = time.time() - t0
-    # keep console quiet for bulk fan-out (only log failures)
-    if not r.ok:
-        console_log("LOCKET fetchUserV2 FAIL", "POST", url, {"user_uid": user_uid},
-                    r.status_code, r.text[:300], dt)
-    debug.append(make_debug("recv" if r.ok else "error", "locket:fetchUserV2", "POST", url,
-                             None, r.status_code, r.text, dt))
+    res = _locket_post_api(s, "fetchUserV2", {"user_uid": user_uid},
+                            timeout=timeout, quiet=user_uid != s.local_id)
+    data = res.get("data", res) if isinstance(res, dict) else {}
+    profile = _normalize_user(data if isinstance(data, dict) else {})
+    profile["uid"] = profile.get("uid") or user_uid
+    return profile, []
+
+
+def fetch_firestore_user_doc(s: LocketSession, timeout: int = 15) -> Dict[str, Any]:
+    url = (f"https://firestore.googleapis.com/v1/projects/locket-4252a/"
+           f"databases/(default)/documents/users/{s.local_id}")
+    r = requests.get(url, headers={"Authorization": f"Bearer {s.id_token}",
+                                    "Accept": "application/json"}, timeout=timeout)
     r.raise_for_status()
-    body = r.json() if r.text else {}
-    data = body
-    if isinstance(body, dict):
-        result = body.get("result")
-        if isinstance(result, dict) and isinstance(result.get("data"), dict):
-            data = result["data"]
-        elif isinstance(body.get("data"), dict):
-            data = body["data"]
-    return _normalize_user(data if isinstance(data, dict) else {"uid": user_uid}), debug
+    return flatten_firestore(r.json())
 
 
 def get_friends_official(s: LocketSession, timeout: int = 45
@@ -685,58 +689,124 @@ def get_friends_official(s: LocketSession, timeout: int = 45
     return celebs + normals, debug
 
 
-def get_friends(s: LocketSession) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Friends with full profiles. Prefer official (Firestore + fetchUserV2)
-    when binhake returns bare UIDs or fails — binhake getFriendsList_v3 has
-    been sparse/broken on some accounts."""
-    debug: List[Dict[str, Any]] = []
-    friends: List[Dict[str, Any]] = []
+_PROFILE_LOCK = threading.Lock()
+_PROFILE_CACHE: Dict[str, Dict[str, Any]] = {}
+_FRIENDS_TTL_SEC = 600
 
-    # 1) try binhake first (fast when healthy)
-    try:
-        debug.append(make_debug("send", "binhake:getFriendsList_v3", "POST", BINHAKE_API,
-                                 {"action": "getFriendsList_v3"}))
-        data, dbg = binhake_call("getFriendsList_v3", s)
-        debug.append(dbg)
-        raw_list = None
-        if isinstance(data, dict):
-            for path in (data.get("data"), data.get("friends"),
-                         (data.get("result") or {}).get("data") if isinstance(data.get("result"), dict) else None):
-                if isinstance(path, list):
-                    raw_list = path
-                    break
-        if raw_list is None:
-            raw_list = []
-        friends = [_normalize_user(u) for u in raw_list if isinstance(u, dict)]
-    except Exception as e:
-        logger.warning("binhake getFriendsList_v3 failed: %s", e)
-        debug.append(make_debug("error", "binhake:getFriendsList_v3", "POST", BINHAKE_API,
-                                 None, None, None, None, e))
-        friends = []
 
-    # 2) official fallback when binhake empty/sparse
-    if _friends_sparse(friends):
-        logger.info("friends sparse (%d) — falling back to official Firestore+fetchUserV2",
-                    len(friends))
-        try:
-            off, d2 = get_friends_official(s)
-            debug.extend(d2)
-            if off:
-                friends = off
-        except Exception as e:
-            logger.error("official friends failed: %s", e)
-            debug.append(make_debug("error", "official:friends", "GET",
-                                     "firestore+fetchUserV2", None, None, None, None, e))
-            # keep whatever binhake gave us (uids only) rather than empty
+def _profile_state(local_id: str) -> Dict[str, Any]:
+    with _PROFILE_LOCK:
+        st = _PROFILE_CACHE.get(local_id)
+        if st is None:
+            st = {"friends": [], "friends_at": 0.0, "profiles": {}}
+            _PROFILE_CACHE[local_id] = st
+        return st
 
+
+def _sort_friends(friends: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     def sort_key(p):
         name = (f"{p.get('first_name','')} {p.get('last_name','')}").strip() or p.get("username") or p.get("uid") or ""
         return name.casefold()
-
     celebs = sorted([p for p in friends if p.get("celebrity")], key=sort_key)
     normals = sorted([p for p in friends if not p.get("celebrity")], key=sort_key)
-    return celebs + normals, debug
+    return celebs + normals
 
+
+def _get_friends_binhake(s: LocketSession) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    debug = [make_debug("send", "binhake:getFriendsList_v3", "POST", BINHAKE_API,
+                         {"action": "getFriendsList_v3"})]
+    data, dbg = binhake_call("getFriendsList_v3", s)
+    debug.append(dbg)
+    raw_list: List[Any] = []
+    if isinstance(data, dict):
+        for path in (data.get("data"), data.get("friends")):
+            if isinstance(path, list):
+                raw_list = path
+                break
+    return [_normalize_user(u) for u in raw_list if isinstance(u, dict)], debug
+
+
+def get_friends(s: LocketSession) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    debug: List[Dict[str, Any]] = []
+    friends: List[Dict[str, Any]] = []
+    try:
+        friends, d = get_friends_official(s)
+        debug.extend(d)
+    except Exception as e:
+        logger.warning("official friends failed: %s", e)
+        debug.append(make_debug("error", "official:friends", "GET",
+                                 "firestore+fetchUserV2", None, None, None, None, e))
+    if _friends_sparse(friends):
+        try:
+            fallback, d = _get_friends_binhake(s)
+            debug.extend(d)
+            if fallback and (not friends or not _friends_sparse(fallback)):
+                friends = fallback
+        except Exception as e:
+            logger.warning("binhake friends fallback failed: %s", e)
+    return _sort_friends(friends), debug
+
+
+def get_friends_cached(s: LocketSession, force: bool = False) -> List[Dict[str, Any]]:
+    st = _profile_state(s.local_id)
+    if not force and st["friends"] and time.time() - st["friends_at"] < _FRIENDS_TTL_SEC:
+        return st["friends"]
+    friends, _ = get_friends(s)
+    if friends:
+        with _PROFILE_LOCK:
+            st["friends"] = friends
+            st["friends_at"] = time.time()
+            for f in friends:
+                if f.get("uid"):
+                    st["profiles"][f["uid"]] = f
+    return st["friends"] or friends
+
+
+def _enrich_moments(s: LocketSession, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not items:
+        return []
+    st = _profile_state(s.local_id)
+    if not st["friends"]:
+        try:
+            get_friends_cached(s)
+        except Exception as e:
+            logger.warning("friends for enrich failed: %s", e)
+    profiles = st["profiles"]
+    if s.local_id not in profiles:
+        try:
+            profiles[s.local_id], _ = fetch_user_v2(s, s.local_id)
+        except Exception as e:
+            logger.debug("self profile failed: %s", e)
+
+    missing: List[str] = []
+    for m in items:
+        uid = m.get("user")
+        if isinstance(uid, str) and uid and uid not in profiles and uid not in missing:
+            missing.append(uid)
+    missing = missing[:12]
+    if missing:
+        with ThreadPoolExecutor(max_workers=min(6, len(missing))) as pool:
+            futs = {pool.submit(fetch_user_v2, s, u, 12): u for u in missing}
+            for fut in as_completed(futs):
+                uid = futs[fut]
+                try:
+                    profile, _ = fut.result()
+                except Exception:
+                    profile = {}
+                profile = profile or {}
+                profile["uid"] = profile.get("uid") or uid
+                profiles[uid] = profile
+
+    out: List[Dict[str, Any]] = []
+    for m in items:
+        p = profiles.get(m.get("user")) or {}
+        c = dict(m)
+        c["first_name"] = c.get("first_name") or p.get("first_name") or ""
+        c["last_name"] = c.get("last_name") or p.get("last_name") or ""
+        c["profile_picture_url"] = c.get("profile_picture_url") or p.get("profile_picture_url") or ""
+        c["from_celebrity"] = bool(c.get("from_celebrity") or p.get("celebrity"))
+        out.append(c)
+    return out
 
 
 def _extract_moments_list(data: Any) -> List[Dict[str, Any]]:
@@ -930,33 +1000,90 @@ def _normalize_moment_official(m: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _locket_post_api(s: LocketSession, endpoint: str, payload: Optional[Dict[str, Any]] = None,
-                      timeout: int = 25) -> Dict[str, Any]:
-    """Mirror locketlam client.post_api: POST api.locketcamera.com/{endpoint}.
+_STREAK_KEYS = {"streak", "streak_count", "streakcount", "current_streak", "currentstreak"}
 
-    Body shape: {"data": {**payload, "analytics": ...}}
-    Returns the unwrapped `result` object (or whole JSON if no result key),
-    same as locketlam so callers can use res.get("data", []).
-    """
-    url = f"{LOCKET_API}/{endpoint}"
-    body = {
-        "data": {
-            **(payload or {}),
-            "analytics": _locket_analytics(),
-        }
+
+def _find_streak(obj, depth=0):
+    if depth > 4:
+        return None
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if str(key).lower() not in _STREAK_KEYS or isinstance(val, bool):
+                continue
+            if isinstance(val, (int, float)):
+                return int(val)
+            if isinstance(val, str) and val.isdigit():
+                return int(val)
+            if isinstance(val, dict):
+                count = _first(val, "count", "streak", "value", "current")
+                if isinstance(count, (int, float)) and not isinstance(count, bool):
+                    return int(count)
+                if isinstance(count, str) and count.isdigit():
+                    return int(count)
+        for val in obj.values():
+            found = _find_streak(val, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for val in obj[:20]:
+            found = _find_streak(val, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _locket_read_headers(s: LocketSession) -> Dict[str, str]:
+    return {
+        "User-Agent": LOCKET_IOS_UA,
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "*/*",
+        "x-ios-bundle-identifier": IOS_BUNDLE,
+        "Authorization": f"Bearer {s.id_token}",
     }
-    headers = _locket_api_headers(s)
-    r = requests.post(url, headers=headers, json=body, timeout=timeout)
-    console_log(f"LOCKET {endpoint}", "POST", url,
-                {k: v for k, v in (payload or {}).items() if k != "excluded_users"} |
-                ({"excluded_users": f"<{len((payload or {}).get('excluded_users') or [])}>"}
-                 if payload and "excluded_users" in payload else {}),
-                r.status_code, (r.text or "")[:400], None)
-    r.raise_for_status()
-    data = r.json() if r.text else {}
-    # locketlam: return data.get("result", data)
-    if isinstance(data, dict) and "result" in data:
-        return data.get("result") if isinstance(data.get("result"), dict) else data
+
+
+def _locket_read_analytics(s: LocketSession) -> Dict[str, Any]:
+    int64 = "type.googleapis.com/google.protobuf.Int64Value"
+    return {
+        "ios_version": f"{LOCKET_IOS_APP_VERSION}.{LOCKET_IOS_BUILD}",
+        "experiments": {
+            "flag_18": {"@type": int64, "value": "1203"},
+            "flag_7": {"@type": int64, "value": "800"},
+            "flag_10": {"@type": int64, "value": "505"},
+        },
+        "installation_id": hashlib.md5(s.local_id.encode()).hexdigest()[:22],
+        "platform": "ios",
+    }
+
+
+def _locket_post_api(s: LocketSession, endpoint: str, payload: Optional[Dict[str, Any]] = None,
+                      timeout: int = 25, quiet: bool = False) -> Dict[str, Any]:
+    url = f"{LOCKET_API}/{endpoint}"
+    body = {"data": {**(payload or {}), "analytics": _locket_read_analytics(s)}}
+    raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=raw, headers=_locket_read_headers(s), method="POST")
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            text = resp.read().decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        text = e.read().decode("utf-8", "ignore")
+    except Exception as e:
+        raise LocketError(f"{endpoint} request failed: {e}") from e
+    dt = time.time() - t0
+    if not quiet or status >= 400:
+        shown = {k: v for k, v in (payload or {}).items() if k != "excluded_users"}
+        console_log(f"LOCKET {endpoint}", "POST", url, shown, status, text[:400], dt)
+    try:
+        data = json.loads(text) if text else {}
+    except ValueError:
+        raise LocketError(f"{endpoint} returned non-JSON body (HTTP {status})")
+    if status >= 400:
+        raise LocketError(f"{endpoint} HTTP {status}: {text[:200]}")
+    if isinstance(data, dict) and isinstance(data.get("result"), dict):
+        return data["result"]
     return data if isinstance(data, dict) else {"data": data}
 
 
@@ -1028,39 +1155,15 @@ def get_shared_moments_by_user(s: LocketSession, user_uid: str,
     return moments
 
 
-def get_moments_official(s: LocketSession, timeout: int = 60,
-                          max_items: int = 200, max_pages: int = 30
+def get_moments_official(s: LocketSession, timeout: int = 60, max_items: int = 300,
+                          max_pages: int = FEED_FULL_PAGES
                           ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Build the Moments grid the same way a full feed looks in production.
-
-    Live payloads (cdn.locketcamera.com / getLatestMomentV2) already return a
-    time-ordered `data` list with MANY moments, multiple per friend, interleaved:
-      date is ms int, thumbnailUrl/videoUrl camelCase, overlays is one object.
-
-    Strategy:
-      1) getLatestMomentV2 once — take the full `data` list, normalize, sort
-      2) Page with sync_token while new ids keep arriving
-      3) If still sparse (< ~friends count), fan-out get_shared_moments_by_user
-      4) Caller may still fall back to binhake getMoments for deep history
-    """
     debug: List[Dict[str, Any]] = []
     items: List[Dict[str, Any]] = []
     seen: set = set()
+    sync_token = None
     t0 = time.time()
 
-    def _add_raw(raw: Dict[str, Any]) -> bool:
-        norm = _normalize_moment_official(raw)
-        if not (norm.get("thumbnail_url") or norm.get("video_url") or norm.get("url")):
-            return False
-        k = _moment_key(norm)
-        if k in seen:
-            return False
-        seen.add(k)
-        items.append(norm)
-        return True
-
-    # ----- Phase 1+2: getLatestMomentV2 + sync_token pages -----
-    sync_token = None
     for page in range(max_pages):
         payload: Dict[str, Any] = {
             "should_count_missed_moments": True,
@@ -1071,94 +1174,40 @@ def get_moments_official(s: LocketSession, timeout: int = 60,
         try:
             res = _locket_post_api(s, "getLatestMomentV2", payload, timeout=min(25, timeout))
         except Exception as e:
+            debug.append(make_debug("error", f"locket:getLatestMomentV2:p{page}", "POST",
+                                     f"{LOCKET_API}/getLatestMomentV2", None, None, None, None, e))
+            if page == 0:
+                raise
             logger.warning("getLatestMomentV2 page %d failed: %s", page, e)
-            debug.append(make_debug("error", f"locket:getLatestMomentV2:p{page}",
-                                     "POST", f"{LOCKET_API}/getLatestMomentV2",
-                                     None, None, None, None, e))
             break
 
         data = res.get("data") if isinstance(res, dict) else None
         if not isinstance(data, list) or not data:
-            # Some gateways wrap list one level deeper
-            if isinstance(res, dict) and isinstance(res.get("result"), dict):
-                data = res["result"].get("data")
-            if not isinstance(data, list) or not data:
-                break
-
-        debug.append(make_debug("recv", f"locket:getLatestMomentV2:p{page}",
-                                 "POST", f"{LOCKET_API}/getLatestMomentV2",
-                                 {"n": len(data), "sync": bool(sync_token)},
-                                 200, f"{len(data)} items", None))
+            break
 
         new_count = 0
-        last_mid = None
         for raw in data:
             if not isinstance(raw, dict):
                 continue
-            mid = raw.get("canonical_uid") or raw.get("id")
-            if mid:
-                last_mid = str(mid)
-            if _add_raw(raw):
-                new_count += 1
+            norm = _normalize_moment_official(raw)
+            key = _moment_key(norm)
+            if key in seen:
+                continue
+            seen.add(key)
+            new_count += 1
+            sync_token = norm.get("canonical_uid") or sync_token
+            if norm.get("thumbnail_url") or norm.get("video_url"):
+                items.append(norm)
 
-        logger.info("getLatestMomentV2 p%d → +%d (total %d, batch %d)",
-                    page, new_count, len(items), len(data))
-
-        if new_count == 0 or not last_mid:
+        logger.info("getLatestMomentV2 p%d batch=%d new=%d total=%d",
+                    page, len(data), new_count, len(items))
+        if new_count == 0 or (isinstance(res, dict) and res.get("status") == 304):
             break
-        if isinstance(res, dict) and res.get("status") == 304:
+        if len(items) >= max_items or time.time() - t0 > min(40, timeout * 0.7):
             break
-        sync_token = last_mid
-        if len(items) >= max_items:
-            break
-        if time.time() - t0 > min(35, timeout * 0.6):
-            break
-
-    # ----- Phase 3: per-friend fill if still thin (locketlam get_shared_moments_by_user) -----
-    friend_uids: List[str] = []
-    try:
-        friend_uids, d_fr = list_friend_uids_firestore(s, timeout=min(15, timeout))
-        debug.extend(d_fr)
-    except Exception as e:
-        logger.warning("friend uids: %s", e)
-
-    # Heuristic: full feed usually has >= min(friends, 20) items and often >1 per active friend
-    sparse = len(items) < max(8, min(len(friend_uids), 25) // 2)
-    if sparse and friend_uids:
-        logger.info("feed sparse (%d items / %d friends) — per-friend sync_token walk",
-                    len(items), len(friend_uids))
-        targets = list(friend_uids)
-        if s.local_id and s.local_id not in targets:
-            targets = [s.local_id] + targets
-        targets = targets[:35]
-        per_limit = 15
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        def _job(uid: str) -> List[Dict[str, Any]]:
-            return get_shared_moments_by_user(
-                s, uid, friend_uids, limit=per_limit,
-                timeout=min(15, max(8, int(timeout / 3))),
-            )
-
-        with ThreadPoolExecutor(max_workers=min(8, max(2, len(targets)))) as pool:
-            futs = {pool.submit(_job, u): u for u in targets}
-            for fut in as_completed(futs):
-                uid = futs[fut]
-                try:
-                    for m in fut.result() or []:
-                        _add_raw(m)
-                except Exception as e:
-                    logger.debug("per-friend %s: %s", uid[:8], e)
-                if len(items) >= max_items or time.time() - t0 > timeout:
-                    break
 
     items.sort(key=_moment_timestamp, reverse=True)
-    items = items[:max_items]
-    logger.info("get_moments_official → %d items, %d authors, %.1fs",
-                len(items),
-                len({str(m.get("user") or "") for m in items}),
-                time.time() - t0)
-    return items, debug
+    return items[:max_items], debug
 
 
 def get_moments_http(s: LocketSession, page_token=None, client_target: str = "all",
@@ -1334,22 +1383,27 @@ def get_moments_ws(s: LocketSession, page_token=None, client_target="all", timeo
 
 
 def _moment_key(m: Dict[str, Any]) -> str:
-    # Firestore's own resource path ("projects/.../documents/moments/{docId}")
-    # is the only field here that's guaranteed both unique AND stable across
-    # repeated fetches. thumbnail_url/url are signed URLs that can come back
-    # with a different token each time the same moment is re-fetched, which
-    # made the old key-priority order treat one real moment as "new" again
-    # and duplicate it in the merged list.
-    key = m.get("name") or m.get("canonical_uid") or m.get("md5") or m.get("thumbnail_url") or m.get("url") or m.get("video_url")
+    cid = m.get("canonical_uid") or m.get("id")
+    if cid:
+        return str(cid)
+    name = m.get("name")
+    if name:
+        return str(name).rsplit("/", 1)[-1]
+    key = m.get("md5") or m.get("thumbnail_url") or m.get("url") or m.get("video_url")
     if key:
         return str(key)
-    # Last-resort deterministic fallback — never id(m): that's a per-process
-    # object id that changes on every WS fetch, so it can never match itself
-    # again and silently duplicates the moment on every merge/poll.
     d = m.get("date") or {}
-    ts = (d.get("_seconds") if isinstance(d, dict) else None) or m.get("timestamp") or m.get("created_at") or ""
-    uid = m.get("user") if isinstance(m.get("user"), str) else (m.get("user") or {}).get("uid") or m.get("user_id") or ""
+    ts = (d.get("_seconds") if isinstance(d, dict) else None) or m.get("timestamp") or ""
+    uid = m.get("user") if isinstance(m.get("user"), str) else (m.get("user") or {}).get("uid") or ""
     return f"{uid}:{ts}"
+
+
+def _splice_feed(existing: List[Dict[str, Any]], fresh: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not fresh:
+        return existing
+    floor = min(_moment_timestamp(m) for m in fresh)
+    older = [m for m in existing if _moment_timestamp(m) < floor]
+    return _merge_moments(fresh, older)
 
 
 def _merge_moments(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1478,22 +1532,14 @@ def _ensure_moments_state(local_id: str) -> Dict[str, Any]:
         return st
 
 
-def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int = 55) -> List[Dict[str, Any]]:
-    """One-shot official feed fetch and merge into state. Single-flight per user.
-
-    Primary path: api.locketcamera.com/getLatestMomentV2 (same as locketlam
-    client.moments.get_latest). No binhake / WebSocket required.
-    """
-    started_here = False
+def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int = 55,
+                              max_pages: int = FEED_FULL_PAGES) -> List[Dict[str, Any]]:
     with st["lock"]:
-        if st.get("fetching"):
-            started_here = False
-        else:
+        started_here = not st.get("fetching")
+        if started_here:
             st["fetching"] = True
-            started_here = True
 
     if not started_here:
-        # Another request is fetching — wait briefly for it, then return whatever is cached
         deadline = time.time() + 12
         while time.time() < deadline:
             with st["lock"]:
@@ -1505,34 +1551,24 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
 
     items: List[Dict[str, Any]] = []
     try:
-        # 1) Official getLatestMomentV2 (full data[] when available) + optional per-friend fill
         try:
-            items, _ = get_moments_official(
-                s, timeout=min(70, max(30, timeout)), max_items=200, max_pages=30,
-            )
+            items, _ = get_moments_official(s, timeout=min(70, max(30, timeout)), max_pages=max_pages)
         except Exception as e_off:
-            logger.warning("moments official failed (%s)", e_off)
-            items = []
-        # 2) binhake getMoments — still the densest full history feed; use when official is empty/sparse
-        if len(items) < 12:
+            logger.warning("official feed failed: %s", e_off)
+        if not items:
             try:
                 bh, _ = get_moments_http(s, timeout=min(30, max(12, timeout)))
-                if bh:
-                    # merge binhake into official (prefer more complete set)
-                    by_key = {_moment_key(m): m for m in items}
-                    for m in bh:
-                        flat = flatten_firestore(m) if isinstance(m, dict) and "fields" in m else m
-                        if not isinstance(flat, dict):
-                            continue
-                        norm = _normalize_moment_official(flat)
-                        k = _moment_key(norm)
-                        if k not in by_key and (norm.get("thumbnail_url") or norm.get("video_url")):
-                            by_key[k] = norm
-                    items = list(by_key.values())
-                    items.sort(key=_moment_timestamp, reverse=True)
-                    logger.info("merged binhake → %d items", len(items))
+                for m in bh:
+                    if not isinstance(m, dict):
+                        continue
+                    flat = flatten_firestore(m) if "fields" in m else m
+                    norm = _normalize_moment_official(flat)
+                    if norm.get("thumbnail_url") or norm.get("video_url"):
+                        items.append(norm)
+                items.sort(key=_moment_timestamp, reverse=True)
+                logger.info("binhake fallback -> %d items", len(items))
             except Exception as e_http:
-                logger.warning("moments binhake fallback failed: %s", e_http)
+                logger.warning("binhake fallback failed: %s", e_http)
     except Exception as e:
         logger.error("moments fetch failed: %s", e)
         items = []
@@ -1541,38 +1577,21 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
         st["fetching"] = False
         st["last_fetch_at"] = time.time()
         if items:
-            # Official feed is the authoritative newest set — prefer replace-when-fresh
-            # but still merge so we don't drop older items already shown offline.
-            st["items"] = _merge_moments(st.get("items") or [], items)
+            st["items"] = _splice_feed(st.get("items") or [], items)
             st["updated_at"] = time.time()
-            st["bootstrapped"] = True
-        elif not st.get("bootstrapped"):
-            st["bootstrapped"] = True
+        st["bootstrapped"] = True
         return list(st.get("items") or [])
 
 
 def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, Any]]:
-    """Return cached moments; fetch via official getLatestMomentV2 when cold/forced.
-
-    force=True always hits the official API (used when user re-opens Moments).
-    Soft path returns memory cache when warm (<25s).
-    """
     st = _ensure_moments_state(s.local_id)
-
     with st["lock"]:
-        warm = (
-            st.get("bootstrapped")
-            and not force
-            and st.get("items")
-            and (time.time() - (st.get("last_fetch_at") or st.get("updated_at") or 0)) < 25
-        )
-        if warm:
+        has_items = bool(st.get("items"))
+        last = st.get("last_fetch_at") or st.get("updated_at") or 0
+        if st.get("bootstrapped") and not force and has_items and (time.time() - last) < 25:
             return list(st["items"])
-
-    out = _fetch_and_store_moments(s, st, timeout=55)
-    # Live binhake WS listener is optional now — official poll covers freshness.
-    # Keep it only if already running; do not start a new one (serverless-safe).
-    return out
+    pages = FEED_REFRESH_PAGES if has_items else FEED_FULL_PAGES
+    return _fetch_and_store_moments(s, st, timeout=55, max_pages=pages)
 
 
 def poll_new_moments(s: LocketSession, since: float = 0) -> Tuple[List[Dict[str, Any]], float]:
@@ -3704,9 +3723,9 @@ function loadMe(){
 }
 
 /* ===================== Friends (progressive render) ===================== */
-const FRIENDS_CACHE_KEY='locket_friends_cache_v1';
+const FRIENDS_CACHE_KEY='locket_friends_cache_v2';
 const FRIENDS_TTL_MS=6*60*60*1000; // 6 hours — avoid re-fetch every visit
-const MOMENTS_LS_KEY='locket_moments_cache_v1';
+const MOMENTS_LS_KEY='locket_moments_cache_v2';
 const MOMENTS_TTL_MS=45*1000; // 45s soft TTL — after offline, online handler zeros ts anyway
 let friendsFetchedAt=0;
 /* friends progressive render — smaller batches on weak devices */
@@ -6016,7 +6035,7 @@ def api_friends():
         return jsonify({"ok": False, "error": "Not logged in"})
     try:
         s = ensure_fresh_token(s)
-        friends, _dbg = get_friends(s)
+        friends = get_friends_cached(s, force=request.args.get("force") == "1")
         return jsonify({"ok": True, "friends": friends, "count": len(friends)})
     except Exception as e:
         logger.error("FRIENDS error: %s", e)
@@ -6031,7 +6050,7 @@ def api_moments():
     try:
         s = ensure_fresh_token(s)
         force = request.args.get("force") == "1"
-        items = get_moments_cached(s, force=force)
+        items = _enrich_moments(s, get_moments_cached(s, force=force))
         st = _MOMENTS_CACHE.get(s.local_id) or {}
         return jsonify({
             "ok": True,
@@ -6056,6 +6075,7 @@ def api_moments_poll():
         s = ensure_fresh_token(s)
         since = float(request.args.get("since") or 0)
         items, updated = poll_new_moments(s, since=since)
+        items = _enrich_moments(s, items)
         return jsonify({
             "ok": True,
             "moments": items,
