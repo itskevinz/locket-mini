@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Locket Web — All-in-one Flask app, powered by the binhake action-API
-(https://locket.binhake.dev/server/) for everything except login, which still
-goes through Locket's own Firebase auth.
+Locket Web — All-in-one Flask app on Locket's official API (api.locketcamera.com,
+Firebase Auth, Firestore) sent with iOS-style headers. The binhake action-API
+(https://locket.binhake.dev/server/) is only a last-resort fallback.
 
-Server-side console logs every Firebase/binhake call. Moments are cached and
-kept warm via a long-lived WebSocket so reopening Moments is instant;
-/api/moments/poll streams live updates. Token auto-refresh + Remember me
-(30-day permanent session).
+Server-side console logs every Firebase/Locket call. The full friend feed is
+walked page by page, cached, and refreshed through /api/moments/poll. Token
+auto-refresh + Remember me (30-day permanent session).
 
 Requires: pip install flask requests pillow websocket-client
 """
@@ -152,8 +151,21 @@ IOS_BUNDLE = "com.locket.Locket"
 LOCKET_IOS_APP_VERSION = "2.68.0"
 LOCKET_IOS_BUILD = "2523"
 LOCKET_IOS_UA = f"{IOS_BUNDLE}/{LOCKET_IOS_APP_VERSION} iPhone/18.1.0 hw/iPhone16,1"
-FEED_FULL_PAGES = 12
+FEED_QUICK_PAGES = 3
+FEED_FULL_PAGES = 30
 FEED_REFRESH_PAGES = 2
+FEED_MAX_ITEMS = 500
+FEED_DEEP_BUDGET_SEC = 60.0
+FEED_BACKFILL_ENABLED = os.environ.get("LOCKET_FEED_BACKFILL", "1") != "0"
+FEED_BACKFILL_MAX_FRIENDS = 80
+FEED_BACKFILL_PER_FRIEND = 3
+FEED_BACKFILL_WORKERS = 4
+FEED_BACKFILL_BUDGET_SEC = 45.0
+FEED_BACKFILL_RETRY_SEC = 1800
+LOCKET_READ_RETRIES = 2
+LOCKET_APPCHECK_TOKEN = os.environ.get("LOCKET_APPCHECK_TOKEN", "").strip()
+LOCKET_INSTANCE_ID_TOKEN = os.environ.get("LOCKET_INSTANCE_ID_TOKEN", "").strip()
+LOCKET_INSTALLATION_ID = os.environ.get("LOCKET_INSTALLATION_ID", "").strip()
 
 WEB_UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
@@ -169,8 +181,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "1.8"
-APP_BUILD = "2026.10.17"
+APP_VERSION = "1.9"
+APP_BUILD = "2026.10.19"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -501,7 +513,18 @@ def _normalize_user(u: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def get_self_info(s: LocketSession) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+_SELF_INFO_LOCK = threading.Lock()
+_SELF_INFO_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_SELF_INFO_TTL_SEC = 120
+
+
+def get_self_info(s: LocketSession, force: bool = False) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    if not force:
+        with _SELF_INFO_LOCK:
+            hit = _SELF_INFO_CACHE.get(s.local_id)
+        if hit and time.time() - hit[0] < _SELF_INFO_TTL_SEC:
+            return dict(hit[1]), []
+
     debug: List[Dict[str, Any]] = []
     info: Dict[str, Any] = {}
     try:
@@ -534,6 +557,8 @@ def get_self_info(s: LocketSession) -> Tuple[Dict[str, Any], List[Dict[str, Any]
         info["first_name"] = s.display_name
     if not info.get("profile_picture_url"):
         info["profile_picture_url"] = s.photo_url
+    with _SELF_INFO_LOCK:
+        _SELF_INFO_CACHE[s.local_id] = (time.time(), dict(info))
     return info, debug
 
 
@@ -899,21 +924,36 @@ def _moment_timestamp(m: Dict[str, Any]) -> int:
     return 0
 
 
+def _overlay_to_client_shape(ov: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(ov.get("data"), dict):
+        out = dict(ov)
+        text = ov["data"].get("text") or ov.get("alt_text") or ""
+        out["alt_text"] = out.get("alt_text") or text
+        return out
+    skip = ("overlay_id", "overlay_type", "alt_text")
+    data = {k: v for k, v in ov.items() if k not in skip}
+    text = ov.get("text") or ov.get("alt_text") or ""
+    kind = ov.get("type") or "standard"
+    return {
+        "overlay_id": ov.get("overlay_id") or f"caption:{kind}",
+        "overlay_type": ov.get("overlay_type") or "caption",
+        "alt_text": text,
+        "data": data,
+    }
+
+
 def _normalize_overlays(overlays: Any) -> List[Dict[str, Any]]:
-    """API sometimes returns overlays as a single object, sometimes as a list."""
     if overlays is None:
         return []
     if isinstance(overlays, list):
-        return [x for x in overlays if isinstance(x, dict)]
+        return [_overlay_to_client_shape(x) for x in overlays if isinstance(x, dict)]
     if isinstance(overlays, dict):
-        # Real getLatestMomentV2: one caption object at top level
         if overlays.get("overlay_type") or overlays.get("type") or overlays.get("text"):
-            return [overlays]
-        # map of id -> overlay
+            return [_overlay_to_client_shape(overlays)]
         out = []
         for v in overlays.values():
             if isinstance(v, dict) and (v.get("text") or v.get("overlay_type") or v.get("type")):
-                out.append(v)
+                out.append(_overlay_to_client_shape(v))
         return out
     return []
 
@@ -1032,14 +1072,32 @@ def _find_streak(obj, depth=0):
     return None
 
 
-def _locket_read_headers(s: LocketSession) -> Dict[str, str]:
-    return {
+_LOCKET_HEADER_PROFILE: Dict[str, str] = {"name": "full"}
+_LOCKET_HEADER_ORDER = ("full", "minimal")
+
+
+def _locket_installation_id(s: LocketSession) -> str:
+    if LOCKET_INSTALLATION_ID:
+        return LOCKET_INSTALLATION_ID
+    return hashlib.md5(s.local_id.encode()).hexdigest()[:22]
+
+
+def _locket_read_headers(s: LocketSession, profile: str = "full") -> Dict[str, str]:
+    headers = {
         "User-Agent": LOCKET_IOS_UA,
         "Content-Type": "application/json; charset=utf-8",
         "Accept": "*/*",
         "x-ios-bundle-identifier": IOS_BUNDLE,
         "Authorization": f"Bearer {s.id_token}",
     }
+    if LOCKET_APPCHECK_TOKEN:
+        headers["X-Firebase-AppCheck"] = LOCKET_APPCHECK_TOKEN
+    if LOCKET_INSTANCE_ID_TOKEN:
+        headers["Firebase-Instance-Id-Token"] = LOCKET_INSTANCE_ID_TOKEN
+    if profile == "full":
+        headers["Accept-Language"] = "en-US,en;q=0.9"
+        headers["X-Firebase-GMPID"] = FIREBASE_GMPID
+    return headers
 
 
 def _locket_read_analytics(s: LocketSession) -> Dict[str, Any]:
@@ -1051,9 +1109,21 @@ def _locket_read_analytics(s: LocketSession) -> Dict[str, Any]:
             "flag_7": {"@type": int64, "value": "800"},
             "flag_10": {"@type": int64, "value": "505"},
         },
-        "installation_id": hashlib.md5(s.local_id.encode()).hexdigest()[:22],
+        "installation_id": _locket_installation_id(s),
         "platform": "ios",
     }
+
+
+def _locket_http_post(url: str, headers: Dict[str, str], raw: bytes, timeout: int
+                       ) -> Tuple[Optional[int], str, Optional[Exception]]:
+    req = urllib.request.Request(url, data=raw, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "ignore"), None
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "ignore"), None
+    except Exception as e:
+        return None, "", e
 
 
 def _locket_post_api(s: LocketSession, endpoint: str, payload: Optional[Dict[str, Any]] = None,
@@ -1061,153 +1131,182 @@ def _locket_post_api(s: LocketSession, endpoint: str, payload: Optional[Dict[str
     url = f"{LOCKET_API}/{endpoint}"
     body = {"data": {**(payload or {}), "analytics": _locket_read_analytics(s)}}
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=raw, headers=_locket_read_headers(s), method="POST")
+    preferred = _LOCKET_HEADER_PROFILE["name"]
+    order = [preferred] + [p for p in _LOCKET_HEADER_ORDER if p != preferred]
+    refreshed = False
+    status: Optional[int] = None
+    text = ""
+    error: Optional[Exception] = None
+    used = preferred
     t0 = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            status = resp.status
-            text = resp.read().decode("utf-8", "ignore")
-    except urllib.error.HTTPError as e:
-        status = e.code
-        text = e.read().decode("utf-8", "ignore")
-    except Exception as e:
-        raise LocketError(f"{endpoint} request failed: {e}") from e
+    for profile in order:
+        used = profile
+        for attempt in range(LOCKET_READ_RETRIES + 1):
+            status, text, error = _locket_http_post(url, _locket_read_headers(s, profile), raw, timeout)
+            if status == 401 and not refreshed:
+                refreshed = True
+                if refresh_id_token(s):
+                    continue
+                break
+            transient = status is None or status in (429, 500, 502, 503, 504)
+            if transient and attempt < LOCKET_READ_RETRIES:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            break
+        if status is not None and status not in (401, 403):
+            break
     dt = time.time() - t0
+    if status is None:
+        raise LocketError(f"{endpoint} request failed: {error}")
     if not quiet or status >= 400:
         shown = {k: v for k, v in (payload or {}).items() if k != "excluded_users"}
-        console_log(f"LOCKET {endpoint}", "POST", url, shown, status, text[:400], dt)
+        excluded = (payload or {}).get("excluded_users")
+        if excluded:
+            shown["excluded_users"] = f"[{len(excluded)} uids]"
+        console_log(f"LOCKET {endpoint} [{used}]", "POST", url, shown, status, text[:400], dt)
+    if status < 400:
+        _LOCKET_HEADER_PROFILE["name"] = used
     try:
         data = json.loads(text) if text else {}
     except ValueError:
         raise LocketError(f"{endpoint} returned non-JSON body (HTTP {status})")
     if status >= 400:
-        raise LocketError(f"{endpoint} HTTP {status}: {text[:200]}")
+        err = LocketError(f"{endpoint} HTTP {status}: {text[:200]}")
+        err.status = status
+        raise err
     if isinstance(data, dict) and isinstance(data.get("result"), dict):
         return data["result"]
     return data if isinstance(data, dict) else {"data": data}
 
 
-def get_shared_moments_by_user(s: LocketSession, user_uid: str,
-                                friend_uids: List[str],
-                                limit: Optional[int] = None,
-                                timeout: int = 20
-                                ) -> List[Dict[str, Any]]:
-    """1:1 port of locketlam MomentsModule.get_shared_moments_by_user.
-
-    Walks getLatestMomentV2 with excluded_users = all friends except target,
-    paginating via sync_token = last canonical_uid until empty / 304 / limit.
-    """
-    moments: List[Dict[str, Any]] = []
-    seen_uids: set = set()
-    current_sync = None
-    other_friends = [fuid for fuid in friend_uids if fuid != user_uid]
-
-    while True:
-        payload: Dict[str, Any] = {
-            "should_count_missed_moments": True,
-            "include_group_moments": True,
-            "excluded_users": other_friends,
-        }
-        if current_sync:
-            payload["sync_token"] = current_sync
-
-        try:
-            feed_res = _locket_post_api(s, "getLatestMomentV2", payload, timeout=timeout)
-        except Exception as e:
-            logger.debug("get_shared_moments_by_user %s page fail: %s", user_uid[:8], e)
-            break
-
-        data = feed_res.get("data", []) if isinstance(feed_res, dict) else []
-        if not isinstance(data, list) or not data:
-            break
-
-        new_count = 0
-        for m in data:
-            if not isinstance(m, dict):
-                continue
-            mid = m.get("canonical_uid")
-            if mid and mid not in seen_uids:
-                seen_uids.add(mid)
-                new_count += 1
-                current_sync = mid
-                # locketlam: if m.get("user") == user_uid
-                author = m.get("user")
-                if isinstance(author, dict):
-                    author = author.get("uid") or author.get("user_id") or author.get("id")
-                if str(author) == str(user_uid):
-                    created_ts = ""
-                    date_field = m.get("date", {})
-                    if isinstance(date_field, dict) and "_seconds" in date_field:
-                        created_ts = str(date_field["_seconds"])
-                    # Keep full original fields + aliases the web UI expects
-                    norm = _normalize_moment_official(m)
-                    if not norm.get("user"):
-                        norm["user"] = user_uid
-                    if not norm.get("canonical_uid") and mid:
-                        norm["canonical_uid"] = mid
-                    moments.append(norm)
-                    if limit and len(moments) >= limit:
-                        return moments[:limit]
-
-        if new_count == 0 or (isinstance(feed_res, dict) and feed_res.get("status") == 304):
-            break
-
-    return moments
+def _moment_author(m: Dict[str, Any]) -> str:
+    u = m.get("user")
+    if isinstance(u, dict):
+        u = u.get("uid") or u.get("user_id") or u.get("id")
+    return str(u) if u else ""
 
 
-def get_moments_official(s: LocketSession, timeout: int = 60, max_items: int = 300,
-                          max_pages: int = FEED_FULL_PAGES
-                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    debug: List[Dict[str, Any]] = []
-    items: List[Dict[str, Any]] = []
-    seen: set = set()
-    sync_token = None
+def _official_feed_page(s: LocketSession, sync_token: Optional[str] = None,
+                         excluded_users: Optional[List[str]] = None,
+                         quiet: bool = False, timeout: int = 25
+                         ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    payload: Dict[str, Any] = {
+        "should_count_missed_moments": True,
+        "include_group_moments": True,
+    }
+    if excluded_users:
+        payload["excluded_users"] = excluded_users
+    if sync_token:
+        payload["sync_token"] = sync_token
+    res = _locket_post_api(s, "getLatestMomentV2", payload, timeout=timeout, quiet=quiet)
+    status = res.get("status") if isinstance(res, dict) else None
+    data = res.get("data") if isinstance(res, dict) else None
+    if isinstance(data, dict):
+        data = data.get("moments") or data.get("data") or []
+    return (data if isinstance(data, list) else []), status
+
+
+def _feed_entry_to_moment(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    norm = _normalize_moment_official(entry)
+    if not (norm.get("thumbnail_url") or norm.get("video_url")):
+        return None
+    norm["source"] = "official"
+    return norm
+
+
+def walk_official_feed(s: LocketSession, sync_token: Optional[str] = None,
+                        max_pages: int = FEED_FULL_PAGES, max_items: int = FEED_MAX_ITEMS,
+                        budget: float = 40.0) -> Dict[str, Any]:
     t0 = time.time()
-
-    for page in range(max_pages):
-        payload: Dict[str, Any] = {
-            "should_count_missed_moments": True,
-            "include_group_moments": True,
-        }
-        if sync_token:
-            payload["sync_token"] = sync_token
+    seen: set = set()
+    items: List[Dict[str, Any]] = []
+    token = sync_token
+    pages = 0
+    exhausted = False
+    error: Optional[str] = None
+    while pages < max_pages:
+        if pages and time.time() - t0 > budget:
+            break
         try:
-            res = _locket_post_api(s, "getLatestMomentV2", payload, timeout=min(25, timeout))
+            raw, status = _official_feed_page(s, token, quiet=pages > 0)
         except Exception as e:
-            debug.append(make_debug("error", f"locket:getLatestMomentV2:p{page}", "POST",
-                                     f"{LOCKET_API}/getLatestMomentV2", None, None, None, None, e))
-            if page == 0:
-                raise
-            logger.warning("getLatestMomentV2 page %d failed: %s", page, e)
+            error = str(e)
             break
-
-        data = res.get("data") if isinstance(res, dict) else None
-        if not isinstance(data, list) or not data:
+        pages += 1
+        if status == 304 or not raw:
+            exhausted = True
             break
-
-        new_count = 0
-        for raw in data:
-            if not isinstance(raw, dict):
+        fresh = 0
+        last_cid: Optional[str] = None
+        for entry in raw:
+            if not isinstance(entry, dict):
                 continue
-            norm = _normalize_moment_official(raw)
-            key = _moment_key(norm)
+            cid = entry.get("canonical_uid") or entry.get("id")
+            if cid:
+                last_cid = str(cid)
+            key = str(cid) if cid else _moment_key(entry)
             if key in seen:
                 continue
             seen.add(key)
-            new_count += 1
-            sync_token = norm.get("canonical_uid") or sync_token
-            if norm.get("thumbnail_url") or norm.get("video_url"):
-                items.append(norm)
-
-        logger.info("getLatestMomentV2 p%d batch=%d new=%d total=%d",
-                    page, len(data), new_count, len(items))
-        if new_count == 0 or (isinstance(res, dict) and res.get("status") == 304):
+            fresh += 1
+            moment = _feed_entry_to_moment(entry)
+            if moment is not None:
+                items.append(moment)
+        logger.info("getLatestMomentV2 p%d batch=%d new=%d total=%d", pages - 1, len(raw), fresh, len(items))
+        if fresh == 0:
+            exhausted = True
             break
-        if len(items) >= max_items or time.time() - t0 > min(40, timeout * 0.7):
+        token = last_cid or token
+        if len(items) >= max_items:
             break
+    return {
+        "items": items,
+        "next_token": token,
+        "exhausted": exhausted,
+        "pages": pages,
+        "error": error,
+        "elapsed": time.time() - t0,
+    }
 
-    items.sort(key=_moment_timestamp, reverse=True)
-    return items[:max_items], debug
+
+def get_shared_moments_by_user(s: LocketSession, user_uid: str, friend_uids: List[str],
+                                limit: Optional[int] = None, timeout: int = 20,
+                                max_pages: int = 50) -> List[Dict[str, Any]]:
+    excluded = [u for u in friend_uids if u and u != user_uid]
+    moments: List[Dict[str, Any]] = []
+    seen: set = set()
+    token: Optional[str] = None
+    for _ in range(max_pages):
+        try:
+            raw, status = _official_feed_page(s, token, excluded, quiet=True, timeout=timeout)
+        except Exception as e:
+            logger.debug("get_shared_moments_by_user %s page fail: %s", user_uid[:8], e)
+            break
+        if not raw or status == 304:
+            break
+        fresh = 0
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            cid = entry.get("canonical_uid") or entry.get("id")
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            fresh += 1
+            token = str(cid)
+            if _moment_author(entry) != str(user_uid):
+                continue
+            moment = _feed_entry_to_moment(entry)
+            if moment is None:
+                continue
+            if not moment.get("user"):
+                moment["user"] = user_uid
+            moments.append(moment)
+            if limit and len(moments) >= limit:
+                return moments[:limit]
+        if fresh == 0:
+            break
+    return moments
 
 
 def get_moments_http(s: LocketSession, page_token=None, client_target: str = "all",
@@ -1525,15 +1624,131 @@ def _ensure_moments_state(local_id: str) -> Dict[str, Any]:
                 "ws": None,
                 "updated_at": 0,
                 "bootstrapped": False,
-                "fetching": False,  # prevent parallel one-shot WS storms
+                "fetching": False,
                 "last_fetch_at": 0,
+                "source": "",
+                "warnings": [],
+                "diag": {},
+                "next_token": None,
+                "feed_exhausted": False,
+                "deep_state": None,
+                "deep_fail_at": 0.0,
+                "no_moments": {},
             }
             _MOMENTS_CACHE[local_id] = st
         return st
 
 
+def _binhake_feed_fallback(s: LocketSession, timeout: int) -> List[Dict[str, Any]]:
+    raw_items, _ = get_moments_http(s, timeout=min(30, max(12, timeout)))
+    out: List[Dict[str, Any]] = []
+    for m in raw_items:
+        if not isinstance(m, dict):
+            continue
+        flat = flatten_firestore(m) if "fields" in m else m
+        norm = _normalize_moment_official(flat)
+        if norm.get("thumbnail_url") or norm.get("video_url"):
+            norm["source"] = "binhake"
+            out.append(norm)
+    out.sort(key=_moment_timestamp, reverse=True)
+    return out
+
+
+def _store_deeper(st: Dict[str, Any], items: List[Dict[str, Any]]) -> None:
+    if not items:
+        return
+    with st["lock"]:
+        st["items"] = _merge_moments(st["items"], items)[:FEED_MAX_ITEMS]
+        st["updated_at"] = time.time()
+
+
+def _backfill_missing_friends(s: LocketSession, st: Dict[str, Any]) -> None:
+    if not FEED_BACKFILL_ENABLED:
+        return
+    friends = get_friends_cached(s)
+    friend_uids = [f["uid"] for f in friends if f.get("uid")]
+    if not friend_uids:
+        return
+    now = time.time()
+    with st["lock"]:
+        present = {_moment_author(m) for m in st["items"]}
+        skip = st["no_moments"]
+        missing = [u for u in friend_uids
+                   if u not in present and now - skip.get(u, 0) > FEED_BACKFILL_RETRY_SEC]
+    missing = missing[:FEED_BACKFILL_MAX_FRIENDS]
+    if not missing:
+        return
+    deadline = now + FEED_BACKFILL_BUDGET_SEC
+
+    def work(uid: str):
+        if time.time() > deadline:
+            return uid, None
+        try:
+            return uid, get_shared_moments_by_user(
+                s, uid, friend_uids, limit=FEED_BACKFILL_PER_FRIEND, timeout=20, max_pages=1)
+        except Exception as e:
+            logger.debug("backfill %s failed: %s", uid[:8], e)
+            return uid, []
+
+    found: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=FEED_BACKFILL_WORKERS) as pool:
+        for uid, res in pool.map(work, missing):
+            if res is None:
+                continue
+            if res:
+                found.extend(res)
+            else:
+                with st["lock"]:
+                    skip[uid] = time.time()
+    _store_deeper(st, found)
+    with st["lock"]:
+        st["diag"] = {**st["diag"], "backfill_checked": len(missing), "backfill_found": len(found)}
+    logger.info("friend backfill checked=%d found=%d", len(missing), len(found))
+
+
+def _deepen_worker(s: LocketSession, st: Dict[str, Any]) -> None:
+    ok = False
+    try:
+        with st["lock"]:
+            token = st.get("next_token")
+            exhausted = st.get("feed_exhausted")
+        if token and not exhausted:
+            walk = walk_official_feed(s, token, max_pages=FEED_FULL_PAGES,
+                                      max_items=FEED_MAX_ITEMS, budget=FEED_DEEP_BUDGET_SEC)
+            _store_deeper(st, walk["items"])
+            with st["lock"]:
+                st["next_token"] = walk["next_token"]
+                st["feed_exhausted"] = walk["exhausted"]
+                st["diag"] = {**st["diag"], "deep_pages": walk["pages"],
+                              "deep_items": len(walk["items"]), "deep_error": walk["error"],
+                              "deep_exhausted": walk["exhausted"]}
+            if walk["error"] and not walk["items"]:
+                raise LocketError(walk["error"])
+        _backfill_missing_friends(s, st)
+        ok = True
+    except Exception as e:
+        logger.warning("feed deepen failed: %s", e)
+    finally:
+        with st["lock"]:
+            st["deep_state"] = "done" if ok else None
+            if not ok:
+                st["deep_fail_at"] = time.time()
+
+
+def _maybe_start_deepen(s: LocketSession, st: Dict[str, Any]) -> None:
+    with st["lock"]:
+        if st["deep_state"] is not None:
+            return
+        if st.get("source") != "official" or not st["items"]:
+            return
+        if time.time() - st.get("deep_fail_at", 0.0) < 120:
+            return
+        st["deep_state"] = "running"
+    threading.Thread(target=_deepen_worker, args=(s, st), daemon=True).start()
+
+
 def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int = 55,
-                              max_pages: int = FEED_FULL_PAGES) -> List[Dict[str, Any]]:
+                              max_pages: int = FEED_QUICK_PAGES) -> List[Dict[str, Any]]:
     with st["lock"]:
         started_here = not st.get("fetching")
         if started_here:
@@ -1550,34 +1765,63 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
             return list(st.get("items") or [])
 
     items: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    source = ""
+    walk: Dict[str, Any] = {"items": [], "next_token": None, "exhausted": False,
+                            "pages": 0, "error": None, "elapsed": 0.0}
     try:
-        try:
-            items, _ = get_moments_official(s, timeout=min(70, max(30, timeout)), max_pages=max_pages)
-        except Exception as e_off:
-            logger.warning("official feed failed: %s", e_off)
-        if not items:
-            try:
-                bh, _ = get_moments_http(s, timeout=min(30, max(12, timeout)))
-                for m in bh:
-                    if not isinstance(m, dict):
-                        continue
-                    flat = flatten_firestore(m) if "fields" in m else m
-                    norm = _normalize_moment_official(flat)
-                    if norm.get("thumbnail_url") or norm.get("video_url"):
-                        items.append(norm)
-                items.sort(key=_moment_timestamp, reverse=True)
-                logger.info("binhake fallback -> %d items", len(items))
-            except Exception as e_http:
-                logger.warning("binhake fallback failed: %s", e_http)
+        walk = walk_official_feed(s, None, max_pages=max_pages, max_items=FEED_MAX_ITEMS,
+                                  budget=min(40.0, timeout * 0.7))
     except Exception as e:
-        logger.error("moments fetch failed: %s", e)
-        items = []
+        walk["error"] = str(e)
+        logger.error("official feed crashed: %s", e)
+
+    diag: Dict[str, Any] = {
+        "at": time.time(),
+        "header_profile": _LOCKET_HEADER_PROFILE["name"],
+        "official_pages": walk["pages"],
+        "official_items": len(walk["items"]),
+        "official_error": walk["error"],
+        "official_ms": int(walk["elapsed"] * 1000),
+    }
+
+    if walk["items"]:
+        items = walk["items"]
+        source = "official"
+        if walk["error"]:
+            warnings.append(f"Official feed loaded only partly: {walk['error']}")
+    else:
+        if walk["error"]:
+            warnings.append(f"Official feed failed: {walk['error']}")
+        with st["lock"]:
+            have_official = any(m.get("source") == "official" for m in st["items"])
+        if not have_official:
+            try:
+                items = _binhake_feed_fallback(s, timeout)
+                if items:
+                    source = "binhake"
+                    warnings.append("Official feed returned nothing, showing binhake fallback (latest moment per friend)")
+                    logger.warning("binhake fallback -> %d items", len(items))
+            except Exception as e:
+                warnings.append(f"Fallback failed: {e}")
+                logger.warning("binhake fallback failed: %s", e)
 
     with st["lock"]:
         st["fetching"] = False
         st["last_fetch_at"] = time.time()
+        st["warnings"] = warnings
+        st["diag"] = {**st.get("diag", {}), **diag}
         if items:
-            st["items"] = _splice_feed(st.get("items") or [], items)
+            if source == "official":
+                kept = [m for m in st["items"] if m.get("source") != "binhake"]
+                st["items"] = _splice_feed(kept, items)[:FEED_MAX_ITEMS]
+                if st["deep_state"] is None:
+                    st["next_token"] = walk["next_token"]
+                    st["feed_exhausted"] = walk["exhausted"]
+            elif not any(m.get("source") == "official" for m in st["items"]):
+                st["items"] = items
+            if source:
+                st["source"] = source
             st["updated_at"] = time.time()
         st["bootstrapped"] = True
         return list(st.get("items") or [])
@@ -1587,19 +1831,17 @@ def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, 
     st = _ensure_moments_state(s.local_id)
     with st["lock"]:
         has_items = bool(st.get("items"))
+        has_official = any(m.get("source") == "official" for m in st.get("items") or [])
         last = st.get("last_fetch_at") or st.get("updated_at") or 0
         if st.get("bootstrapped") and not force and has_items and (time.time() - last) < 25:
             return list(st["items"])
-    pages = FEED_REFRESH_PAGES if has_items else FEED_FULL_PAGES
-    return _fetch_and_store_moments(s, st, timeout=55, max_pages=pages)
+    pages = FEED_REFRESH_PAGES if has_official else FEED_QUICK_PAGES
+    items = _fetch_and_store_moments(s, st, timeout=55, max_pages=pages)
+    _maybe_start_deepen(s, st)
+    return items
 
 
 def poll_new_moments(s: LocketSession, since: float = 0) -> Tuple[List[Dict[str, Any]], float]:
-    """Return moments if cache advanced past `since`.
-
-    Official getLatestMomentV2 is fast (~1–3s), so we can refresh on cold start
-    and background-refresh when stale without the old 30s binhake WS hang.
-    """
     st = _ensure_moments_state(s.local_id)
     now = time.time()
     with st["lock"]:
@@ -1612,7 +1854,6 @@ def poll_new_moments(s: LocketSession, since: float = 0) -> Tuple[List[Dict[str,
         except Exception as e:
             logger.warning("poll refresh failed: %s", e)
     elif has_data and (now - last) > 60:
-        # Stale: background refresh via official API (non-blocking)
         try:
             th = threading.Thread(
                 target=lambda: get_moments_cached(s, force=True),
@@ -1641,7 +1882,6 @@ def stop_moments_live(local_id: str):
             ws.close()
         except Exception:
             pass
-
 
 
 def _random_storage_name(ext: str = "webp") -> str:
@@ -3725,7 +3965,7 @@ function loadMe(){
 /* ===================== Friends (progressive render) ===================== */
 const FRIENDS_CACHE_KEY='locket_friends_cache_v2';
 const FRIENDS_TTL_MS=6*60*60*1000; // 6 hours — avoid re-fetch every visit
-const MOMENTS_LS_KEY='locket_moments_cache_v2';
+const MOMENTS_LS_KEY='locket_moments_cache_v3';try{localStorage.removeItem('locket_moments_cache_v2')}catch(e){}
 const MOMENTS_TTL_MS=45*1000; // 45s soft TTL — after offline, online handler zeros ts anyway
 let friendsFetchedAt=0;
 /* friends progressive render — smaller batches on weak devices */
@@ -4091,6 +4331,7 @@ function refreshMomentsNow(){
   apiTimeout('/api/moments?force=1', null, 20000).then(function(d){
     if(icon) icon.classList.remove('icon-spin');
     if(!d.ok){ toast(d.error||'Không làm mới được Moments'); return; }
+    notifyMomentsWarning(d);
     var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
     if(!items.length && momentsCache.length){
       toast('Không có Moments mới');
@@ -4365,6 +4606,13 @@ function applyMomentsNetworkResult(items, updatedAt, preferPrepend, opts){
 }
 
 function loggerSoft(msg){ try{ console.log('[moments]', msg); }catch(e){} }
+var _lastMomentsWarn='';
+function notifyMomentsWarning(d){
+  try{
+    var w=d&&d.warnings&&d.warnings[0];
+    if(w&&w!==_lastMomentsWarn){ _lastMomentsWarn=w; toast(String(w)); }
+  }catch(e){}
+}
 
 function loadMoments(force){
   // 1) Always try to show something immediately
@@ -4412,6 +4660,7 @@ function loadMoments(force){
       if(queued) loadMoments(true);
       return;
     }
+    notifyMomentsWarning(d);
     var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
     applyMomentsNetworkResult(items, d.updated_at, true);
     if(queued) loadMoments(true);
@@ -6059,6 +6308,10 @@ def api_moments():
             "updated_at": st.get("updated_at") or time.time(),
             "cached": not force and bool(st.get("bootstrapped")),
             "force": force,
+            "source": st.get("source") or "",
+            "warnings": list(st.get("warnings") or []),
+            "deep_state": st.get("deep_state"),
+            "diag": dict(st.get("diag") or {}),
         })
     except Exception as e:
         logger.error("MOMENTS error: %s", e)
@@ -6076,11 +6329,14 @@ def api_moments_poll():
         since = float(request.args.get("since") or 0)
         items, updated = poll_new_moments(s, since=since)
         items = _enrich_moments(s, items)
+        st = _MOMENTS_CACHE.get(s.local_id) or {}
         return jsonify({
             "ok": True,
             "moments": items,
             "updated_at": updated,
             "changed": bool(items) and updated > since,
+            "source": st.get("source") or "",
+            "deep_state": st.get("deep_state"),
         })
     except Exception as e:
         logger.error("MOMENTS POLL error: %s", e)
