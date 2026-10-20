@@ -20,6 +20,7 @@ import logging
 import threading
 import os
 import sys
+import re
 import tempfile
 import time
 import uuid
@@ -152,13 +153,18 @@ IOS_BUNDLE = "com.locket.Locket"
 LOCKET_IOS_APP_VERSION = "2.68.0"
 LOCKET_IOS_BUILD = "2523"
 LOCKET_IOS_UA = f"{IOS_BUNDLE}/{LOCKET_IOS_APP_VERSION} iPhone/18.1.0 hw/iPhone16,1"
-FEED_MAX_ITEMS = 500
+FEED_MAX_ITEMS = 1500
+FEED_PER_FRIEND = 20
+FEED_WINDOW_START = 60
+FEED_WINDOW_STEP = 60
+FEED_DEEPEN_BUDGET_SEC = 9.0
+FEED_MAX_ROUNDS = 25
 FEED_CRAWL_WORKERS = 12
 FEED_CRAWL_BUDGET_SEC = 12.0
 FEED_RECRAWL_SEC = 600
 FEED_PRECHECK_MIN_SEC = 20
 FEED_UIDS_TTL_SEC = 600
-FEED_HISTORY_PER_USER = 30
+FEED_HISTORY_PER_USER = 20
 FEED_FIRESTORE_HISTORY = os.environ.get("LOCKET_FIRESTORE_HISTORY", "1") != "0"
 FEED_HISTORY_DIR = os.environ.get("LOCKET_HISTORY_DIR", "").strip() or tempfile.gettempdir()
 FIREBASE_CLIENT_HEADER = "H4sIAAAAAAAAAKtWykhNLCpJSk0sKVayio7VUSpLLSrOzM9TslIyUqoFAFyivEQfAAAA"
@@ -166,6 +172,12 @@ LOCKET_READ_RETRIES = 2
 LOCKET_APPCHECK_TOKEN = os.environ.get("LOCKET_APPCHECK_TOKEN", "").strip()
 LOCKET_INSTANCE_ID_TOKEN = os.environ.get("LOCKET_INSTANCE_ID_TOKEN", "").strip()
 LOCKET_INSTALLATION_ID = os.environ.get("LOCKET_INSTALLATION_ID", "").strip()
+FEED_USE_HISTORY = os.environ.get("LOCKET_FEED_HISTORY", "1") != "0"
+FEED_HISTORY_DB = os.environ.get("LOCKET_FIRESTORE_DB", "locket").strip() or "locket"
+FEED_HISTORY_PAGE = 60
+FEED_HISTORY_PAGE_MORE = 100
+FEED_HISTORY_RETRY_SEC = 600
+FIREBASE_AUTH_UA = "FirebaseAuth.iOS/10.23.1 com.locket.Locket/1.82.0 iPhone/18.0 hw/iPhone12_1"
 
 WEB_UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
@@ -181,8 +193,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "2.0"
-APP_BUILD = "2026.10.19.2"
+APP_VERSION = "2.2"
+APP_BUILD = "2026.10.20.2"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -455,9 +467,12 @@ def _flatten_firestore_value(v):
     if "timestampValue" in v:
         from datetime import datetime, timezone
         try:
-            ts = v["timestampValue"].replace("Z", "+00:00")
-            dt = datetime.fromisoformat(ts)
-            return {"_seconds": int(dt.timestamp()), "_nanoseconds": 0}
+            raw_ts = v["timestampValue"]
+            frac_match = re.search(r"\.(\d+)", raw_ts)
+            nanos = int((frac_match.group(1) + "000000000")[:9]) if frac_match else 0
+            base_ts = re.sub(r"\.\d+", "", raw_ts).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(base_ts)
+            return {"_seconds": int(dt.timestamp()), "_nanoseconds": nanos}
         except Exception:
             return {"_seconds": 0, "_nanoseconds": 0}
     if "nullValue" in v:
@@ -1260,6 +1275,7 @@ def crawl_latest_per_user(s: LocketSession, uids: List[str],
 
     items: List[Dict[str, Any]] = []
     errors: List[str] = []
+    empty_uids: List[str] = []
     empty = skipped = 0
     with ThreadPoolExecutor(max_workers=FEED_CRAWL_WORKERS) as pool:
         for uid, out, err in pool.map(work, targets):
@@ -1269,11 +1285,13 @@ def crawl_latest_per_user(s: LocketSession, uids: List[str],
                 errors.append(err)
             elif not out:
                 empty += 1
+                empty_uids.append(uid)
             else:
                 items.extend(out)
     return {
         "items": items,
         "targets": len(targets),
+        "empty_uids": empty_uids,
         "empty": empty,
         "skipped": skipped,
         "errors": errors,
@@ -1281,8 +1299,8 @@ def crawl_latest_per_user(s: LocketSession, uids: List[str],
     }
 
 
-_FS_HISTORY: Dict[str, Any] = {"state": None, "error": None}
 _FS_RUNQUERY_URL = "https://firestore.googleapis.com/v1/projects/locket-4252a/databases/(default)/documents:runQuery"
+_HIST: Dict[str, Any] = {"method": None, "tried": {}, "none_at": 0.0}
 
 
 def fetch_user_history_firestore(s: LocketSession, uid: str, limit: int = FEED_HISTORY_PER_USER,
@@ -1315,33 +1333,101 @@ def fetch_user_history_firestore(s: LocketSession, uid: str, limit: int = FEED_H
     return out
 
 
-def collect_firestore_history(s: LocketSession, uids: List[str], probe_uid: str) -> List[Dict[str, Any]]:
-    if not FEED_FIRESTORE_HISTORY or _FS_HISTORY["state"] in ("denied", "empty"):
-        return []
-    collected: List[Dict[str, Any]] = []
-    if _FS_HISTORY["state"] is None:
-        try:
-            collected = fetch_user_history_firestore(s, probe_uid)
-        except Exception as e:
-            _FS_HISTORY.update(state="denied", error=str(e)[:200])
-            logger.info("firestore moment history unavailable: %s", e)
-            return []
-        _FS_HISTORY["state"] = "ok" if collected else "empty"
-        if not collected:
-            return []
-    todo = [u for u in uids if u and u != probe_uid]
+def _excluding(targets: List[str], uid: str) -> List[str]:
+    return [u for u in targets if u and u != uid]
 
-    def work(uid: str) -> List[Dict[str, Any]]:
-        try:
-            return fetch_user_history_firestore(s, uid)
-        except Exception as e:
-            logger.debug("firestore history %s failed: %s", uid[:8], e)
-            return []
 
-    with ThreadPoolExecutor(max_workers=FEED_CRAWL_WORKERS) as pool:
-        for part in pool.map(work, todo):
-            collected.extend(part)
-    return collected
+def fetch_older_via_sync(s: LocketSession, uid: str, targets: List[str], after_id: str,
+                          timeout: int = 15) -> List[Dict[str, Any]]:
+    raw, _ = _official_feed_page(s, after_id, _excluding(targets, uid), quiet=True, timeout=timeout)
+    out: List[Dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict) or _moment_author(entry) != uid:
+            continue
+        moment = _feed_entry_to_moment(entry)
+        if moment is not None:
+            out.append(moment)
+    return out
+
+
+def detect_history_method(s: LocketSession, candidates: List[Tuple[str, str]],
+                           targets: List[str]) -> str:
+    method = _HIST["method"]
+    if method in ("sync", "firestore"):
+        return method
+    if method == "none" and time.time() - _HIST["none_at"] < 1800:
+        return "none"
+    tried: Dict[str, Any] = {}
+    found = "none"
+    for uid, latest_id in candidates[:3]:
+        try:
+            older = [m for m in fetch_older_via_sync(s, uid, targets, latest_id) if _moment_id(m) != latest_id]
+            tried["sync"] = len(older)
+            if older:
+                found = "sync"
+                break
+        except Exception as e:
+            tried["sync"] = "error: " + str(e)[:120]
+        if FEED_FIRESTORE_HISTORY:
+            try:
+                docs = fetch_user_history_firestore(s, uid)
+                extra = {_moment_id(m) for m in docs} - {latest_id}
+                tried["firestore"] = len(extra)
+                if extra:
+                    found = "firestore"
+                    break
+            except Exception as e:
+                tried["firestore"] = "error: " + str(e)[:120]
+    _HIST.update(method=found, tried=tried, none_at=time.time())
+    logger.info("history method detected: %s %s", found, tried)
+    return found
+
+
+def fetch_history_page(s: LocketSession, page_token: Optional[str] = None,
+                        page_size: int = FEED_HISTORY_PAGE, timeout: int = 20
+                        ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    url = (f"https://firestore.googleapis.com/v1/projects/locket-4252a/databases/"
+           f"{FEED_HISTORY_DB}/documents/history/{s.local_id}/entries")
+    params: Dict[str, Any] = {"orderBy": "date desc", "pageSize": page_size}
+    if page_token:
+        params["pageToken"] = page_token
+    refreshed = False
+    r = None
+    for attempt in range(LOCKET_READ_RETRIES + 1):
+        headers = {
+            "Authorization": f"Bearer {s.id_token}",
+            "Accept": "application/json",
+            "User-Agent": FIREBASE_AUTH_UA,
+            "X-Ios-Bundle-Identifier": IOS_BUNDLE,
+        }
+        r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        if r.status_code == 401 and not refreshed:
+            refreshed = True
+            if refresh_id_token(s):
+                continue
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < LOCKET_READ_RETRIES:
+            time.sleep(0.5 * (attempt + 1))
+            continue
+        break
+    if r is None or r.status_code >= 400:
+        code = r.status_code if r is not None else "n/a"
+        body = r.text[:160] if r is not None else ""
+        raise LocketError(f"history list HTTP {code}: {body}")
+    data = r.json()
+    out: List[Dict[str, Any]] = []
+    for doc in data.get("documents") or []:
+        if not isinstance(doc, dict):
+            continue
+        flat = flatten_firestore(doc)
+        if not isinstance(flat, dict):
+            continue
+        name = str(doc.get("name") or "")
+        if name and not flat.get("canonical_uid"):
+            flat["canonical_uid"] = name.rsplit("/", 1)[-1]
+        moment = _feed_entry_to_moment(flat)
+        if moment is not None:
+            out.append(moment)
+    return out, data.get("nextPageToken") or None
 
 
 def get_moments_http(s: LocketSession, page_token=None, client_target: str = "all",
@@ -1652,26 +1738,28 @@ def _history_path(local_id: str) -> str:
     return os.path.join(FEED_HISTORY_DIR, f"locket_feed_{safe}.json")
 
 
-def _history_load(local_id: str) -> List[Dict[str, Any]]:
+def _history_load(local_id: str) -> Tuple[List[Dict[str, Any]], set]:
     try:
         with open(_history_path(local_id), encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        return []
-    items = [m for m in data if isinstance(m, dict)
+        return [], set()
+    raw_items = data.get("items") if isinstance(data, dict) else data
+    done = set(data.get("done") or []) if isinstance(data, dict) else set()
+    items = [m for m in raw_items or [] if isinstance(m, dict)
              and m.get("source") == "official"
              and (m.get("thumbnail_url") or m.get("video_url"))]
     items.sort(key=_moment_timestamp, reverse=True)
-    return items[:FEED_MAX_ITEMS]
+    return items[:FEED_MAX_ITEMS], done
 
 
-def _history_save(local_id: str, items: List[Dict[str, Any]]) -> None:
+def _history_save(local_id: str, items: List[Dict[str, Any]], done: set) -> None:
     keep = [m for m in items if m.get("source") == "official"][:FEED_MAX_ITEMS]
     path = _history_path(local_id)
     try:
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(keep, f, ensure_ascii=False)
+            json.dump({"items": keep, "done": sorted(done)}, f, ensure_ascii=False)
         os.replace(tmp, path)
     except Exception as e:
         logger.debug("history save skipped: %s", e)
@@ -1681,8 +1769,11 @@ def _ensure_moments_state(local_id: str) -> Dict[str, Any]:
     with _MOMENTS_LOCK:
         st = _MOMENTS_CACHE.get(local_id)
         if st is None:
+            saved_items, saved_done = _history_load(local_id)
             st = {
-                "items": _history_load(local_id),
+                "items": saved_items,
+                "done_uids": saved_done,
+                "window": FEED_WINDOW_START,
                 "lock": threading.Lock(),
                 "stop": threading.Event(),
                 "thread": None,
@@ -1698,6 +1789,10 @@ def _ensure_moments_state(local_id: str) -> Dict[str, Any]:
                 "uids": [],
                 "uids_at": 0.0,
                 "sync_token": None,
+                "hist_ok": None,
+                "hist_fail_at": 0.0,
+                "hist_next": None,
+                "hist_started": False,
             }
             if st["items"]:
                 st["source"] = "official"
@@ -1764,6 +1859,8 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
     warnings: List[str] = []
     diag: Dict[str, Any] = {"at": now, "header_profile": _LOCKET_HEADER_PROFILE["name"]}
     crawled: List[Dict[str, Any]] = []
+    history_items: List[Dict[str, Any]] = []
+    empty_uids: set = set()
     crawl_ok = False
     fallback: List[Dict[str, Any]] = []
 
@@ -1773,9 +1870,33 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
             known_ids = {_moment_id(m) for m in st["items"]}
             token = st["sync_token"]
             have_items = bool(st["items"])
+        with st["lock"]:
+            hist_ok = st["hist_ok"]
+            hist_failed_recently = now - st["hist_fail_at"] < FEED_HISTORY_RETRY_SEC
+        if FEED_USE_HISTORY and not (hist_ok is False and hist_failed_recently):
+            try:
+                page, nxt = fetch_history_page(s, None, FEED_HISTORY_PAGE)
+                history_items = page
+                with st["lock"]:
+                    st["hist_ok"] = True
+                    if not st["hist_started"]:
+                        st["hist_next"] = nxt
+                        st["hist_started"] = True
+                diag["history"] = "ok"
+                diag["history_page"] = len(page)
+                diag["self_in_history"] = any(_moment_author(m) == s.local_id for m in page)
+            except Exception as e:
+                history_items = []
+                with st["lock"]:
+                    st["hist_ok"] = False
+                    st["hist_fail_at"] = time.time()
+                diag["history"] = "failed"
+                diag["history_error"] = str(e)[:200]
+                warnings.append(f"Firestore history unavailable, using per-friend fallback: {str(e)[:120]}")
         age = now - last_crawl if last_crawl else None
-        need_crawl = (not have_items) or age is None or age > FEED_RECRAWL_SEC
-        if not need_crawl and age > FEED_PRECHECK_MIN_SEC:
+        use_history = bool(history_items) or diag.get("history") == "ok"
+        need_crawl = (not use_history) and ((not have_items) or age is None or age > FEED_RECRAWL_SEC)
+        if not use_history and not need_crawl and age > FEED_PRECHECK_MIN_SEC:
             try:
                 raw, _ = _official_feed_page(s, token, [], quiet=True, timeout=15)
                 newer = [e for e in raw if isinstance(e, dict) and _moment_id(e) not in known_ids]
@@ -1804,16 +1925,7 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
                 warnings.append(
                     f"{len(result['errors'])} of {result['targets']} official lookups failed: {result['errors'][0][:120]}")
             crawl_ok = bool(crawled) or not result["errors"]
-            if crawled:
-                newest = max(crawled, key=_moment_timestamp)
-                diag["history_probe_uid"] = _moment_author(newest)
-                history = collect_firestore_history(
-                    s, [u for u in uids + [s.local_id] if u], _moment_author(newest))
-                crawled = crawled + history
-                diag["history_found"] = len(history)
-            diag["history_mode"] = _FS_HISTORY["state"]
-            if _FS_HISTORY["error"]:
-                diag["history_error"] = _FS_HISTORY["error"]
+            empty_uids = set(result["empty_uids"])
             if not crawled and result["errors"]:
                 with st["lock"]:
                     have_official = any(m.get("source") == "official" for m in st["items"])
@@ -1831,6 +1943,10 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
         st["last_fetch_at"] = time.time()
         st["warnings"] = warnings
         st["diag"] = {**st.get("diag", {}), **diag}
+        st["done_uids"] |= empty_uids
+        if history_items:
+            crawled = history_items
+            crawl_ok = True
         if crawled:
             kept = [m for m in st["items"] if m.get("source") != "binhake"]
             st["items"] = _merge_moments(kept, crawled)[:FEED_MAX_ITEMS]
@@ -1848,8 +1964,171 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
         out = list(st["items"])
         changed = after_ids != before_ids
     if changed:
-        _history_save(s.local_id, out)
+        _history_save(s.local_id, out, st["done_uids"])
     return out
+
+
+def _author_stats(items: List[Dict[str, Any]]) -> Dict[str, Tuple[int, float, str]]:
+    stats: Dict[str, Tuple[int, float, str]] = {}
+    for m in items:
+        uid = _moment_author(m)
+        if not uid:
+            continue
+        ts = _moment_timestamp(m)
+        count, oldest_ts, oldest_id = stats.get(uid, (0, float("inf"), ""))
+        if ts < oldest_ts:
+            oldest_ts, oldest_id = ts, _moment_id(m)
+        stats[uid] = (count + 1, oldest_ts, oldest_id)
+    return stats
+
+
+def _needy_friends(st: Dict[str, Any]) -> List[Tuple[str, str, float]]:
+    items = sorted(st["items"], key=_moment_timestamp, reverse=True)
+    window = st["window"]
+    cut = _moment_timestamp(items[window - 1]) if len(items) >= window else 0.0
+    needy = []
+    for uid, (count, oldest_ts, oldest_id) in _author_stats(items).items():
+        if uid in st["done_uids"] or count >= FEED_PER_FRIEND or oldest_ts <= cut:
+            continue
+        needy.append((uid, oldest_id, oldest_ts))
+    needy.sort(key=lambda x: x[2], reverse=True)
+    return needy
+
+
+def feed_has_more(st: Dict[str, Any]) -> bool:
+    with st["lock"]:
+        if st["hist_ok"]:
+            return bool(st["hist_next"]) or len(_apply_cap(st["items"])) > st["window"]
+        if len(st["items"]) > st["window"]:
+            return True
+        if _HIST["method"] == "none":
+            return False
+        stats = _author_stats(st["items"])
+        return any(uid not in st["done_uids"] and count < FEED_PER_FRIEND
+                   for uid, (count, _, _) in stats.items())
+
+
+def deepen_feed(s: LocketSession, st: Dict[str, Any], budget: float = FEED_DEEPEN_BUDGET_SEC
+                ) -> Dict[str, Any]:
+    with st["lock"]:
+        use_history = bool(st["hist_ok"])
+    if use_history:
+        return deepen_history(s, st, budget)
+    t0 = time.time()
+    rounds = added = 0
+    calls = 0
+    before_ids: set = set()
+    with st["lock"]:
+        before_ids = {_moment_id(m) for m in st["items"]}
+        targets = list(st["uids"]) + [s.local_id]
+    while rounds < FEED_MAX_ROUNDS and time.time() - t0 < budget:
+        with st["lock"]:
+            needy = _needy_friends(st)
+        if not needy:
+            break
+        method = detect_history_method(s, [(u, i) for u, i, _ in needy], targets)
+        if method == "none":
+            break
+        rounds += 1
+
+        def work(entry: Tuple[str, str, float]):
+            uid, oldest_id, _ = entry
+            if time.time() - t0 > budget:
+                return uid, None
+            try:
+                if method == "firestore":
+                    return uid, fetch_user_history_firestore(s, uid, FEED_PER_FRIEND)
+                return uid, fetch_older_via_sync(s, uid, targets, oldest_id)
+            except Exception as e:
+                logger.debug("deepen %s failed: %s", uid[:8], e)
+                return uid, []
+
+        results: List[Tuple[str, Optional[List[Dict[str, Any]]]]] = []
+        with ThreadPoolExecutor(max_workers=FEED_CRAWL_WORKERS) as pool:
+            results = list(pool.map(work, needy))
+        calls += len(needy)
+        gained: List[Dict[str, Any]] = []
+        with st["lock"]:
+            known = {_moment_id(m) for m in st["items"]}
+            for uid, got in results:
+                if got is None:
+                    continue
+                fresh = [m for m in got if _moment_id(m) not in known]
+                if not fresh or method == "firestore":
+                    st["done_uids"].add(uid)
+                gained.extend(fresh)
+            if gained:
+                st["items"] = _merge_moments(st["items"], gained)[:FEED_MAX_ITEMS]
+        added += len(gained)
+        if not gained and method == "sync":
+            continue
+    with st["lock"]:
+        after_ids = {_moment_id(m) for m in st["items"]}
+        changed = after_ids != before_ids
+        if changed:
+            st["updated_at"] = time.time()
+        out = list(st["items"])
+        done = set(st["done_uids"])
+        st["diag"] = {**st["diag"], "history_method": _HIST["method"], "history_tried": dict(_HIST["tried"]),
+                      "deepen_rounds": rounds, "deepen_calls": calls, "deepen_added": added,
+                      "deepen_ms": int((time.time() - t0) * 1000), "window": st["window"],
+                      "items_total": len(st["items"])}
+    if changed:
+        _history_save(s.local_id, out, done)
+    return {"rounds": rounds, "added": added, "calls": calls}
+
+
+def _apply_cap(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ordered = sorted(items, key=_moment_timestamp, reverse=True)
+    if FEED_PER_FRIEND <= 0:
+        return ordered
+    seen: Dict[str, int] = {}
+    out: List[Dict[str, Any]] = []
+    for m in ordered:
+        uid = _moment_author(m)
+        seen[uid] = seen.get(uid, 0) + 1
+        if seen[uid] <= FEED_PER_FRIEND:
+            out.append(m)
+    return out
+
+
+def moments_window(st: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return _apply_cap(items)[:st["window"]]
+
+
+def deepen_history(s: LocketSession, st: Dict[str, Any], budget: float) -> Dict[str, Any]:
+    t0 = time.time()
+    rounds = added = 0
+    error: Optional[str] = None
+    while rounds < FEED_MAX_ROUNDS and time.time() - t0 < budget:
+        with st["lock"]:
+            token = st["hist_next"]
+            enough = len(_apply_cap(st["items"])) >= st["window"]
+        if enough or not token:
+            break
+        try:
+            page, nxt = fetch_history_page(s, token, FEED_HISTORY_PAGE_MORE)
+        except Exception as e:
+            error = str(e)[:200]
+            break
+        rounds += 1
+        with st["lock"]:
+            st["hist_next"] = nxt
+            before = len(st["items"])
+            st["items"] = _merge_moments(st["items"], page)[:FEED_MAX_ITEMS]
+            added += len(st["items"]) - before
+    with st["lock"]:
+        if added:
+            st["updated_at"] = time.time()
+        out = list(st["items"])
+        done = set(st["done_uids"])
+        st["diag"] = {**st["diag"], "history_rounds": rounds, "history_added": added,
+                      "history_more_error": error, "history_has_next": bool(st["hist_next"]),
+                      "deepen_ms": int((time.time() - t0) * 1000), "window": st["window"],
+                      "items_total": len(st["items"])}
+    if added:
+        _history_save(s.local_id, out, done)
+    return {"rounds": rounds, "added": added, "calls": rounds}
 
 
 def get_moments_cached(s: LocketSession, force: bool = False) -> List[Dict[str, Any]]:
@@ -4442,7 +4721,7 @@ function bindMomentsScroll(){
     const tryLoadMore=function(){
       if(_momentsBootLock) return;
       const items=window._momentItems||[];
-      if(momentsRendered>=items.length) return;
+      if(momentsRendered>=items.length){ fetchMoreMoments(false); return; }
       appendMomentsBatch();
     };
     if(window.IntersectionObserver){
@@ -4626,6 +4905,42 @@ function notifyMomentsWarning(d){
   }catch(e){}
 }
 
+
+var _momentsMoreBusy=false, _momentsHasMore=true, _momentsAutoRounds=2;
+function momentTs(m){ return (m&&(m.timestamp||(m.date&&m.date._seconds)))||0; }
+function fetchMoreMoments(auto){
+  if(_momentsMoreBusy||!_momentsHasMore) return;
+  _momentsMoreBusy=true;
+  var have=(window._momentItems||[]).length;
+  apiTimeout('/api/moments/more?have='+have, null, 45000).then(function(d){
+    _momentsMoreBusy=false;
+    if(!d||!d.ok) return;
+    _momentsHasMore=d.has_more!==false;
+    var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
+    var cur=window._momentItems||[];
+    if(items.length<=cur.length) return;
+    momentsCache=items;
+    momentsUpdatedAt=d.updated_at||momentsUpdatedAt;
+    writeMomentsLocal(items, momentsUpdatedAt);
+    var scroller=momentsScrollEl();
+    var top=(scroller&&scroller.scrollTop)||window.pageYOffset||0;
+    if(top<250){
+      renderMomentsUI(items, true);
+    } else {
+      var lastTs=cur.length?momentTs(cur[cur.length-1]):0;
+      var seen={};
+      cur.forEach(function(m){ seen[momentKey(m)]=1; });
+      var older=items.filter(function(m){ return momentTs(m)<lastTs && !seen[momentKey(m)]; });
+      window._momentItems=cur.concat(older);
+      appendMomentsBatch();
+    }
+    if(auto && _momentsAutoRounds>0 && _momentsHasMore){
+      _momentsAutoRounds--;
+      setTimeout(function(){ fetchMoreMoments(true); }, 300);
+    }
+  }).catch(function(){ _momentsMoreBusy=false; });
+}
+
 function loadMoments(force){
   // 1) Always try to show something immediately
   var painted = ensureMomentsFromCache();
@@ -4675,6 +4990,9 @@ function loadMoments(force){
     notifyMomentsWarning(d);
     var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
     applyMomentsNetworkResult(items, d.updated_at, true);
+    _momentsHasMore=d.has_more!==false;
+    _momentsAutoRounds=2;
+    setTimeout(function(){ fetchMoreMoments(true); }, 500);
     if(queued) loadMoments(true);
   }).catch(function(err){
     _momentsFetchInFlight = false;
@@ -6311,9 +6629,10 @@ def api_moments():
     try:
         s = ensure_fresh_token(s)
         force = request.args.get("force") == "1"
-        items = _enrich_moments(s, get_moments_cached(s, force=force))
-        st = _MOMENTS_CACHE.get(s.local_id) or {}
+        st = _ensure_moments_state(s.local_id)
+        items = _enrich_moments(s, moments_window(st, get_moments_cached(s, force=force)))
         return jsonify({
+            "has_more": feed_has_more(st),
             "ok": True,
             "moments": items,
             "count": len(items),
@@ -6329,6 +6648,38 @@ def api_moments():
         return jsonify({"ok": False, "error": str(e)})
 
 
+@app.route("/api/moments/more")
+def api_moments_more():
+    s = get_session()
+    if not s:
+        return jsonify({"ok": False, "error": "Not logged in"})
+    try:
+        s = ensure_fresh_token(s)
+        st = _ensure_moments_state(s.local_id)
+        have = int(request.args.get("have") or 0)
+        with st["lock"]:
+            st["window"] = max(st["window"], have + FEED_WINDOW_STEP)
+            empty = not st["items"]
+        if empty:
+            get_moments_cached(s, force=True)
+        deepen_feed(s, st)
+        with st["lock"]:
+            items = moments_window(st, st["items"])
+            updated = st.get("updated_at") or time.time()
+        items = _enrich_moments(s, items)
+        return jsonify({
+            "ok": True,
+            "moments": items,
+            "count": len(items),
+            "updated_at": updated,
+            "has_more": feed_has_more(st),
+            "diag": dict(st.get("diag") or {}),
+        })
+    except Exception as e:
+        logger.error("MOMENTS MORE error: %s", e)
+        return jsonify({"ok": False, "error": str(e)})
+
+
 @app.route("/api/moments/poll")
 def api_moments_poll():
     """Lightweight live poll — returns full list only when cache was updated after `since`."""
@@ -6339,8 +6690,8 @@ def api_moments_poll():
         s = ensure_fresh_token(s)
         since = float(request.args.get("since") or 0)
         items, updated = poll_new_moments(s, since=since)
-        items = _enrich_moments(s, items)
-        st = _MOMENTS_CACHE.get(s.local_id) or {}
+        st = _ensure_moments_state(s.local_id)
+        items = _enrich_moments(s, moments_window(st, items))
         return jsonify({
             "ok": True,
             "moments": items,
