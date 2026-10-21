@@ -193,8 +193,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "2.2"
-APP_BUILD = "2026.10.20.2"
+APP_VERSION = "2.3"
+APP_BUILD = "2026.10.21"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -1147,7 +1147,9 @@ def _locket_http_post(url: str, headers: Dict[str, str], raw: bytes, timeout: in
 
 
 def _locket_post_api(s: LocketSession, endpoint: str, payload: Optional[Dict[str, Any]] = None,
-                      timeout: int = 25, quiet: bool = False) -> Dict[str, Any]:
+                      timeout: int = 25, quiet: bool = False, retries: Optional[int] = None
+                      ) -> Dict[str, Any]:
+    max_retries = LOCKET_READ_RETRIES if retries is None else retries
     url = f"{LOCKET_API}/{endpoint}"
     body = {"data": {**(payload or {}), "analytics": _locket_read_analytics(s)}}
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -1161,7 +1163,7 @@ def _locket_post_api(s: LocketSession, endpoint: str, payload: Optional[Dict[str
     t0 = time.time()
     for profile in order:
         used = profile
-        for attempt in range(LOCKET_READ_RETRIES + 1):
+        for attempt in range(max_retries + 1):
             status, text, error = _locket_http_post(url, _locket_read_headers(s, profile), raw, timeout)
             if status == 401 and not refreshed:
                 refreshed = True
@@ -1169,7 +1171,7 @@ def _locket_post_api(s: LocketSession, endpoint: str, payload: Optional[Dict[str
                     continue
                 break
             transient = status is None or status in (429, 500, 502, 503, 504)
-            if transient and attempt < LOCKET_READ_RETRIES:
+            if transient and attempt < max_retries:
                 time.sleep(0.5 * (attempt + 1))
                 continue
             break
@@ -2856,6 +2858,26 @@ body{
 .friend-row{display:flex;align-items:center;padding:12px 0;border-bottom:1px solid var(--border)}
 .friend-row:last-child{border-bottom:none}
 .friend-row .avatar-wrap{margin-right:14px}
+.people-search{display:flex;margin:0 0 12px}
+.people-search .input{flex:1 1 auto;min-width:0}
+.people-go{width:48px;flex:0 0 48px;margin-left:8px;padding:0;display:flex;align-items:center;justify-content:center;font-size:18px}
+.people-msg{font-size:13px;color:var(--text2);padding:10px 4px}
+.person-card{display:flex;align-items:center;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--border)}
+.person-card .avatar-wrap{margin-right:12px;flex:0 0 auto}
+.person-info{flex:1 1 120px;min-width:0}
+.person-name{font-weight:800;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.person-user{font-size:12px;color:var(--text2)}
+.person-actions{flex:0 0 auto;display:flex;flex-direction:column;align-items:flex-end;margin-left:8px}
+.p-btn{border:none;border-radius:500px;padding:9px 16px;font-family:inherit;font-weight:800;font-size:13px;cursor:pointer;background:var(--accent);color:rgba(0,0,0,.85)}
+.p-btn.ghost{background:rgba(255,255,255,.1);color:var(--text)}
+.p-btn:disabled{opacity:.5}
+.p-row{display:flex;margin-top:6px}
+.p-row .p-btn + .p-btn{margin-left:6px}
+.p-share{font-size:12px;color:var(--text2);display:flex;align-items:center}
+.p-share input{margin-right:6px}
+.p-tag{font-size:12px;font-weight:800;color:var(--text2);padding:8px 4px}
+.req-head{font-size:13px;font-weight:800;color:var(--text2);margin:14px 0 2px}
+.req-head b{color:var(--accent)}
 .friend-info{min-width:0;flex:1}
 .friend-name{font-weight:800;font-size:16.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .friend-user{font-size:13px;color:var(--text2);font-weight:600;margin-top:2px}
@@ -3333,6 +3355,12 @@ body{
 
   <div class="page" id="page-friends">
     <h2 style="margin:0 0 4px;font-size:20px;font-weight:800">Bạn bè</h2>
+    <div class="people-search">
+      <input class="input" id="peopleQuery" type="text" placeholder="Find @username, invite link or UID" autocapitalize="off" autocorrect="off" autocomplete="off" onkeydown="if(event.key==='Enter'){searchPeople();return false}">
+      <button type="button" class="btn people-go" onclick="searchPeople();return false;" aria-label="Search"><i class="bi bi-search"></i></button>
+    </div>
+    <div id="peopleResult"></div>
+    <div id="peopleRequests"></div>
     <div class="friends-count" id="friendsCountLine">Đang tải...</div>
     <div id="friendsList"></div>
     <div class="friends-empty hidden" id="friendsEmpty">
@@ -4154,7 +4182,7 @@ function showPage(name){
     stopMomentsPoll();
     if(name !== 'friends') hideProgress(0);
   }
-  if(name==='friends') loadFriends();
+  if(name==='friends'){ loadFriends(); loadPeopleRequests(); }
   if(name==='upload'){
     if(isLiveCamera() && !croppedBlob){
       $('previewBox').classList.add('hidden');
@@ -4343,6 +4371,74 @@ function preloadFriends(){
   const need=!(local && (Date.now()-(local.ts||0)<FRIENDS_TTL_MS));
   if(need) loadFriends(false);
 }
+function peoplePost(path, body){
+  return apiTimeout(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},25000);
+}
+function personButtons(u,rel){
+  var uid=esc(u.uid||'');
+  if(rel==='self') return '<span class="p-tag">You</span>';
+  if(rel==='friend') return '<span class="p-tag">'+(u.celebrity?'Following':'Friends')+'</span>';
+  if(rel==='outgoing') return '<button type="button" class="p-btn ghost p-act" data-act="decline" data-dir="outgoing" data-uid="'+uid+'">Requested · Cancel</button>';
+  if(rel==='incoming') return '<label class="p-share"><input type="checkbox" class="p-share-cb"> Share my history</label><div class="p-row"><button type="button" class="p-btn p-act" data-act="accept" data-uid="'+uid+'">Accept</button><button type="button" class="p-btn ghost p-act" data-act="decline" data-dir="incoming" data-uid="'+uid+'">Decline</button></div>';
+  return '<button type="button" class="p-btn p-act" data-act="add" data-uid="'+uid+'">'+(u.celebrity?'Follow':'Add friend')+'</button>';
+}
+function personCard(u,rel){
+  var name=((u.first_name||'')+' '+(u.last_name||'')).trim()||u.username||u.uid||'';
+  return '<div class="person-card" data-uid="'+esc(u.uid||'')+'">'+renderAvatar(u,48)+'<div class="person-info"><div class="person-name">'+esc(name)+'</div><div class="person-user">@'+esc(u.username||u.uid||'')+(u.celebrity?' · Celebrity':'')+'</div></div><div class="person-actions">'+personButtons(u,rel)+'</div></div>';
+}
+function searchPeople(){
+  var q=(($('peopleQuery')||{}).value||'').trim();
+  if(!q) return;
+  var box=$('peopleResult');
+  box.innerHTML='<div class="skeleton" style="height:68px"></div>';
+  apiTimeout('/api/people/search?q='+encodeURIComponent(q),null,25000).then(function(d){
+    if(!d.ok){ box.innerHTML='<div class="people-msg">'+esc(d.error||'Not found')+'</div>'; return; }
+    box.innerHTML=personCard(d.user,d.relation);
+  }).catch(function(){ box.innerHTML='<div class="people-msg">Network error</div>'; });
+}
+function loadPeopleRequests(){
+  var box=$('peopleRequests');
+  if(!box) return;
+  apiTimeout('/api/people/requests',null,25000).then(function(d){
+    if(!d.ok){ box.innerHTML=''; return; }
+    var inc=d.incoming||[], out=d.outgoing||[], h='';
+    if(inc.length) h+='<div class="req-head">Friend requests <b>'+inc.length+'</b></div>'+inc.map(function(u){return personCard(u,'incoming')}).join('');
+    if(out.length) h+='<div class="req-head">Sent <b>'+out.length+'</b></div>'+out.map(function(u){return personCard(u,'outgoing')}).join('');
+    box.innerHTML=h;
+  }).catch(function(){});
+}
+function personAfter(refreshFriends){
+  loadPeopleRequests();
+  if(refreshFriends) loadFriends(true);
+  var q=(($('peopleQuery')||{}).value||'').trim();
+  if(q && $('peopleResult') && $('peopleResult').innerHTML) searchPeople();
+}
+document.addEventListener('click',function(ev){
+  var b=ev.target&&ev.target.closest?ev.target.closest('.p-act'):null;
+  if(!b||b.disabled) return;
+  var uid=b.getAttribute('data-uid'), act=b.getAttribute('data-act');
+  b.disabled=true;
+  var done=function(d,okMsg,refresh){
+    b.disabled=false;
+    if(!d||!d.ok){ toast((d&&d.error)||'Request failed'); return; }
+    toast(okMsg); personAfter(refresh);
+  };
+  var fail=function(){ b.disabled=false; toast('Network error'); };
+  if(act==='add'){
+    peoplePost('/api/people/add',{uid:uid}).then(function(d){
+      done(d,(d&&d.kind==='follow')?'Follow request sent':'Friend request sent',false);
+    }).catch(fail);
+  }else if(act==='accept'){
+    var card=b.closest('.person-card'), cb=card?card.querySelector('.p-share-cb'):null;
+    peoplePost('/api/people/accept',{uid:uid,share_history:!!(cb&&cb.checked)}).then(function(d){
+      done(d,(d&&d.share_history)?'Accepted, history shared':'Accepted',true);
+    }).catch(fail);
+  }else if(act==='decline'){
+    peoplePost('/api/people/decline',{uid:uid,direction:b.getAttribute('data-dir')||'incoming'}).then(function(d){
+      done(d,'Request removed',false);
+    }).catch(fail);
+  }
+});
 function renderFriendBatch(container,friends,start,batch){
   const end=Math.min(start+batch,friends.length);
   var frag=document.createDocumentFragment();
@@ -6605,6 +6701,221 @@ def api_me():
     except Exception as e:
         logger.error("ME error: %s", e)
         return jsonify({"ok": False, "error": str(e)})
+
+
+_UID_RE = re.compile(r"^[A-Za-z0-9]{28}$")
+
+
+def _fs_list_uids(s: LocketSession, collection: str, timeout: int = 20) -> List[str]:
+    url = (f"https://firestore.googleapis.com/v1/projects/locket-4252a/databases/(default)/"
+           f"documents/users/{s.local_id}/{collection}?pageSize=300")
+    headers = {"Authorization": f"Bearer {s.id_token}", "Accept": "application/json",
+               "User-Agent": "okhttp/4.12.0"}
+    r = requests.get(url, headers=headers, timeout=timeout)
+    if r.status_code in (403, 404):
+        return []
+    r.raise_for_status()
+    uids: List[str] = []
+    for doc in (r.json() or {}).get("documents") or []:
+        name = str(doc.get("name") or "")
+        uid = name.rsplit("/", 1)[-1]
+        if uid and uid not in uids:
+            uids.append(uid)
+    return uids
+
+
+def _invite_token_for_username(username: str) -> Optional[str]:
+    r = requests.get(f"https://locket.cam/{username}", timeout=12,
+                     headers={"User-Agent": "com.locket.Locket/2.68.0 iPhone/27.0"})
+    for pattern in (r"locket\.camera%2Finvites%2F([A-Za-z0-9]+)", r"locket\.camera/invites/([A-Za-z0-9]+)"):
+        m = re.search(pattern, r.text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def resolve_person(s: LocketSession, query: str) -> Dict[str, Any]:
+    q = (query or "").strip()
+    if not q:
+        raise LocketError("Enter a username, invite link or UID")
+    token: Optional[str] = None
+    m = re.search(r"locket\.camera(?:%2F|/)invites(?:%2F|/)([A-Za-z0-9]+)", q)
+    if m:
+        token = m.group(1)
+    else:
+        m = re.search(r"locket\.cam/([A-Za-z0-9_.\-]+)", q)
+        handle = (m.group(1) if m else q).lstrip("@").strip()
+        if _UID_RE.match(handle):
+            try:
+                profile, _ = fetch_user_v2(s, handle)
+                if profile.get("uid"):
+                    return profile
+            except Exception as e:
+                logger.debug("uid lookup failed, trying username: %s", e)
+        token = _invite_token_for_username(handle)
+    if not token:
+        raise LocketError(f"No Locket user found for '{q}'")
+    res = _locket_post_api(s, "fetchUserForInviteToken", {"invite_token": token}, timeout=20, quiet=True)
+    data = res.get("data", res) if isinstance(res, dict) else {}
+    user = data.get("user") if isinstance(data, dict) and isinstance(data.get("user"), dict) else data
+    profile = _normalize_user(user if isinstance(user, dict) else {})
+    if not profile.get("uid"):
+        raise LocketError(f"No Locket user found for '{q}'")
+    return profile
+
+
+def _relationship(s: LocketSession, uid: str) -> str:
+    if uid == s.local_id:
+        return "self"
+    friends, incoming, outgoing = set(), set(), set()
+    try:
+        friends = set(list_friend_uids_firestore(s)[0])
+    except Exception as e:
+        logger.debug("relationship friends failed: %s", e)
+    if uid in friends:
+        return "friend"
+    for name, target in (("incoming_friend_requests", incoming), ("outgoing_friend_requests", outgoing)):
+        try:
+            target.update(_fs_list_uids(s, name))
+        except Exception as e:
+            logger.debug("relationship %s failed: %s", name, e)
+    if uid in incoming:
+        return "incoming"
+    if uid in outgoing:
+        return "outgoing"
+    return "none"
+
+
+def list_friend_requests(s: LocketSession) -> Dict[str, List[Dict[str, Any]]]:
+    result: Dict[str, List[Dict[str, Any]]] = {"incoming": [], "outgoing": []}
+    for key, collection in (("incoming", "incoming_friend_requests"), ("outgoing", "outgoing_friend_requests")):
+        try:
+            uids = _fs_list_uids(s, collection)[:60]
+        except Exception as e:
+            logger.warning("%s list failed: %s", collection, e)
+            continue
+
+        def load(uid: str) -> Dict[str, Any]:
+            try:
+                profile, _ = fetch_user_v2(s, uid)
+                profile["uid"] = profile.get("uid") or uid
+                return profile
+            except Exception:
+                return {"uid": uid}
+
+        if uids:
+            with ThreadPoolExecutor(max_workers=min(8, len(uids))) as pool:
+                result[key] = list(pool.map(load, uids))
+    return result
+
+
+def _invalidate_social_caches(s: LocketSession) -> None:
+    st = _profile_state(s.local_id)
+    with _PROFILE_LOCK:
+        st["friends_at"] = 0
+    moments = _MOMENTS_CACHE.get(s.local_id)
+    if moments:
+        with moments["lock"]:
+            moments["uids_at"] = 0.0
+            moments["last_crawl_at"] = 0.0
+
+
+def _write_api(s: LocketSession, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _locket_post_api(s, endpoint, payload, timeout=25, quiet=False, retries=0)
+
+
+def add_person(s: LocketSession, uid: str) -> Dict[str, Any]:
+    profile: Dict[str, Any] = {"uid": uid}
+    try:
+        profile, _ = fetch_user_v2(s, uid)
+        profile["uid"] = profile.get("uid") or uid
+    except Exception as e:
+        logger.debug("profile before add failed: %s", e)
+    payload = {
+        "user_uid": uid,
+        "source": "inviteCardPopup",
+        "platform": "iOS",
+        "create_ofr_for_temp_users": False,
+        "share_history_eligible": True,
+        "get_reengagement_status": False,
+        "prompted_reengagement": False,
+        "rollcall": False,
+        "invite_variant": {"value": "1002", "@type": "type.googleapis.com/google.protobuf.Int64Value"},
+    }
+    res = _write_api(s, "sendFriendRequest", payload)
+    _invalidate_social_caches(s)
+    return {"kind": "follow" if profile.get("celebrity") else "friend", "user": profile, "result": res}
+
+
+def accept_person(s: LocketSession, uid: str, share_history: bool) -> Dict[str, Any]:
+    payload = {
+        "user_uid": uid,
+        "during_signup": False,
+        "ios_version": f"{LOCKET_IOS_APP_VERSION}.{LOCKET_IOS_BUILD}",
+        "share_history": bool(share_history),
+    }
+    res = _write_api(s, "acceptFriendRequest", payload)
+    _invalidate_social_caches(s)
+    return {"uid": uid, "share_history": bool(share_history), "result": res}
+
+
+def decline_person(s: LocketSession, uid: str, direction: str) -> Dict[str, Any]:
+    direction = "outgoing" if direction == "outgoing" else "incoming"
+    res = _write_api(s, "deleteFriendRequest", {"user_uid": uid, "direction": direction})
+    _invalidate_social_caches(s)
+    return {"uid": uid, "direction": direction, "result": res}
+
+
+def _people_call(fn):
+    s = get_session()
+    if not s:
+        return jsonify({"ok": False, "error": "Not logged in"})
+    try:
+        s = ensure_fresh_token(s)
+        return jsonify({"ok": True, **fn(s)})
+    except Exception as e:
+        logger.error("PEOPLE error: %s", e)
+        return jsonify({"ok": False, "error": str(e)})
+
+
+def _uid_arg(data: Dict[str, Any]) -> str:
+    uid = str(data.get("uid") or "").strip()
+    if not _UID_RE.match(uid):
+        raise LocketError("Invalid user id")
+    return uid
+
+
+@app.route("/api/people/search")
+def api_people_search():
+    q = request.args.get("q", "")
+
+    def run(s):
+        profile = resolve_person(s, q)
+        return {"user": profile, "relation": _relationship(s, profile["uid"])}
+    return _people_call(run)
+
+
+@app.route("/api/people/requests")
+def api_people_requests():
+    return _people_call(lambda s: list_friend_requests(s))
+
+
+@app.route("/api/people/add", methods=["POST"])
+def api_people_add():
+    data = request.get_json(force=True) or {}
+    return _people_call(lambda s: add_person(s, _uid_arg(data)))
+
+
+@app.route("/api/people/accept", methods=["POST"])
+def api_people_accept():
+    data = request.get_json(force=True) or {}
+    return _people_call(lambda s: accept_person(s, _uid_arg(data), bool(data.get("share_history"))))
+
+
+@app.route("/api/people/decline", methods=["POST"])
+def api_people_decline():
+    data = request.get_json(force=True) or {}
+    return _people_call(lambda s: decline_person(s, _uid_arg(data), str(data.get("direction") or "incoming")))
 
 
 @app.route("/api/friends")
