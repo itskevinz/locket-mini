@@ -21,6 +21,7 @@ import threading
 import os
 import sys
 import re
+import base64
 import tempfile
 import time
 import uuid
@@ -178,6 +179,12 @@ FEED_HISTORY_PAGE = 60
 FEED_HISTORY_PAGE_MORE = 100
 FEED_HISTORY_RETRY_SEC = 600
 FIREBASE_AUTH_UA = "FirebaseAuth.iOS/10.23.1 com.locket.Locket/1.82.0 iPhone/18.0 hw/iPhone12_1"
+APPCHECK_PROVIDER_URL = os.environ.get("LOCKET_APPCHECK_PROVIDER_URL", "").strip()
+APPCHECK_PROVIDER_KEY = os.environ.get("LOCKET_APPCHECK_PROVIDER_KEY", "").strip()
+APPCHECK_PROVIDER_APP_VERSION = os.environ.get("LOCKET_APPCHECK_PROVIDER_APP_VERSION", "2.5.2").strip()
+APPCHECK_MIN_LEFT_SEC = 180
+APPCHECK_RETRY_SEC = 30
+FEED_DELETED_LIMIT = 60
 
 WEB_UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
@@ -193,8 +200,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "2.3"
-APP_BUILD = "2026.10.21"
+APP_VERSION = "2.5"
+APP_BUILD = "2026.10.22"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -525,6 +532,7 @@ def _normalize_user(u: Dict[str, Any]) -> Dict[str, Any]:
         "celebrity": bool(_first(u, "celebrity", "is_celebrity", default=False)),
         "badge": _first(u, "badge", "badge_type", default="") or "",
         "streak": _find_streak(u) or 0,
+        "celebrity_data": _norm_celeb_data(u.get("celebrity_data")),
     }
 
 
@@ -1089,6 +1097,87 @@ def _find_streak(obj, depth=0):
     return None
 
 
+_APPCHECK_TOKENS: Dict[str, str] = {}
+
+
+def _appcheck_for(s: LocketSession) -> str:
+    return _APPCHECK_TOKENS.get(s.local_id) or LOCKET_APPCHECK_TOKEN
+
+
+def _jwt_exp(token: str) -> float:
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(part)).get("exp") or 0)
+    except Exception:
+        return 0.0
+
+
+def set_appcheck_token(local_id: str, token: str) -> None:
+    if token:
+        _APPCHECK_TOKENS[local_id] = token
+    else:
+        _APPCHECK_TOKENS.pop(local_id, None)
+
+
+_APPCHECK_LOCK = threading.Lock()
+_APPCHECK_FAIL: Dict[str, float] = {}
+_APPCHECK_CLIENT_ID = str(uuid.uuid4())
+
+
+def appcheck_status(local_id: str) -> Dict[str, Any]:
+    provider = bool(APPCHECK_PROVIDER_URL and APPCHECK_PROVIDER_KEY)
+    token = _APPCHECK_TOKENS.get(local_id) or LOCKET_APPCHECK_TOKEN
+    if not token:
+        return {"has": False, "source": "none", "expired": False, "expires_in": None, "provider": provider}
+    exp = _jwt_exp(token)
+    left = int(exp - time.time()) if exp else None
+    return {"has": True, "source": "session" if local_id in _APPCHECK_TOKENS else "env",
+            "expired": bool(exp) and left is not None and left <= 0, "expires_in": left,
+            "provider": provider}
+
+
+def fetch_appcheck_from_provider(s: LocketSession, timeout: int = 20) -> str:
+    url = APPCHECK_PROVIDER_URL.rstrip("/") + "/config/app-check"
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "content-type": "application/json",
+        "authorization": f"Bearer {s.id_token}",
+        "active-key": APPCHECK_PROVIDER_KEY,
+        "app-version": APPCHECK_PROVIDER_APP_VERSION,
+        "client-unique-id": _APPCHECK_CLIENT_ID,
+        "User-Agent": "okhttp/4.12.0",
+    }
+    r = requests.post(url, json={"token": s.id_token}, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    token = str((data or {}).get("appCheckToken") or (data or {}).get("token") or "").strip()
+    if token.count(".") != 2:
+        raise LocketError("App Check provider returned no token")
+    return token
+
+
+def ensure_appcheck(s: LocketSession) -> Dict[str, Any]:
+    state = appcheck_status(s.local_id)
+    fresh = state["has"] and not state["expired"] and (
+        state["expires_in"] is None or state["expires_in"] > APPCHECK_MIN_LEFT_SEC)
+    if fresh or not (APPCHECK_PROVIDER_URL and APPCHECK_PROVIDER_KEY):
+        return state
+    with _APPCHECK_LOCK:
+        state = appcheck_status(s.local_id)
+        if state["has"] and not state["expired"] and (
+                state["expires_in"] is None or state["expires_in"] > APPCHECK_MIN_LEFT_SEC):
+            return state
+        if time.time() - _APPCHECK_FAIL.get(s.local_id, 0.0) < APPCHECK_RETRY_SEC:
+            return state
+        try:
+            set_appcheck_token(s.local_id, fetch_appcheck_from_provider(s))
+        except Exception as e:
+            _APPCHECK_FAIL[s.local_id] = time.time()
+            logger.warning("app check provider failed: %s", e)
+    return appcheck_status(s.local_id)
+
+
 _LOCKET_HEADER_PROFILE: Dict[str, str] = {"name": "full"}
 _LOCKET_HEADER_ORDER = ("full", "minimal")
 
@@ -1107,11 +1196,13 @@ def _locket_read_headers(s: LocketSession, profile: str = "full") -> Dict[str, s
         "x-ios-bundle-identifier": IOS_BUNDLE,
         "Authorization": f"Bearer {s.id_token}",
     }
-    if LOCKET_APPCHECK_TOKEN:
-        headers["X-Firebase-AppCheck"] = LOCKET_APPCHECK_TOKEN
+    appcheck = _appcheck_for(s)
+    if appcheck:
+        headers["X-Firebase-AppCheck"] = appcheck
     if LOCKET_INSTANCE_ID_TOKEN:
         headers["Firebase-Instance-Id-Token"] = LOCKET_INSTANCE_ID_TOKEN
     if profile == "full":
+        headers["User-Agent"] = FIREBASE_AUTH_UA
         headers["Accept"] = "application/json"
         headers["Accept-Language"] = "en-US"
         headers["X-Firebase-GMPID"] = FIREBASE_GMPID
@@ -1147,11 +1238,14 @@ def _locket_http_post(url: str, headers: Dict[str, str], raw: bytes, timeout: in
 
 
 def _locket_post_api(s: LocketSession, endpoint: str, payload: Optional[Dict[str, Any]] = None,
-                      timeout: int = 25, quiet: bool = False, retries: Optional[int] = None
-                      ) -> Dict[str, Any]:
+                      timeout: int = 25, quiet: bool = False, retries: Optional[int] = None,
+                      analytics: bool = True) -> Dict[str, Any]:
     max_retries = LOCKET_READ_RETRIES if retries is None else retries
     url = f"{LOCKET_API}/{endpoint}"
-    body = {"data": {**(payload or {}), "analytics": _locket_read_analytics(s)}}
+    data_body = dict(payload or {})
+    if analytics:
+        data_body["analytics"] = _locket_read_analytics(s)
+    body = {"data": data_body}
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
     preferred = _LOCKET_HEADER_PROFILE["name"]
     order = [preferred] + [p for p in _LOCKET_HEADER_ORDER if p != preferred]
@@ -1430,6 +1524,42 @@ def fetch_history_page(s: LocketSession, page_token: Optional[str] = None,
         if moment is not None:
             out.append(moment)
     return out, data.get("nextPageToken") or None
+
+
+def fetch_deleted_moment_ids(s: LocketSession, limit: int = FEED_DELETED_LIMIT, timeout: int = 15) -> set:
+    url = (f"https://firestore.googleapis.com/v1/projects/locket-4252a/databases/(default)/"
+           f"documents/users/{s.local_id}:runQuery")
+    body = {"structuredQuery": {
+        "from": [{"collectionId": "deleted_moments"}],
+        "orderBy": [{"field": {"fieldPath": "date"}, "direction": "DESCENDING"}],
+        "limit": limit,
+    }}
+    headers = {"Authorization": f"Bearer {s.id_token}", "Accept": "application/json",
+               "Content-Type": "application/json", "User-Agent": "okhttp/4.12.0"}
+    r = requests.post(url, json=body, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    out: set = set()
+    for row in r.json() if isinstance(r.json(), list) else []:
+        doc = row.get("document") if isinstance(row, dict) else None
+        if not isinstance(doc, dict):
+            continue
+        flat = flatten_firestore(doc)
+        mid = flat.get("moment_uid") if isinstance(flat, dict) else None
+        if not mid:
+            mid = str(doc.get("name") or "").rsplit("/", 1)[-1]
+        if mid:
+            out.add(str(mid))
+    return out
+
+
+def fetch_user_doc_firestore(s: LocketSession, uid: str, timeout: int = 12) -> Dict[str, Any]:
+    url = (f"https://firestore.googleapis.com/v1/projects/locket-4252a/databases/"
+           f"(default)/documents/users/{uid}")
+    r = requests.get(url, headers={"Authorization": f"Bearer {s.id_token}",
+                                    "Accept": "application/json"}, timeout=timeout)
+    r.raise_for_status()
+    flat = flatten_firestore(r.json())
+    return flat if isinstance(flat, dict) else {}
 
 
 def get_moments_http(s: LocketSession, page_token=None, client_target: str = "all",
@@ -1791,6 +1921,7 @@ def _ensure_moments_state(local_id: str) -> Dict[str, Any]:
                 "uids": [],
                 "uids_at": 0.0,
                 "sync_token": None,
+                "deleted_ids": set(),
                 "hist_ok": None,
                 "hist_fail_at": 0.0,
                 "hist_next": None,
@@ -1878,6 +2009,15 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
         if FEED_USE_HISTORY and not (hist_ok is False and hist_failed_recently):
             try:
                 page, nxt = fetch_history_page(s, None, FEED_HISTORY_PAGE)
+                try:
+                    with st["lock"]:
+                        st["deleted_ids"] |= fetch_deleted_moment_ids(s)
+                except Exception as de:
+                    diag["deleted_error"] = str(de)[:120]
+                with st["lock"]:
+                    dropped = st["deleted_ids"]
+                page = [m for m in page if _moment_id(m) not in dropped]
+                diag["deleted_known"] = len(dropped)
                 history_items = page
                 with st["lock"]:
                     st["hist_ok"] = True
@@ -1949,6 +2089,8 @@ def _fetch_and_store_moments(s: LocketSession, st: Dict[str, Any], timeout: int 
         if history_items:
             crawled = history_items
             crawl_ok = True
+        if st["deleted_ids"]:
+            st["items"] = [m for m in st["items"] if _moment_id(m) not in st["deleted_ids"]]
         if crawled:
             kept = [m for m in st["items"] if m.get("source") != "binhake"]
             st["items"] = _merge_moments(kept, crawled)[:FEED_MAX_ITEMS]
@@ -2117,6 +2259,7 @@ def deepen_history(s: LocketSession, st: Dict[str, Any], budget: float) -> Dict[
         with st["lock"]:
             st["hist_next"] = nxt
             before = len(st["items"])
+            page = [m for m in page if _moment_id(m) not in st["deleted_ids"]]
             st["items"] = _merge_moments(st["items"], page)[:FEED_MAX_ITEMS]
             added += len(st["items"]) - before
     with st["lock"]:
@@ -2878,6 +3021,13 @@ body{
 .p-tag{font-size:12px;font-weight:800;color:var(--text2);padding:8px 4px}
 .req-head{font-size:13px;font-weight:800;color:var(--text2);margin:14px 0 2px}
 .req-head b{color:var(--accent)}
+.person-slots{font-size:12px;font-weight:700;color:var(--accent);margin-top:2px}
+.person-slots.full{color:#ff6b6b}
+.p-adv{margin:10px 0 4px;font-size:13px;color:var(--text2)}
+.p-adv summary{cursor:pointer;font-weight:800}
+.p-adv summary span{font-weight:600;margin-left:6px;color:var(--accent)}
+.p-adv-body{display:flex;margin-top:8px}
+.p-adv-body .input{flex:1 1 auto;min-width:0;margin-right:8px}
 .friend-info{min-width:0;flex:1}
 .friend-name{font-weight:800;font-size:16.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .friend-user{font-size:13px;color:var(--text2);font-weight:600;margin-top:2px}
@@ -3359,8 +3509,17 @@ body{
       <input class="input" id="peopleQuery" type="text" placeholder="Find @username, invite link or UID" autocapitalize="off" autocorrect="off" autocomplete="off" onkeydown="if(event.key==='Enter'){searchPeople();return false}">
       <button type="button" class="btn people-go" onclick="searchPeople();return false;" aria-label="Search"><i class="bi bi-search"></i></button>
     </div>
+    <div id="myInvite" class="people-msg"></div>
+    <div id="peopleMsg" class="people-msg"></div>
     <div id="peopleResult"></div>
     <div id="peopleRequests"></div>
+    <details class="p-adv">
+      <summary>App Check token <span id="appcheckState"></span></summary>
+      <div class="p-adv-body">
+        <input class="input" id="appcheckToken" type="text" placeholder="Paste X-Firebase-AppCheck value" autocapitalize="off" autocorrect="off" autocomplete="off">
+        <button type="button" class="p-btn" onclick="saveAppCheck();return false;">Save</button>
+      </div>
+    </details>
     <div class="friends-count" id="friendsCountLine">Đang tải...</div>
     <div id="friendsList"></div>
     <div class="friends-empty hidden" id="friendsEmpty">
@@ -4380,11 +4539,24 @@ function personButtons(u,rel){
   if(rel==='friend') return '<span class="p-tag">'+(u.celebrity?'Following':'Friends')+'</span>';
   if(rel==='outgoing') return '<button type="button" class="p-btn ghost p-act" data-act="decline" data-dir="outgoing" data-uid="'+uid+'">Requested · Cancel</button>';
   if(rel==='incoming') return '<label class="p-share"><input type="checkbox" class="p-share-cb"> Share my history</label><div class="p-row"><button type="button" class="p-btn p-act" data-act="accept" data-uid="'+uid+'">Accept</button><button type="button" class="p-btn ghost p-act" data-act="decline" data-dir="incoming" data-uid="'+uid+'">Decline</button></div>';
+  if(u.celebrity && celebFull(u)) return '<button type="button" class="p-btn ghost" disabled>Full</button>';
   return '<button type="button" class="p-btn p-act" data-act="add" data-uid="'+uid+'">'+(u.celebrity?'Follow':'Add friend')+'</button>';
+}
+function celebFull(u){
+  var c=u&&u.celebrity_data;
+  return !!(c&&c.max_friends&&(c.friend_count||0)>=c.max_friends);
+}
+function celebSlots(u){
+  var c=u&&u.celebrity_data;
+  if(!u||!u.celebrity) return '';
+  if(!c||!c.max_friends) return '<div class="person-slots">Slots unknown</div>';
+  var used=c.friend_count||0, left=c.max_friends-used;
+  if(left<=0) return '<div class="person-slots full">Full · '+used+' / '+c.max_friends+'</div>';
+  return '<div class="person-slots">'+used+' / '+c.max_friends+' · '+left+' slots left</div>';
 }
 function personCard(u,rel){
   var name=((u.first_name||'')+' '+(u.last_name||'')).trim()||u.username||u.uid||'';
-  return '<div class="person-card" data-uid="'+esc(u.uid||'')+'">'+renderAvatar(u,48)+'<div class="person-info"><div class="person-name">'+esc(name)+'</div><div class="person-user">@'+esc(u.username||u.uid||'')+(u.celebrity?' · Celebrity':'')+'</div></div><div class="person-actions">'+personButtons(u,rel)+'</div></div>';
+  return '<div class="person-card" data-uid="'+esc(u.uid||'')+'">'+renderAvatar(u,48)+'<div class="person-info"><div class="person-name">'+esc(name)+'</div><div class="person-user">@'+esc(u.username||u.uid||'')+(u.celebrity?' · Celebrity':'')+'</div>'+celebSlots(u)+'</div><div class="person-actions">'+personButtons(u,rel)+'</div></div>';
 }
 function searchPeople(){
   var q=(($('peopleQuery')||{}).value||'').trim();
@@ -4399,6 +4571,8 @@ function searchPeople(){
 function loadPeopleRequests(){
   var box=$('peopleRequests');
   if(!box) return;
+  loadAppCheckState();
+  loadMyInvite();
   apiTimeout('/api/people/requests',null,25000).then(function(d){
     if(!d.ok){ box.innerHTML=''; return; }
     var inc=d.incoming||[], out=d.outgoing||[], h='';
@@ -4420,7 +4594,9 @@ document.addEventListener('click',function(ev){
   b.disabled=true;
   var done=function(d,okMsg,refresh){
     b.disabled=false;
-    if(!d||!d.ok){ toast((d&&d.error)||'Request failed'); return; }
+    var msg=$('peopleMsg');
+    if(!d||!d.ok){ var em=(d&&d.error)||'Request failed'; toast(em.length>80?'Request rejected, see details below':em); if(msg) msg.textContent=em; return; }
+    if(msg) msg.textContent='';
     toast(okMsg); personAfter(refresh);
   };
   var fail=function(){ b.disabled=false; toast('Network error'); };
@@ -4439,6 +4615,39 @@ document.addEventListener('click',function(ev){
     }).catch(fail);
   }
 });
+function loadAppCheckState(){
+  var el=$('appcheckState');
+  if(!el) return;
+  apiTimeout('/api/people/appcheck',null,15000).then(function(d){
+    if(!d||!d.ok){ el.textContent=''; return; }
+    if(!d.has){ el.textContent=d.provider?'Auto (fetched on demand)':'Not set'; return; }
+    if(d.expired){ el.textContent=d.provider?'Auto (refreshing)':'Expired'; return; }
+    el.textContent=d.expires_in==null?'Set':('Valid for '+Math.max(1,Math.round(d.expires_in/60))+' min');
+  }).catch(function(){});
+}
+function saveAppCheck(){
+  var input=$('appcheckToken');
+  if(!input) return;
+  peoplePost('/api/people/appcheck',{token:(input.value||'').trim()}).then(function(d){
+    if(!d||!d.ok){ toast((d&&d.error)||'Could not save'); return; }
+    input.value='';
+    toast('App Check token saved');
+    loadAppCheckState();
+  }).catch(function(){ toast('Network error'); });
+}
+function loadMyInvite(){
+  var el=$('myInvite');
+  if(!el) return;
+  apiTimeout('/api/people/invite',null,20000).then(function(d){
+    if(!d||!d.ok||!d.link){ el.innerHTML=''; return; }
+    el.innerHTML='Your link: <a href="#" id="myInviteCopy">'+esc(d.link)+'</a>';
+    var a=$('myInviteCopy');
+    if(a) a.onclick=function(ev){
+      ev.preventDefault();
+      try{ navigator.clipboard.writeText(d.link); toast('Link copied'); }catch(e){ toast(d.link); }
+    };
+  }).catch(function(){});
+}
 function renderFriendBatch(container,friends,start,batch){
   const end=Math.min(start+batch,friends.length);
   var frag=document.createDocumentFragment();
@@ -6755,30 +6964,80 @@ def resolve_person(s: LocketSession, query: str) -> Dict[str, Any]:
         token = _invite_token_for_username(handle)
     if not token:
         raise LocketError(f"No Locket user found for '{q}'")
-    res = _locket_post_api(s, "fetchUserForInviteToken", {"invite_token": token}, timeout=20, quiet=True)
+    res = _locket_post_api(s, "fetchUserForInviteToken", {"invite_token": token},
+                           timeout=20, quiet=True, analytics=False)
     data = res.get("data", res) if isinstance(res, dict) else {}
     user = data.get("user") if isinstance(data, dict) and isinstance(data.get("user"), dict) else data
-    profile = _normalize_user(user if isinstance(user, dict) else {})
+    raw = user if isinstance(user, dict) else {}
+    profile = _normalize_user(raw)
     if not profile.get("uid"):
         raise LocketError(f"No Locket user found for '{q}'")
-    return profile
+    profile["friendship_status"] = str(raw.get("friendship_status") or "")
+    return _enrich_person(s, profile)
+
+
+def _enrich_person(s: LocketSession, profile: Dict[str, Any]) -> Dict[str, Any]:
+    status = profile.get("friendship_status", "")
+    try:
+        full, _ = fetch_user_v2(s, profile["uid"])
+    except Exception as e:
+        logger.debug("profile enrich failed: %s", e)
+        full = {}
+    merged = {**profile, **{k: v for k, v in full.items() if v not in (None, "", 0)}}
+    merged["celebrity"] = bool(profile.get("celebrity") or full.get("celebrity"))
+    merged["friendship_status"] = status
+    if merged["celebrity"] and not merged.get("celebrity_data"):
+        try:
+            doc = fetch_user_doc_firestore(s, merged["uid"])
+            merged["celebrity_data"] = _norm_celeb_data(doc.get("celebrity_data"))
+        except Exception as e:
+            logger.debug("celebrity slots lookup failed: %s", e)
+    return merged
+
+
+def _relation_from_status(status: str) -> str:
+    value = (status or "").strip().lower()
+    if not value:
+        return ""
+    if "outgoing" in value:
+        return "outgoing"
+    if "incoming" in value:
+        return "incoming"
+    if value in ("friend", "friends", "accepted"):
+        return "friend"
+    return ""
+
+
+def _norm_celeb_data(raw: Any) -> Optional[Dict[str, int]]:
+    if not isinstance(raw, dict):
+        return None
+    out: Dict[str, int] = {}
+    for key in ("friend_count", "max_friends"):
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        out[key] = int(value)
+    return out or None
 
 
 def _relationship(s: LocketSession, uid: str) -> str:
     if uid == s.local_id:
         return "self"
-    friends, incoming, outgoing = set(), set(), set()
-    try:
-        friends = set(list_friend_uids_firestore(s)[0])
-    except Exception as e:
-        logger.debug("relationship friends failed: %s", e)
+
+    def load(kind: str) -> set:
+        try:
+            if kind == "friends":
+                return set(list_friend_uids_firestore(s)[0])
+            return set(_fs_list_uids(s, kind))
+        except Exception as e:
+            logger.debug("relationship %s failed: %s", kind, e)
+            return set()
+
+    kinds = ("friends", "incoming_friend_requests", "outgoing_friend_requests")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        friends, incoming, outgoing = list(pool.map(load, kinds))
     if uid in friends:
         return "friend"
-    for name, target in (("incoming_friend_requests", incoming), ("outgoing_friend_requests", outgoing)):
-        try:
-            target.update(_fs_list_uids(s, name))
-        except Exception as e:
-            logger.debug("relationship %s failed: %s", name, e)
     if uid in incoming:
         return "incoming"
     if uid in outgoing:
@@ -6820,8 +7079,29 @@ def _invalidate_social_caches(s: LocketSession) -> None:
             moments["last_crawl_at"] = 0.0
 
 
-def _write_api(s: LocketSession, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _locket_post_api(s, endpoint, payload, timeout=25, quiet=False, retries=0)
+def _write_api(s: LocketSession, endpoint: str, payload: Dict[str, Any],
+               needs_appcheck: bool = False) -> Dict[str, Any]:
+    if needs_appcheck:
+        ensure_appcheck(s)
+    try:
+        return _locket_post_api(s, endpoint, payload, timeout=25, quiet=False, retries=0,
+                                analytics=False)
+    except LocketError as e:
+        if getattr(e, "status", None) not in (401, 403):
+            raise
+        state = appcheck_status(s.local_id)
+        if state["has"] and state["expired"]:
+            hint = "The App Check token has expired."
+        elif state["has"]:
+            hint = "The App Check token was rejected."
+        elif state["provider"]:
+            hint = "The App Check provider did not return a token."
+        else:
+            hint = "No App Check token is set."
+        raise LocketError(
+            f"Locket rejected {endpoint} (HTTP {e.status}). {hint} Sending a friend request needs a valid "
+            "X-Firebase-AppCheck token: set LOCKET_APPCHECK_PROVIDER_URL and LOCKET_APPCHECK_PROVIDER_KEY "
+            "for automatic tokens, or paste one under 'App Check token' (it lasts about 1 hour).") from e
 
 
 def add_person(s: LocketSession, uid: str) -> Dict[str, Any]:
@@ -6831,18 +7111,8 @@ def add_person(s: LocketSession, uid: str) -> Dict[str, Any]:
         profile["uid"] = profile.get("uid") or uid
     except Exception as e:
         logger.debug("profile before add failed: %s", e)
-    payload = {
-        "user_uid": uid,
-        "source": "inviteCardPopup",
-        "platform": "iOS",
-        "create_ofr_for_temp_users": False,
-        "share_history_eligible": True,
-        "get_reengagement_status": False,
-        "prompted_reengagement": False,
-        "rollcall": False,
-        "invite_variant": {"value": "1002", "@type": "type.googleapis.com/google.protobuf.Int64Value"},
-    }
-    res = _write_api(s, "sendFriendRequest", payload)
+    payload = {"source": "inviteCardPopup", "user_uid": uid}
+    res = _write_api(s, "sendFriendRequest", payload, needs_appcheck=True)
     _invalidate_social_caches(s)
     return {"kind": "follow" if profile.get("celebrity") else "friend", "user": profile, "result": res}
 
@@ -6891,7 +7161,8 @@ def api_people_search():
 
     def run(s):
         profile = resolve_person(s, q)
-        return {"user": profile, "relation": _relationship(s, profile["uid"])}
+        relation = "self" if profile["uid"] == s.local_id else _relation_from_status(profile.get("friendship_status", ""))
+        return {"user": profile, "relation": relation or _relationship(s, profile["uid"])}
     return _people_call(run)
 
 
@@ -6916,6 +7187,28 @@ def api_people_accept():
 def api_people_decline():
     data = request.get_json(force=True) or {}
     return _people_call(lambda s: decline_person(s, _uid_arg(data), str(data.get("direction") or "incoming")))
+
+
+@app.route("/api/people/appcheck", methods=["GET", "POST"])
+def api_people_appcheck():
+    s = get_session()
+    if not s:
+        return jsonify({"ok": False, "error": "Not logged in"})
+    if request.method == "POST":
+        token = str((request.get_json(force=True) or {}).get("token") or "").strip()
+        if token and token.count(".") != 2:
+            return jsonify({"ok": False, "error": "That does not look like an App Check token"})
+        set_appcheck_token(s.local_id, token)
+    return jsonify({"ok": True, **appcheck_status(s.local_id)})
+
+
+@app.route("/api/people/invite")
+def api_people_invite():
+    def run(s):
+        info, _ = get_self_info(s)
+        username = str(info.get("username") or "")
+        return {"username": username, "link": f"https://locket.cam/{username}" if username else ""}
+    return _people_call(run)
 
 
 @app.route("/api/friends")
