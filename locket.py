@@ -200,8 +200,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "2.5"
-APP_BUILD = "2026.10.22"
+APP_VERSION = "2.6"
+APP_BUILD = "2026.10.25"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -3028,6 +3028,19 @@ body{
 .p-adv summary span{font-weight:600;margin-left:6px;color:var(--accent)}
 .p-adv-body{display:flex;margin-top:8px}
 .p-adv-body .input{flex:1 1 auto;min-width:0;margin-right:8px}
+#viewsPanel{position:fixed;left:0;right:0;bottom:0;max-height:70vh;background:var(--card);border-top-left-radius:20px;border-top-right-radius:20px;box-shadow:0 -8px 30px rgba(0,0,0,.4);z-index:220;display:flex;flex-direction:column;overflow:hidden}
+.viewer-head-row{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;font-weight:800;font-size:16px;border-bottom:1px solid var(--border)}
+.viewer-head-row .viewer-close{background:none;border:none;color:var(--text);font-size:16px;cursor:pointer;padding:4px 8px}
+.viewer-list{overflow-y:auto;padding:4px 18px 18px}
+.viewer-row{display:flex;align-items:center;padding:9px 0;border-bottom:1px solid var(--border)}
+.viewer-row:last-child{border-bottom:none}
+.viewer-row .avatar-wrap{margin-right:12px;flex:0 0 auto}
+.viewer-info{flex:1 1 auto;min-width:0}
+.viewer-name{font-weight:800;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.viewer-user{font-size:12px;color:var(--text2)}
+.viewer-reaction{font-size:18px;margin-right:10px}
+.viewer-time{font-size:12px;color:var(--text2);flex:0 0 auto}
+.viewer-views-btn{display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:500px;padding:8px 14px;font-weight:800;font-size:13px;cursor:pointer;margin-left:auto}
 .friend-info{min-width:0;flex:1}
 .friend-name{font-weight:800;font-size:16.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .friend-user{font-size:13px;color:var(--text2);font-weight:600;margin-top:2px}
@@ -3565,6 +3578,7 @@ body{
   </div>
 
   <div class="viewer hidden" id="viewerStage"></div>
+<div id="viewsPanel" class="hidden"></div>
 
   {% endif %}
 </div>
@@ -3583,6 +3597,7 @@ body{
 const $=id=>document.getElementById(id);
 const GOLD_BADGE="{{ gold_badge }}", CELEB_BADGE="{{ celeb_badge }}";
 const BOOT_NAME={{ (boot_name or '')|tojson }};
+const BOOT_UID={{ (boot_uid or '')|tojson }};
 const BOOT_PHOTO={{ (boot_photo or '')|tojson }};
 let croppedBlob=null, originalFile=null, isVideo=false, cropper=null;
 let videoCropPayload=null, videoThumbBlob=null;
@@ -5401,15 +5416,59 @@ function openViewer(idx){
   const src=isVid?raw:mediaSrc(raw, 1080);
   const poster=(isVid&&m.thumbnail_url)?mediaSrc(m.thumbnail_url,1080):'';
   const cap=extractCaption(m);
+  const isMine=BOOT_UID && m.user===BOOT_UID;
   v.innerHTML=`
-    <div class="viewer-head"><button class="viewer-close" onclick="closeViewer()" aria-label="Đóng">✕</button></div>
+    <div class="viewer-head"><button class="viewer-close" onclick="closeViewer()" aria-label="Đóng">✕</button>${isMine?`<button type="button" class="viewer-views-btn" onclick='openMomentViews(${JSON.stringify(m).replace(/'/g,"&#39;")})'><i class="bi bi-eye-fill"></i> Views</button>`:''}</div>
     ${isVid?`<video src="${esc(src)}" ${poster?`poster="${esc(poster)}"`:''} controls autoplay playsinline style="max-width:100%;max-height:100%;object-fit:contain" onerror="viewerMediaError(this,'Không phát được video')"></video>`
            :`<img src="${esc(src)}" alt="" style="max-width:100%;max-height:100%;object-fit:contain" onerror="viewerMediaError(this,'Không tải được ảnh')">`}
     ${cap?`<div class="viewer-caption">${esc(cap)}</div>`:''}
   `;
   v.classList.remove('hidden');
 }
-function closeViewer(){$('viewerStage').classList.add('hidden');$('viewerStage').innerHTML=''}
+function closeViewer(){$('viewerStage').classList.add('hidden');$('viewerStage').innerHTML='';closeMomentViews();}
+function timeAgoShort(sec){
+  if(!sec) return '';
+  var d=Math.max(0, Math.floor(Date.now()/1000 - sec));
+  if(d<60) return 'now';
+  if(d<3600) return Math.floor(d/60)+'m';
+  if(d<86400) return Math.floor(d/3600)+'h';
+  if(d<2592000) return Math.floor(d/86400)+'d';
+  return Math.floor(d/2592000)+'mo';
+}
+function viewerRow(v){
+  var name=((v.first_name||'')+' '+(v.last_name||'')).trim()||v.username||v.uid||'';
+  return '<div class="viewer-row">'+renderAvatar(v,36)+
+    '<div class="viewer-info"><div class="viewer-name">'+esc(name)+'</div>'+
+    (v.username?'<div class="viewer-user">@'+esc(v.username)+'</div>':'')+'</div>'+
+    (v.reaction?'<span class="viewer-reaction">'+esc(v.reaction)+'</span>':'')+
+    '<span class="viewer-time">'+timeAgoShort(v.viewed_at)+'</span></div>';
+}
+function openMomentViews(moment){
+  var panel=$('viewsPanel');
+  if(!panel) return;
+  var mid=moment.canonical_uid||moment.id||'';
+  if(!mid){ toast('No id for this moment'); return; }
+  panel.classList.remove('hidden');
+  panel.innerHTML='<div class="viewer-head-row"><span>Views</span><button type="button" class="viewer-close" onclick="closeMomentViews()">✕</button></div><div class="viewer-list" id="viewerList"><div class="skeleton" style="height:48px;margin:8px 0"></div><div class="skeleton" style="height:48px;margin:8px 0"></div></div>';
+  apiTimeout('/api/moments/views?uid='+encodeURIComponent(mid),null,25000).then(function(d){
+    var list=$('viewerList');
+    if(!list) return;
+    if(!d||!d.ok){ list.innerHTML='<div class="people-msg">'+esc((d&&d.error)||'Could not load views')+'</div>'; return; }
+    var count=d.count||(d.viewers||[]).length;
+    var head=panel.querySelector('.viewer-head-row span');
+    if(head) head.textContent='Views · '+count;
+    if(!d.viewers || !d.viewers.length){ list.innerHTML='<div class="people-msg">No views yet</div>'; return; }
+    list.innerHTML=d.viewers.map(viewerRow).join('');
+  }).catch(function(){
+    var list=$('viewerList');
+    if(list) list.innerHTML='<div class="people-msg">Network error</div>';
+  });
+}
+function closeMomentViews(){
+  var panel=$('viewsPanel');
+  if(panel){ panel.classList.add('hidden'); panel.innerHTML=''; }
+}
+
 
 /* ===================== Upload: pick / paste / crop ===================== */
 function triggerFilePick(){$('fileInput').click()}
@@ -6753,6 +6812,7 @@ def index():
         gold_badge=GOLD_BADGE, celeb_badge=CELEB_BADGE,
         font_url=FONT_URL, favicon_url=FAVICON_URL,
         boot_name=(s.display_name if s else ""),
+        boot_uid=(s.local_id if s else ""),
         boot_photo=(s.photo_url if s else ""),
         boot_email=(s.email if s else ""),
         app_version=APP_VERSION_STRING,
@@ -7208,6 +7268,99 @@ def api_people_invite():
         info, _ = get_self_info(s)
         username = str(info.get("username") or "")
         return {"username": username, "link": f"https://locket.cam/{username}" if username else ""}
+    return _people_call(run)
+
+
+def _normalize_viewer_entry(raw: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(raw, str):
+        return {"uid": raw, "viewed_at": None}
+    if not isinstance(raw, dict):
+        return None
+    uid = raw.get("uid") or raw.get("user") or raw.get("user_uid") or raw.get("viewer_uid")
+    if not uid:
+        return None
+    ts = raw.get("viewed_at") or raw.get("date") or raw.get("created_at")
+    seconds = None
+    if isinstance(ts, dict):
+        seconds = ts.get("_seconds") or ts.get("seconds")
+    elif isinstance(ts, (int, float)):
+        seconds = ts if ts < 1e12 else ts / 1000.0
+    return {"uid": str(uid), "viewed_at": seconds}
+
+
+def fetch_moment_reactions(s: LocketSession, moment_uid: str, timeout: int = 10) -> List[Dict[str, Any]]:
+    url = (f"https://firestore.googleapis.com/v1/projects/locket-4252a/databases/(default)/"
+           f"documents/moments/{moment_uid}/reactions")
+    r = requests.get(url, headers={"Authorization": f"Bearer {s.id_token}",
+                                    "Accept": "application/json"}, timeout=timeout)
+    if r.status_code in (403, 404):
+        return []
+    r.raise_for_status()
+    out: List[Dict[str, Any]] = []
+    for doc in (r.json() or {}).get("documents") or []:
+        f = flatten_firestore(doc) or {}
+        emoji = f.get("string") or f.get("reaction") or f.get("emoji") or ""
+        uid = f.get("user") or f.get("user_uid") or ""
+        if emoji and uid:
+            out.append({"uid": str(uid), "emoji": str(emoji)})
+    return out
+
+
+def get_moment_views(s: LocketSession, moment_uid: str) -> Dict[str, Any]:
+    res = _locket_post_api(s, "getMomentViews", {"moment_uid": moment_uid}, timeout=20, quiet=True)
+    data = res.get("data", res) if isinstance(res, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    raw_viewers = data.get("moment_views") or data.get("viewers") or data.get("views") or []
+    viewers: List[Dict[str, Any]] = []
+    seen: set = set()
+    for entry in raw_viewers if isinstance(raw_viewers, list) else []:
+        norm = _normalize_viewer_entry(entry)
+        if norm and norm["uid"] not in seen:
+            seen.add(norm["uid"])
+            viewers.append(norm)
+
+    try:
+        reactions = fetch_moment_reactions(s, moment_uid)
+    except Exception as e:
+        logger.debug("reactions fetch failed for %s: %s", moment_uid[:8], e)
+        reactions = []
+    reaction_by_uid = {r["uid"]: r["emoji"] for r in reactions}
+
+    uids = [v["uid"] for v in viewers if v["uid"] != s.local_id]
+    profiles: Dict[str, Dict[str, Any]] = {}
+    if uids:
+        def load(uid: str):
+            try:
+                prof, _ = fetch_user_v2(s, uid)
+                prof["uid"] = prof.get("uid") or uid
+                return uid, prof
+            except Exception:
+                return uid, {"uid": uid}
+        with ThreadPoolExecutor(max_workers=min(8, len(uids))) as pool:
+            for uid, prof in pool.map(load, uids):
+                profiles[uid] = prof
+
+    out_viewers: List[Dict[str, Any]] = []
+    for v in viewers:
+        prof = profiles.get(v["uid"], {"uid": v["uid"]})
+        out_viewers.append({**prof, "viewed_at": v["viewed_at"], "reaction": reaction_by_uid.get(v["uid"], "")})
+    out_viewers.sort(key=lambda x: x.get("viewed_at") or 0, reverse=True)
+
+    count = data.get("views_count") or data.get("count") or len(out_viewers)
+    return {"count": int(count) if isinstance(count, (int, float)) else len(out_viewers),
+            "viewers": out_viewers,
+            "reaction_count": len(reactions)}
+
+
+@app.route("/api/moments/views")
+def api_moment_views():
+    uid = request.args.get("uid", "")
+
+    def run(s):
+        if not uid or len(uid) > 64:
+            raise LocketError("Missing moment id")
+        return get_moment_views(s, uid)
     return _people_call(run)
 
 
