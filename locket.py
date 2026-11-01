@@ -200,7 +200,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "2.7"
+APP_VERSION = "2.7.1"
 APP_BUILD = "2026.11.01"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
@@ -3050,6 +3050,35 @@ body.mv-feed .moments-feed{display:block !important}
 .moments-grid.cols-4 .moment-top{padding-right:3px}
 .viewer-time.mtime{margin-left:0}
 
+/* ---------- Feed 1 ảnh: luôn vuông 1:1 (padding-bottom % theo đúng chiều rộng thẻ) ---------- */
+.moments-feed .feed-slide{max-width:480px;margin-left:auto;margin-right:auto}
+.moments-feed .feed-card{display:block !important;width:100% !important;max-width:none !important;
+  height:0;padding-bottom:100% !important}
+.moments-feed .feed-meta{width:100% !important;max-width:none !important;margin:10px 0 0 !important}
+
+/* ---------- Caption pill: chữ dài tự chạy ngang ---------- */
+.moment-caption{left:6%;right:6%;bottom:10px;-webkit-transform:none;transform:none;background:none;
+  border-radius:0;padding:0;max-width:none;width:auto;max-height:none;overflow:visible;display:block;
+  white-space:normal;text-align:center;pointer-events:none}
+.cap-pill{display:inline-block;max-width:100%;vertical-align:bottom;background:rgba(0,0,0,.55);
+  border-radius:500px;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.cap-clip{overflow:hidden;margin:0 16px;padding:7px 0;white-space:nowrap;font-size:12px;font-weight:700;
+  line-height:1.35;color:#fff;text-align:left}
+.cap-in{display:inline-block}
+.cap-clip.marq{-webkit-mask-image:linear-gradient(90deg,transparent 0,#000 12px,#000 calc(100% - 12px),transparent 100%);
+  mask-image:linear-gradient(90deg,transparent 0,#000 12px,#000 calc(100% - 12px),transparent 100%)}
+.cap-clip.marq .cap-in{padding-right:36px}
+.cap-track{display:inline-block;white-space:nowrap;will-change:transform;
+  -webkit-animation:capMarq 10s linear 1s infinite;animation:capMarq 10s linear 1s infinite}
+@-webkit-keyframes capMarq{from{-webkit-transform:translate3d(0,0,0)}to{-webkit-transform:translate3d(-50%,0,0)}}
+@keyframes capMarq{from{transform:translate3d(0,0,0)}to{transform:translate3d(-50%,0,0)}}
+@media (prefers-reduced-motion:reduce){
+  .cap-track{display:inline;-webkit-animation:none;animation:none}
+  .cap-clip.marq{-webkit-mask-image:none;mask-image:none;text-overflow:ellipsis}
+  .cap-clip.marq .cap-in{display:inline;padding:0}
+  .cap-track .cap-in + .cap-in{display:none}
+}
+
 @media (max-width:375px){
   .moment-card,.moments-feed .feed-card{border-radius:10px;box-shadow:none}
   .page.active{animation:none}
@@ -4196,7 +4225,7 @@ var IMG_CONCURRENCY = IS_PHONE ? 1 : 4;   // iPhone 6: 1 concurrent decode — a
 var MOMENT_BATCH = IS_PHONE ? 2 : 8;      // DOM nodes per paint wave
 var PREFETCH_COUNT = IS_PHONE ? 2 : 10;   // eager Image() ahead of scroll
 var THUMB_W = IS_PHONE ? 320 : 480;       // feed thumb max side (grid)
-var FEED_THUMB_W = IS_PHONE ? 360 : 540;  // vertical feed card
+var FEED_THUMB_W = IS_PHONE ? 540 : 720;  // vertical feed card
 var AVATAR_W = 96;
 var LOCAL_MOMENTS_CAP = IS_PHONE ? 30 : 80;
 var LOCAL_FRIENDS_CAP = 200;
@@ -4873,7 +4902,7 @@ function buildMomentCard(m, idx, friendMap, eager){
     '<div class="moment-overlay"></div>'+
     (isVid?'<div class="moment-video-badge"><i class="bi bi-play-fill"></i></div>':'')+
     '<div class="moment-top">'+renderAvatar(displayProf,20)+'<span class="mname">'+esc(fullName)+'</span><span class="mtime" data-ts="'+t+'">'+timeAgo(t)+'</span></div>'+
-    (cap?'<div class="moment-caption">'+esc(cap)+'</div>':'');
+    (cap?captionHtml(cap):'');
   var imgEl = card.querySelector('img');
   if(imgEl && imgUrl){
     if(eager) enqueueImg(imgEl, imgUrl);
@@ -4896,7 +4925,7 @@ function buildFeedSlide(m, idx, friendMap, eager){
       '<img src="'+TINY_PIXEL+'" data-real="'+esc(imgUrl)+'" alt="" style="background:#1a1a1a">'+
       '<div class="moment-overlay"></div>'+
       (isVid?'<div class="moment-video-badge"><i class="bi bi-play-fill"></i></div>':'')+
-      (cap?'<div class="moment-caption">'+esc(cap)+'</div>':'')+
+      (cap?captionHtml(cap):'')+
     '</div>'+
     '<div class="feed-meta">'+
       '<div class="feed-name">'+renderAvatar(displayProf,28)+'<span>'+esc(name)+'</span><span class="mtime" data-ts="'+t+'" style="margin-left:auto;color:var(--muted);font-size:12px;font-weight:700">'+timeAgo(t)+'</span></div>'+
@@ -4908,6 +4937,69 @@ function buildFeedSlide(m, idx, friendMap, eager){
   }
   return slide;
 }
+/* ===== Caption pill: tự chạy chữ khi dài hơn khung ===== */
+function captionHtml(cap){
+  return '<div class="moment-caption"><div class="cap-pill"><div class="cap-clip"><span class="cap-in">'+esc(cap)+'</span></div></div></div>';
+}
+var _capRaf=0, _capForce=false, _capResizeT=null;
+function fitCaptionsSoon(force){
+  if(force) _capForce=true;
+  if(_capRaf) return;
+  _capRaf=requestAnimationFrame(function(){
+    _capRaf=0;
+    var f=_capForce; _capForce=false;
+    fitCaptions(f);
+  });
+}
+function fitCaptions(force){
+  var clips=document.querySelectorAll('#momentsGrid .cap-clip, #momentsFeed .cap-clip');
+  var todo=[], i, c;
+  for(i=0;i<clips.length;i++){
+    c=clips[i];
+    if(!force && c._fitW && c._fitW===c.clientWidth) continue;
+    todo.push(c);
+  }
+  if(!todo.length) return;
+  for(i=0;i<todo.length;i++){
+    c=todo[i];
+    var tr=c.querySelector('.cap-track');
+    if(tr){
+      var first=tr.querySelector('.cap-in');
+      c.innerHTML=''; c.appendChild(first); c.classList.remove('marq');
+    }
+  }
+  var info=[];
+  for(i=0;i<todo.length;i++){
+    c=todo[i];
+    var inn=c.querySelector('.cap-in');
+    info.push({c:c, inn:inn, cw:c.clientWidth, sw:inn?inn.offsetWidth:0, dist:0});
+  }
+  for(i=0;i<info.length;i++){
+    var o=info[i];
+    if(!o.cw || !o.inn) continue;
+    if(o.sw>o.cw+1){
+      var track=document.createElement('span'); track.className='cap-track';
+      var b=o.inn.cloneNode(true); b.setAttribute('aria-hidden','true');
+      o.c.classList.add('marq');
+      o.c.appendChild(track); track.appendChild(o.inn); track.appendChild(b);
+      o.dist=o.sw+36;
+    }
+    o.c._fitW=o.cw;
+  }
+  for(i=0;i<info.length;i++){
+    if(!info[i].dist) continue;
+    var t=info[i].c.querySelector('.cap-track');
+    if(t) t.style.animationDuration=Math.max(6, info[i].dist/36)+'s';
+  }
+}
+window.addEventListener('resize', function(){
+  clearTimeout(_capResizeT);
+  _capResizeT=setTimeout(function(){ fitCaptionsSoon(false); }, 250);
+});
+if(document.fonts && document.fonts.ready){
+  document.fonts.ready.then(function(){ fitCaptionsSoon(true); });
+}
+
 function appendMomentsBatch(){
   const items=window._momentItems||[];
   if(momentsRendered>=items.length){
@@ -4930,6 +5022,7 @@ function appendMomentsBatch(){
     if(frag) frag.appendChild(buildMomentNode(items[idx], idx, friendMap, eager));
   }
   if(target && frag) target.appendChild(frag);
+  fitCaptionsSoon(false);
   momentsRendered=end;
   showProgress('Moments ' + momentsRendered + '/' + items.length, momentsRendered, items.length);
   updateMoreLabel();
@@ -5014,6 +5107,7 @@ function prependNewMoments(freshItems){
     if(frag) frag.appendChild(buildMomentNode(newOnes[idx], idx, friendMap, true));
   }
   if(target && frag) target.insertBefore(frag, target.firstChild);
+  fitCaptionsSoon(false);
   window._momentItems=freshItems;
   momentsRendered+=n;
   scheduleLazyLoad();
@@ -7178,12 +7272,14 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.environ.get("LOCKET_HTTPS", "0") == "1"
 
 _CSP_ON = os.environ.get("LOCKET_CSP", "1") != "0"
+_CSP_CONNECT_EXTRA = "".join(" " + h for h in os.environ.get("LOCKET_CSP_CONNECT", "").split()
+                             if h.startswith("https://") or h.startswith("wss://"))
 _CSP = ("default-src 'self'; "
         "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
         "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; "
         "font-src 'self' data: https://raw.githubusercontent.com https://cdn.jsdelivr.net; "
         "img-src 'self' data: blob: https:; media-src 'self' blob: https:; "
-        "connect-src 'self'; worker-src 'self'; manifest-src 'self'; "
+        "connect-src 'self'" + _CSP_CONNECT_EXTRA + "; worker-src 'self'; manifest-src 'self'; "
         "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
 _EXTRA_HOSTS = {h.strip().lower() for h in os.environ.get("LOCKET_ALLOWED_HOSTS", "").split(",") if h.strip()}
 _TRUST_PROXY = os.environ.get("LOCKET_TRUST_PROXY", "0") == "1"
@@ -8050,6 +8146,15 @@ def api_img():
         resp = Response(data, mimetype=mime)
         resp.headers["Cache-Control"] = "private, max-age=900"
         return resp
+    except requests.HTTPError as e:
+        code_up = getattr(getattr(e, "response", None), "status_code", 0) or 0
+        logger.warning("IMG PROXY upstream %s for %s", code_up, url[:120])
+        if 400 <= code_up < 500:
+            miss = jsonify({"ok": False, "error": "image unavailable"})
+            miss.status_code = 404
+            miss.headers["Cache-Control"] = "private, max-age=300"
+            return miss
+        return jsonify({"ok": False, "error": str(e)}), 502
     except Exception as e:
         logger.warning("IMG PROXY fail %s: %s", url[:120], e)
         return jsonify({"ok": False, "error": str(e)}), 502
