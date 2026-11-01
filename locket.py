@@ -200,8 +200,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "2.6"
-APP_BUILD = "2026.10.25"
+APP_VERSION = "2.7"
+APP_BUILD = "2026.11.01"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -2676,6 +2676,12 @@ _img_cache: Dict[Tuple[str, int], Tuple[float, bytes, str]] = {}
 _IMG_CACHE_TTL = 900
 _IMG_CACHE_MAX = 160
 
+def _img_host_ok(url: str) -> bool:
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower()
+    return bool(host) and any(host == h or host.endswith("." + h) for h in _ALLOWED_IMG_HOSTS)
+
+
 def _client_needs_jpeg(request) -> bool:
     """Detect browsers that cannot decode WebP (mainly Safari < 14 / iOS < 14)."""
     ua = (request.headers.get("User-Agent") or "").lower()
@@ -3024,6 +3030,25 @@ body{
 @media (max-width:900px) and (orientation:landscape) and (min-width:769px){
   .viewer-side{flex-basis:300px;width:300px}
 }
+
+/* ---------- Moments view modes (feed / 2 / 3 / 4 cột) ---------- */
+.mv-seg{display:flex;margin-left:auto;margin-right:6px;border:1px solid var(--border);border-radius:500px;
+  overflow:hidden;background:var(--surface)}
+.mv-seg button{border:none;background:transparent;color:var(--text2);font-family:inherit;font-weight:800;
+  font-size:12px;min-width:32px;height:30px;padding:0 9px;cursor:pointer;-webkit-appearance:none;appearance:none}
+.mv-seg button.active{background:var(--accent);color:#111}
+body.mv-grid .moments-grid{display:grid !important}
+body.mv-grid .moments-feed{display:none !important}
+body.mv-feed .moments-grid{display:none !important}
+body.mv-feed .moments-feed{display:block !important}
+.moments-grid.cols-2{grid-template-columns:repeat(2,1fr) !important}
+.moments-grid.cols-3{grid-template-columns:repeat(3,1fr) !important}
+.moments-grid.cols-4{grid-template-columns:repeat(4,1fr) !important}
+.moments-grid.dense .moment-caption{display:none}
+.moments-grid.dense .moment-top .mtime{display:none}
+.moments-grid.cols-4 .moment-top .mname{display:none}
+.moments-grid.cols-4 .moment-top{padding-right:3px}
+.viewer-time.mtime{margin-left:0}
 
 @media (max-width:375px){
   .moment-card,.moments-feed .feed-card{border-radius:10px;box-shadow:none}
@@ -3528,6 +3553,12 @@ body{
   <div class="page" id="page-moments">
     <div class="moments-head">
       <h2>Moments</h2>
+      <div class="mv-seg" id="mvSeg" role="group" aria-label="Chế độ xem">
+        <button type="button" data-mv="feed" title="Danh sách" aria-label="Danh sách"><i class="bi bi-view-stacked"></i></button>
+        <button type="button" data-mv="2" title="2 cột" aria-label="2 cột">2</button>
+        <button type="button" data-mv="3" title="3 cột" aria-label="3 cột">3</button>
+        <button type="button" data-mv="4" title="4 cột" aria-label="4 cột">4</button>
+      </div>
       <button type="button" class="moments-refresh-btn" id="momentsRefreshBtn" onclick="refreshMomentsNow();return false;" title="Làm mới Moments" aria-label="Làm mới Moments">
         <i class="bi bi-arrow-clockwise" id="momentsRefreshIcon"></i>
       </button>
@@ -4359,7 +4390,9 @@ function doLogin(){
 }
 {% else %}
 /* ===================== Nav / paging ===================== */
-function showPage(name){
+var _curPage='dash';
+function _showPage(name){
+  _curPage=name;
   ['dash','upload','moments','friends'].forEach(p=>{
     $(`page-${p}`).classList.remove('active');
     const nb=$(`nav-${p}`); if(nb)nb.classList.remove('active');
@@ -4606,6 +4639,7 @@ function personCard(u,rel){
 function searchPeople(){
   var q=(($('peopleQuery')||{}).value||'').trim();
   if(!q) return;
+  try{ if(_curPage==='friends') history.replaceState(history.state,'','/friends?q='+encodeURIComponent(q)); }catch(e){}
   var box=$('peopleResult');
   box.innerHTML='<div class="skeleton" style="height:68px"></div>';
   apiTimeout('/api/people/search?q='+encodeURIComponent(q),null,25000).then(function(d){
@@ -4756,13 +4790,54 @@ function momentProf(m,friendMap){
 let momentsRendered=0;
 var _momentsBootLock = false; // true while opening tab — block scroll-triggered append
 var _momentsHiddenAt = 0;
-function momentsBatchSize(){ return MOMENT_BATCH; }
+function momentsBatchSize(){ return MOMENTS_GRID_MODE ? Math.max(MOMENT_BATCH, momentsCols()*2) : MOMENT_BATCH; }
 // The grid (desktop) and feed (phone) are mutually exclusive per the @media(max-width:520px)
 // breakpoint in the CSS — only one is ever visible. Previously both were always built for every
 // moment, silently doubling DOM nodes, image decodes and network requests on every device,
 // which is a big part of why Moments felt heavy on iPhone 6. IS_PHONE mirrors that same 520px
 // cutoff, so we now build only the node that will actually be shown.
-var MOMENTS_GRID_MODE = !IS_PHONE;
+var MV_KEY='locket_moments_view_v1';
+function readMomentsView(){
+  try{ var v=localStorage.getItem(MV_KEY); if(v==='feed'||v==='2'||v==='3'||v==='4') return v; }catch(e){}
+  return IS_PHONE?'feed':'3';
+}
+var MOMENTS_VIEW=readMomentsView();
+var MOMENTS_GRID_MODE = MOMENTS_VIEW!=='feed';
+function momentsCols(){ return MOMENTS_VIEW==='feed'?1:(parseInt(MOMENTS_VIEW,10)||3); }
+function applyMomentsView(){
+  var b=document.body;
+  b.className=(b.className||'').split(' ').filter(function(c){return c&&c.indexOf('mv-')!==0;})
+    .concat([MOMENTS_GRID_MODE?'mv-grid':'mv-feed']).join(' ');
+  var g=$('momentsGrid');
+  if(g){
+    var n=momentsCols();
+    g.className='moments-grid cols-'+n+((n>=4||(n>=3&&window.innerWidth<=520))?' dense':'');
+  }
+  var seg=$('mvSeg');
+  if(seg){
+    var bs=seg.querySelectorAll('button');
+    for(var i=0;i<bs.length;i++) bs[i].classList.toggle('active', bs[i].getAttribute('data-mv')===MOMENTS_VIEW);
+  }
+}
+function setMomentsView(v){
+  if(v!=='feed'&&v!=='2'&&v!=='3'&&v!=='4') return;
+  if(v===MOMENTS_VIEW) return;
+  MOMENTS_VIEW=v; MOMENTS_GRID_MODE=(v!=='feed');
+  try{ localStorage.setItem(MV_KEY, v); }catch(e){}
+  applyMomentsView();
+  var items=window._momentItems||momentsCache||[];
+  if(items.length) renderMomentsUI(items, true);
+}
+function initMomentsView(){
+  applyMomentsView();
+  var seg=$('mvSeg');
+  if(seg) seg.addEventListener('click',function(e){
+    var b=e.target.closest?e.target.closest('button[data-mv]'):null;
+    if(b) setMomentsView(b.getAttribute('data-mv'));
+  });
+  var rt=null;
+  window.addEventListener('resize',function(){ clearTimeout(rt); rt=setTimeout(applyMomentsView,200); });
+}
 function buildMomentNode(m, idx, friendMap, eager){
   return MOMENTS_GRID_MODE ? buildMomentCard(m, idx, friendMap, eager) : buildFeedSlide(m, idx, friendMap, eager);
 }
@@ -4836,7 +4911,7 @@ function buildFeedSlide(m, idx, friendMap, eager){
 function appendMomentsBatch(){
   const items=window._momentItems||[];
   if(momentsRendered>=items.length){
-    const more=$('momentsMore'); if(more) more.classList.add('hidden');
+    updateMoreLabel();
     if(items.length){
       showProgress('Moments ' + items.length + '/' + items.length, items.length, items.length);
       hideProgress(800);
@@ -4857,8 +4932,7 @@ function appendMomentsBatch(){
   if(target && frag) target.appendChild(frag);
   momentsRendered=end;
   showProgress('Moments ' + momentsRendered + '/' + items.length, momentsRendered, items.length);
-  const more=$('momentsMore');
-  if(more) more.classList.toggle('hidden', momentsRendered>=items.length);
+  updateMoreLabel();
   // kick lazy load for newly painted nodes near viewport
   scheduleLazyLoad();
 }
@@ -4996,6 +5070,7 @@ function scheduleLazyLoad(){
   }, 60);
 }
 function runLazyLoad(){
+  pumpMore();
   var root = momentsScrollEl() || document;
   var viewH = (root === document || root === window) ? window.innerHeight : root.clientHeight;
   var scrollTop = (root === document || root === window) ? (window.pageYOffset || document.documentElement.scrollTop) : root.scrollTop;
@@ -5068,12 +5143,7 @@ function bindMomentsScroll(){
       window._momentsMoreObserver.disconnect();
     }
     window._momentsMoreObserver=null;
-    const tryLoadMore=function(){
-      if(_momentsBootLock) return;
-      const items=window._momentItems||[];
-      if(momentsRendered>=items.length){ fetchMoreMoments(false); return; }
-      appendMomentsBatch();
-    };
+    const tryLoadMore=function(){ pumpMore(); };
     if(window.IntersectionObserver){
       window._momentsMoreObserver=new IntersectionObserver(function(entries){
         if(entries.some(function(e){return e.isIntersecting})) tryLoadMore();
@@ -5258,22 +5328,27 @@ function notifyMomentsWarning(d){
 
 var _momentsMoreBusy=false, _momentsHasMore=true, _momentsAutoRounds=2;
 function momentTs(m){ return (m&&(m.timestamp||(m.date&&m.date._seconds)))||0; }
+var _momentsEmptyStreak=0;
 function fetchMoreMoments(auto){
-  if(_momentsMoreBusy||!_momentsHasMore) return;
-  _momentsMoreBusy=true;
+  if(_momentsMoreBusy||!_momentsHasMore||navigator.onLine===false){ updateMoreLabel(); return; }
+  _momentsMoreBusy=true; updateMoreLabel();
   var have=(window._momentItems||[]).length;
   apiTimeout('/api/moments/more?have='+have, null, 45000).then(function(d){
     _momentsMoreBusy=false;
-    if(!d||!d.ok) return;
+    if(!d||!d.ok){ updateMoreLabel(); return; }
     _momentsHasMore=d.has_more!==false;
     var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
     var cur=window._momentItems||[];
-    if(items.length<=cur.length) return;
+    if(items.length<=cur.length){
+      if(++_momentsEmptyStreak>=2) _momentsHasMore=false;
+      updateMoreLabel(); return;
+    }
     momentsCache=items;
     momentsUpdatedAt=d.updated_at||momentsUpdatedAt;
     writeMomentsLocal(items, momentsUpdatedAt);
     var scroller=momentsScrollEl();
     var top=(scroller&&scroller.scrollTop)||window.pageYOffset||0;
+    var gotNew=true;
     if(top<250){
       renderMomentsUI(items, true);
     } else {
@@ -5281,14 +5356,18 @@ function fetchMoreMoments(auto){
       var seen={};
       cur.forEach(function(m){ seen[momentKey(m)]=1; });
       var older=items.filter(function(m){ return momentTs(m)<lastTs && !seen[momentKey(m)]; });
-      window._momentItems=cur.concat(older);
-      appendMomentsBatch();
+      gotNew=older.length>0;
+      if(gotNew){ window._momentItems=cur.concat(older); appendMomentsBatch(); }
     }
+    if(gotNew) _momentsEmptyStreak=0;
+    else if(++_momentsEmptyStreak>=2) _momentsHasMore=false;
+    updateMoreLabel();
+    if(gotNew) pumpMore();
     if(auto && _momentsAutoRounds>0 && _momentsHasMore){
       _momentsAutoRounds--;
       setTimeout(function(){ fetchMoreMoments(true); }, 300);
     }
-  }).catch(function(){ _momentsMoreBusy=false; });
+  }).catch(function(){ _momentsMoreBusy=false; updateMoreLabel(); });
 }
 
 function loadMoments(force){
@@ -5341,6 +5420,7 @@ function loadMoments(force){
     var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
     applyMomentsNetworkResult(items, d.updated_at, true);
     _momentsHasMore=d.has_more!==false;
+    _momentsEmptyStreak=0;
     _momentsAutoRounds=2;
     setTimeout(function(){ fetchMoreMoments(true); }, 500);
     if(queued) loadMoments(true);
@@ -5397,6 +5477,7 @@ function preloadMoments(){
   }
 }
 function pollMomentsOnce(){
+  try{ pumpMore(); updateMoreLabel(); }catch(e){}
   apiTimeout('/api/moments/poll?since='+encodeURIComponent(momentsUpdatedAt||0), null, 20000).then(function(d){
     if(!d.ok||!d.changed)return;
     const items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
@@ -5438,10 +5519,118 @@ function viewerMediaError(el, msg){
     }
   }catch(e){}
 }
-var _viewsToken=0, _viewsTimer=null, _viewsCache={};
-var VIEWS_REFRESH_MS=20000;
+/* ===== Viewer + Views realtime (single-flight, tạm dừng khi ẩn tab, không rò rỉ) ===== */
+var _viewsToken=0, _viewsTimer=null, _viewsAbort=null, _viewsBusy=false;
+var _viewsCache={}, _viewsCacheKeys=[], _viewsActive=null, _viewsSig='';
+var _viewsIdle=0, _viewsFail=0, _viewsLastHtml='', _viewsPending=null;
+var VIEWS_FAST_MS=4000, VIEWS_SLOW_MS=12000, VIEWS_MAX_CACHE=20;
 
-function openViewer(idx){
+function viewsDelay(){
+  var base=_viewsIdle>=6?VIEWS_SLOW_MS:VIEWS_FAST_MS;
+  if(_viewsFail>0) base=Math.min(60000, base*Math.pow(2,_viewsFail));
+  return base;
+}
+function viewsCachePut(mid,d){
+  if(!_viewsCache[mid]) _viewsCacheKeys.push(mid);
+  _viewsCache[mid]=d;
+  while(_viewsCacheKeys.length>VIEWS_MAX_CACHE) delete _viewsCache[_viewsCacheKeys.shift()];
+}
+function stopViews(){
+  _viewsToken++;
+  if(_viewsTimer){ clearTimeout(_viewsTimer); _viewsTimer=null; }
+  if(_viewsAbort){ try{ _viewsAbort.abort(); }catch(e){} _viewsAbort=null; }
+  _viewsBusy=false; _viewsActive=null; _viewsSig=''; _viewsIdle=0; _viewsFail=0;
+  _viewsLastHtml=''; _viewsPending=null;
+}
+function startViews(mid){
+  stopViews();
+  _viewsActive={mid:mid, token:_viewsToken};
+  var c=_viewsCache[mid];
+  if(c){ _viewsSig=c.sig||''; renderViews(c); }
+  loadViews(!!c);
+}
+function scheduleViews(){
+  if(!_viewsActive||_viewsTimer) return;
+  _viewsTimer=setTimeout(function(){ _viewsTimer=null; loadViews(true); }, viewsDelay());
+}
+function loadViews(silent){
+  var act=_viewsActive; if(!act) return;
+  if(_viewsTimer){ clearTimeout(_viewsTimer); _viewsTimer=null; }
+  if(document.hidden || navigator.onLine===false || _viewsBusy) return;
+  var token=act.token, mid=act.mid;
+  var ctrl=(typeof AbortController!=='undefined')?new AbortController():null;
+  _viewsAbort=ctrl; _viewsBusy=true;
+  var killer=setTimeout(function(){ if(ctrl){ try{ ctrl.abort(); }catch(e){} } }, 20000);
+  var url='/api/moments/views?uid='+encodeURIComponent(mid)+(_viewsSig?'&sig='+encodeURIComponent(_viewsSig):'');
+  var opts={credentials:'same-origin'}; if(ctrl) opts.signal=ctrl.signal;
+  fetch(url, opts).then(function(r){ return r.json(); }).then(function(d){
+    clearTimeout(killer);
+    if(token!==_viewsToken) return;
+    _viewsBusy=false; _viewsAbort=null;
+    if(!d||!d.ok){
+      if(d && d.error==='Not logged in') return;
+      _viewsFail++;
+      if(!_viewsCache[mid]) renderViewsError((d&&d.error)||'Không tải được lượt xem', mid);
+      scheduleViews(); return;
+    }
+    _viewsFail=0;
+    if(d.unchanged){ _viewsIdle++; scheduleViews(); return; }
+    _viewsIdle=0; _viewsSig=d.sig||'';
+    viewsCachePut(mid, d);
+    renderViews(d);
+    scheduleViews();
+  }).catch(function(){
+    clearTimeout(killer);
+    if(token!==_viewsToken) return;
+    _viewsBusy=false; _viewsAbort=null; _viewsFail++;
+    if(!_viewsCache[mid]) renderViewsError('Lỗi mạng', mid);
+    scheduleViews();
+  });
+}
+function renderViewsError(msg, mid){
+  var list=$('viewerList'); if(!list) return;
+  _viewsLastHtml='';
+  list.innerHTML=`<div class="people-msg">${esc(msg)}<br><button type="button" class="vs-retry" data-mid="${esc(mid)}" onclick="startViews(this.getAttribute('data-mid'))">Thử lại</button></div>`;
+}
+function renderViews(d){
+  var list=$('viewerList'); if(!list) return;
+  var viewers=d.viewers||[], count=d.count||viewers.length;
+  var c=$('vsCount'); if(c) c.textContent='Lượt xem · '+count;
+  var tally={};
+  viewers.forEach(function(v){ if(v.reaction) tally[v.reaction]=(tally[v.reaction]||0)+1; });
+  var r=$('vsReact');
+  if(r) r.innerHTML=Object.keys(tally).map(function(e){
+    return '<span class="vs-chip">'+esc(e)+' '+tally[e]+'</span>';
+  }).join('');
+  var side=$('viewerSide');
+  if(side && side.classList.contains('collapsed')){ _viewsPending=d; return; }
+  _viewsPending=null;
+  var html=viewers.length
+    ? viewers.map(viewerRow).join('')
+    : '<div class="people-msg" style="text-align:center;padding:28px 0">Chưa có ai xem</div>';
+  if(html===_viewsLastHtml) return;
+  _viewsLastHtml=html;
+  var keep=list.scrollTop;
+  list.innerHTML=html;
+  list.scrollTop=keep;
+}
+function toggleViewsSide(){
+  var s=$('viewerSide'); if(!s) return;
+  s.classList.toggle('collapsed');
+  if(!s.classList.contains('collapsed') && _viewsPending) renderViews(_viewsPending);
+}
+if(!window._viewsListeners){
+  window._viewsListeners=true;
+  document.addEventListener('visibilitychange',function(){
+    if(!_viewsActive) return;
+    if(document.hidden){ if(_viewsTimer){ clearTimeout(_viewsTimer); _viewsTimer=null; } }
+    else { _viewsIdle=0; loadViews(true); }
+  });
+  window.addEventListener('online',function(){ if(_viewsActive){ _viewsFail=0; loadViews(true); } });
+}
+
+var _viewerOpenId=null;
+function openViewer(idx, fromRoute){
   const m=(window._momentItems||[])[idx]; if(!m)return;
   const v=$('viewerStage');
   const isVid=!!m.video_url;
@@ -5451,6 +5640,7 @@ function openViewer(idx){
   const cap=extractCaption(m);
   const mid=m.canonical_uid||m.id||'';
   const showSide=!!(BOOT_UID && m.user===BOOT_UID && mid);
+  stopViews();
 
   const media=isVid
     ? `<video class="viewer-media" src="${esc(src)}" ${poster?`poster="${esc(poster)}"`:''} controls autoplay playsinline onerror="viewerMediaError(this,'Không phát được video')"></video>`
@@ -5477,64 +5667,136 @@ function openViewer(idx){
     </div>${side}`;
   v.classList.remove('hidden');
   document.body.style.overflow='hidden';
+  _viewerOpenId=mid||('i'+idx);
+  if(!fromRoute && mid) pushRoute('/moments/'+encodeURIComponent(mid), {page:'moments', viewer:1});
   if(showSide) startViews(mid);
 }
-function closeViewer(){
+function closeViewer(fromPop){
   stopViews();
   const v=$('viewerStage');
-  v.classList.add('hidden');
-  v.innerHTML='';
+  if(v){ v.classList.add('hidden'); v.innerHTML=''; }
   document.body.style.overflow='';
-}
-function toggleViewsSide(){
-  var s=$('viewerSide'); if(s) s.classList.toggle('collapsed');
-}
-function stopViews(){
-  _viewsToken++;
-  if(_viewsTimer){ clearInterval(_viewsTimer); _viewsTimer=null; }
-}
-function startViews(mid){
-  stopViews();
-  var token=_viewsToken;
-  if(_viewsCache[mid]) renderViews(_viewsCache[mid]);
-  loadViews(mid, token, !!_viewsCache[mid]);
-  _viewsTimer=setInterval(function(){ loadViews(mid, token, true); }, VIEWS_REFRESH_MS);
-}
-function loadViews(mid, token, silent){
-  apiTimeout('/api/moments/views?uid='+encodeURIComponent(mid), null, 25000).then(function(d){
-    if(token!==_viewsToken) return;
-    if(!d||!d.ok){ if(!silent) renderViewsError((d&&d.error)||'Không tải được lượt xem', mid); return; }
-    _viewsCache[mid]=d;
-    renderViews(d);
-  }).catch(function(){
-    if(token!==_viewsToken) return;
-    if(!silent) renderViewsError('Lỗi mạng', mid);
-  });
-}
-function renderViewsError(msg, mid){
-  var list=$('viewerList'); if(!list) return;
-  list.innerHTML='<div class="people-msg">'+esc(msg)+'<br><button type="button" class="vs-retry" data-mid="'+esc(mid)+'" onclick="startViews(this.getAttribute(\\'data-mid\\'))">Thử lại</button></div>';
-}
-function renderViews(d){
-  var list=$('viewerList'); if(!list) return;
-  var viewers=d.viewers||[], count=d.count||viewers.length;
-  var c=$('vsCount'); if(c) c.textContent='Lượt xem · '+count;
-  var tally={};
-  viewers.forEach(function(v){ if(v.reaction) tally[v.reaction]=(tally[v.reaction]||0)+1; });
-  var r=$('vsReact');
-  if(r) r.innerHTML=Object.keys(tally).map(function(e){
-    return '<span class="vs-chip">'+esc(e)+' '+tally[e]+'</span>';
-  }).join('');
-  var keep=list.scrollTop;
-  list.innerHTML=viewers.length
-    ? viewers.map(viewerRow).join('')
-    : '<div class="people-msg" style="text-align:center;padding:28px 0">Chưa có ai xem</div>';
-  list.scrollTop=keep;
+  _viewerOpenId=null;
+  if(fromPop!==true){
+    try{
+      if(history.state && history.state.viewer) history.back();
+      else if(location.pathname.indexOf('/moments/')===0) history.replaceState({page:'moments'},'','/moments');
+    }catch(e){}
+  }
 }
 document.addEventListener('keydown',function(e){
   var v=$('viewerStage');
   if(e.key==='Escape' && v && !v.classList.contains('hidden')) closeViewer();
 });
+
+/* ===== Router: mỗi tab / ảnh có địa chỉ riêng ===== */
+var ROUTES={dash:'/',upload:'/upload',moments:'/moments',friends:'/friends'};
+var PAGE_TITLES={dash:'Locket Mini',upload:'Đăng khoảnh khắc · Locket Mini',moments:'Moments · Locket Mini',friends:'Bạn bè · Locket Mini'};
+function routeFromPath(path){
+  path=String(path||'/');
+  while(path.length>1 && path.charAt(path.length-1)==='/') path=path.slice(0,-1);
+  if(path==='/upload') return {page:'upload'};
+  if(path==='/friends') return {page:'friends'};
+  if(path==='/moments') return {page:'moments'};
+  if(path.indexOf('/moments/')===0){
+    var id=''; try{ id=decodeURIComponent(path.slice(9)); }catch(e){}
+    if(/^[A-Za-z0-9_-]{1,64}$/.test(id)) return {page:'moments', moment:id};
+    return {page:'moments'};
+  }
+  return {page:'dash'};
+}
+function setRouteTitle(name){ try{ document.title=PAGE_TITLES[name]||'Locket Mini'; }catch(e){} }
+function pushRoute(path, state){
+  try{
+    if(location.pathname+location.search===path) return;
+    history.pushState(state||{}, '', path);
+  }catch(e){}
+}
+function showPage(name, opts){
+  if(!ROUTES[name]) name='dash';
+  var vs=$('viewerStage');
+  if(vs && !vs.classList.contains('hidden')) closeViewer(true);
+  _showPage(name);
+  setRouteTitle(name);
+  if(!(opts&&opts.noPush)) pushRoute(ROUTES[name], {page:name});
+}
+function openMomentById(id, tries){
+  if(routeFromPath(location.pathname).moment!==id) return;
+  var items=window._momentItems||[];
+  for(var i=0;i<items.length;i++){
+    if((items[i].canonical_uid||items[i].id)===id){ openViewer(i, true); return; }
+  }
+  tries=tries||0;
+  if(tries<24) setTimeout(function(){ openMomentById(id, tries+1); }, 500);
+  else { try{ history.replaceState({page:'moments'},'','/moments'); }catch(e){} }
+}
+function onPop(){
+  var r=routeFromPath(location.pathname);
+  var vs=$('viewerStage'), open=!!(vs && !vs.classList.contains('hidden'));
+  if(r.page!==_curPage){ if(open){ closeViewer(true); open=false; } _showPage(r.page); setRouteTitle(r.page); }
+  if(r.moment) openMomentById(r.moment, 0);
+  else if(open) closeViewer(true);
+}
+function initRouter(){
+  var r=routeFromPath(location.pathname);
+  var canon=r.moment?('/moments/'+encodeURIComponent(r.moment)):ROUTES[r.page];
+  var search=(r.page==='friends')?location.search:'';
+  try{ history.replaceState({page:r.page}, '', canon+search); }catch(e){}
+  if(r.page!=='dash') _showPage(r.page);
+  setRouteTitle(r.page);
+  if(r.moment) openMomentById(r.moment, 0);
+  if(r.page==='friends' && search){
+    try{
+      var q=new URLSearchParams(search).get('q');
+      if(q && $('peopleQuery')){ $('peopleQuery').value=q; searchPeople(); }
+    }catch(e){}
+  }
+  window.addEventListener('popstate', onPop);
+}
+
+/* ===== Load-more không bao giờ đứng: bơm theo vị trí thật của sentinel ===== */
+var _pumpRaf=0;
+function pumpMore(){
+  if(_pumpRaf) return;
+  _pumpRaf=requestAnimationFrame(function(){ _pumpRaf=0; pumpMoreNow(); });
+}
+function sentinelNear(){
+  var p=$('page-moments'), s=$('momentsMoreSentinel');
+  if(!p||!s||!p.classList.contains('active')) return false;
+  return s.getBoundingClientRect().top < (window.innerHeight||800)+600;
+}
+function pumpMoreNow(){
+  if(_momentsBootLock){ setTimeout(pumpMore, 150); return; }
+  if(!sentinelNear()) return;
+  var items=window._momentItems||[];
+  if(momentsRendered<items.length){ appendMomentsBatch(); return; }
+  fetchMoreMoments(false);
+}
+function updateMoreLabel(){
+  var more=$('momentsMore'); if(!more) return;
+  var items=window._momentItems||[];
+  if(!items.length){ more.classList.add('hidden'); return; }
+  if(momentsRendered<items.length || _momentsMoreBusy){
+    if(more.getAttribute('data-s')!=='busy'){ more.textContent='Đang tải thêm…'; more.setAttribute('data-s','busy'); }
+    more.classList.remove('hidden'); return;
+  }
+  if(_momentsHasMore){
+    if(more.getAttribute('data-s')!=='tap'){
+      more.innerHTML='<button type="button" class="moments-empty-retry" onclick="forceMore();return false;">Tải thêm</button>';
+      more.setAttribute('data-s','tap');
+    }
+    more.classList.remove('hidden'); return;
+  }
+  more.classList.add('hidden');
+}
+function forceMore(){
+  _momentsHasMore=true; _momentsEmptyStreak=0;
+  var items=window._momentItems||[];
+  if(momentsRendered<items.length) appendMomentsBatch(); else fetchMoreMoments(false);
+  pumpMore();
+}
+window.addEventListener('resize', function(){ pumpMore(); });
+document.addEventListener('visibilitychange', function(){ if(!document.hidden) pumpMore(); });
 function timeAgoShort(sec){
   if(!sec) return '';
   var d=Math.max(0, Math.floor(Date.now()/1000 - sec));
@@ -5550,7 +5812,7 @@ function viewerRow(v){
     '<div class="viewer-info"><div class="viewer-name">'+esc(name)+'</div>'+
     (v.username?'<div class="viewer-user">@'+esc(v.username)+'</div>':'')+'</div>'+
     (v.reaction?'<span class="viewer-reaction">'+esc(v.reaction)+'</span>':'')+
-    '<span class="viewer-time">'+(v.viewed_at?timeAgo(v.viewed_at):'')+'</span></div>';
+    '<span class="viewer-time mtime"'+(v.viewed_at?' data-ts="'+v.viewed_at+'"':'')+'>'+(v.viewed_at?timeAgo(v.viewed_at):'')+'</span></div>';
 }
 
 
@@ -6581,6 +6843,7 @@ function toggleLowPower(on){
 }
 function maybeAutoCamera(){
   if(!isAutoCamera()) return;
+  if(location.pathname!=='/' && location.pathname!=='') return;
   // Always switch to Đăng. Live camera mode opens in-page stream;
   // otherwise open the system camera picker (capture=environment).
   setTimeout(function(){
@@ -6717,13 +6980,27 @@ function doUpload(){
   });
 }
 
-function doLogout(){apiTimeout('/api/logout', null, 10000).then(()=>location.reload()).catch(()=>location.reload())}
+function wipeLocalData(){
+  try{ localStorage.removeItem(MOMENTS_LS_KEY); localStorage.removeItem(FRIENDS_CACHE_KEY); }catch(e){}
+  try{
+    if(window.caches) caches.keys().then(function(ks){
+      ks.forEach(function(k){ if(k.indexOf('locket-mini')===0) caches.delete(k); });
+    });
+  }catch(e){}
+}
+function doLogout(){
+  stopViews();
+  var go=function(){ wipeLocalData(); location.href='/'; };
+  apiTimeout('/api/logout', null, 10000).then(go).catch(go);
+}
 
 /* boot */
 loadMe();
 preloadFriends();
 preloadMoments();
 bindMomentsClickDelegation();
+initMomentsView();
+initRouter();
 (function bindPreviewVidThumb(){
   var pv=$('previewVid');
   if(!pv) return;
@@ -6870,9 +7147,115 @@ if('serviceWorker' in navigator){
 from datetime import timedelta
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(24)
+def _load_secret() -> str:
+    # Secret ổn định giữa các lần khởi động để không bị đăng xuất hàng loạt.
+    env = os.environ.get("SECRET_KEY")
+    if env:
+        return env
+    path = os.path.join(FEED_HISTORY_DIR, "locket_secret.key")
+    try:
+        with open(path, encoding="utf-8") as f:
+            val = f.read().strip()
+        if len(val) >= 32:
+            return val
+    except Exception:
+        pass
+    val = os.urandom(32).hex()
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(val)
+    except Exception as e:
+        logger.warning("cannot persist secret key: %s", e)
+    return val
+
+
+app.secret_key = _load_secret()
 app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("LOCKET_HTTPS", "0") == "1"
+
+_CSP_ON = os.environ.get("LOCKET_CSP", "1") != "0"
+_CSP = ("default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
+        "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; "
+        "font-src 'self' data: https://raw.githubusercontent.com https://cdn.jsdelivr.net; "
+        "img-src 'self' data: blob: https:; media-src 'self' blob: https:; "
+        "connect-src 'self'; worker-src 'self'; manifest-src 'self'; "
+        "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
+_EXTRA_HOSTS = {h.strip().lower() for h in os.environ.get("LOCKET_ALLOWED_HOSTS", "").split(",") if h.strip()}
+_TRUST_PROXY = os.environ.get("LOCKET_TRUST_PROXY", "0") == "1"
+
+_LOGIN_FAILS: Dict[str, List[float]] = {}
+_LOGIN_LOCK = threading.Lock()
+_LOGIN_MAX_FAILS = 8
+_LOGIN_WINDOW_SEC = 600
+
+
+def _client_ip() -> str:
+    if _TRUST_PROXY:
+        fwd = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        if fwd:
+            return fwd
+    return request.remote_addr or "?"
+
+
+def _login_blocked() -> bool:
+    ip, now = _client_ip(), time.time()
+    with _LOGIN_LOCK:
+        hits = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < _LOGIN_WINDOW_SEC]
+        if hits:
+            _LOGIN_FAILS[ip] = hits
+        else:
+            _LOGIN_FAILS.pop(ip, None)
+        return len(hits) >= _LOGIN_MAX_FAILS
+
+
+def _login_fail() -> None:
+    ip, now = _client_ip(), time.time()
+    with _LOGIN_LOCK:
+        if len(_LOGIN_FAILS) > 500:
+            for k in [k for k, v in _LOGIN_FAILS.items() if not v or now - v[-1] > _LOGIN_WINDOW_SEC]:
+                _LOGIN_FAILS.pop(k, None)
+        _LOGIN_FAILS.setdefault(ip, []).append(now)
+
+
+def _login_clear() -> None:
+    with _LOGIN_LOCK:
+        _LOGIN_FAILS.pop(_client_ip(), None)
+
+
+@app.before_request
+def _csrf_origin_check():
+    # Chặn POST cross-site tới /api/* (bổ sung cho SameSite=Lax).
+    if request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path.startswith("/api/"):
+        origin = request.headers.get("Origin") or request.headers.get("Referer")
+        if origin:
+            from urllib.parse import urlsplit
+            host = (urlsplit(origin).netloc or "").lower()
+            ok = {(request.host or "").lower(),
+                  (request.headers.get("X-Forwarded-Host") or "").split(",")[0].strip().lower()} | _EXTRA_HOSTS
+            if host not in ok:
+                return jsonify({"ok": False, "error": "Forbidden origin"}), 403
+    return None
+
+
+@app.after_request
+def _security_headers(resp):
+    h = resp.headers
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    h.setdefault("Permissions-Policy", "camera=(self), microphone=(), geolocation=()")
+    if request.path.startswith("/api/") and "Cache-Control" not in h:
+        h["Cache-Control"] = "no-store"
+    if (resp.mimetype or "") == "text/html":
+        h.setdefault("Cache-Control", "no-cache, private")
+        if _CSP_ON:
+            h.setdefault("Content-Security-Policy", _CSP)
+    return resp
 
 
 def get_session() -> Optional[LocketSession]:
@@ -6888,7 +7271,12 @@ def get_session() -> Optional[LocketSession]:
 
 
 @app.route("/")
-def index():
+@app.route("/login")
+@app.route("/upload")
+@app.route("/moments")
+@app.route("/moments/<mid>")
+@app.route("/friends")
+def index(mid=None):
     s = get_session()
     return render_template_string(
         HTML,
@@ -6955,7 +7343,7 @@ self.addEventListener('fetch',e=>{
         if(hit) return hit;
         try{
           const res=await fetch(req);
-          if(res && res.ok) c.put(req, res.clone());
+          if(res && res.ok){ c.put(req, res.clone()); c.keys().then(function(ks){ var im=ks.filter(function(k){return k.url.indexOf('/api/img')>-1}); if(im.length>220) c.delete(im[0]); }); }
           return res;
         }catch(err){
           return hit || Response.error();
@@ -6998,8 +7386,12 @@ def api_login():
     remember = bool(data.get("remember"))
     if not email or not password:
         return jsonify({"ok": False, "error": "Nhập email và mật khẩu"})
+    if _login_blocked():
+        return jsonify({"ok": False, "error": "Thử đăng nhập quá nhiều lần, đợi vài phút rồi thử lại."}), 429
     try:
         s, _dbg = login(email, password)
+        _login_clear()
+        session.clear()
         session.permanent = remember
         session["token"] = s.id_token
         session["local_id"] = s.local_id
@@ -7020,6 +7412,7 @@ def api_login():
             },
         })
     except LoginError as e:
+        _login_fail()
         logger.error("LOGIN failed: %s", e.friendly)
         return jsonify({"ok": False, "error": e.friendly})
     except Exception as e:
@@ -7390,7 +7783,21 @@ def fetch_moment_reactions(s: LocketSession, moment_uid: str, timeout: int = 10)
     return out
 
 
-def get_moment_views(s: LocketSession, moment_uid: str) -> Dict[str, Any]:
+def _cached_profile(s: LocketSession, uid: str) -> Dict[str, Any]:
+    st = _profile_state(s.local_id)
+    with _PROFILE_LOCK:
+        p = st["profiles"].get(uid)
+    if p and (p.get("first_name") or p.get("username") or p.get("profile_picture_url")):
+        return dict(p)
+    prof, _ = fetch_user_v2(s, uid)
+    prof["uid"] = prof.get("uid") or uid
+    with _PROFILE_LOCK:
+        if len(st["profiles"]) < 2000:
+            st["profiles"][uid] = prof
+    return dict(prof)
+
+
+def _get_moment_views_raw(s: LocketSession, moment_uid: str) -> Dict[str, Any]:
     res = _locket_post_api(s, "getMomentViews", {"moment_uid": moment_uid}, timeout=20, quiet=True)
     data = res.get("data", res) if isinstance(res, dict) else {}
     if not isinstance(data, dict):
@@ -7411,13 +7818,14 @@ def get_moment_views(s: LocketSession, moment_uid: str) -> Dict[str, Any]:
         reactions = []
     reaction_by_uid = {r["uid"]: r["emoji"] for r in reactions}
 
+    total_views = len(viewers)
+    viewers = viewers[:150]
     uids = [v["uid"] for v in viewers if v["uid"] != s.local_id]
     profiles: Dict[str, Dict[str, Any]] = {}
     if uids:
         def load(uid: str):
             try:
-                prof, _ = fetch_user_v2(s, uid)
-                prof["uid"] = prof.get("uid") or uid
+                prof = _cached_profile(s, uid)
                 return uid, prof
             except Exception:
                 return uid, {"uid": uid}
@@ -7431,10 +7839,54 @@ def get_moment_views(s: LocketSession, moment_uid: str) -> Dict[str, Any]:
         out_viewers.append({**prof, "viewed_at": v["viewed_at"], "reaction": reaction_by_uid.get(v["uid"], "")})
     out_viewers.sort(key=lambda x: x.get("viewed_at") or 0, reverse=True)
 
-    count = data.get("views_count") or data.get("count") or len(out_viewers)
+    count = data.get("views_count") or data.get("count") or total_views
     return {"count": int(count) if isinstance(count, (int, float)) else len(out_viewers),
             "viewers": out_viewers,
             "reaction_count": len(reactions)}
+
+
+_VIEWS_LOCK = threading.Lock()
+_VIEWS_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+_VIEWS_INFLIGHT: Dict[Tuple[str, str], threading.Event] = {}
+_VIEWS_TTL_SEC = 3.0
+_VIEWS_CACHE_MAX = 120
+
+
+def get_moment_views(s: LocketSession, moment_uid: str) -> Dict[str, Any]:
+    # Cache 3s + single-flight: nhiều tab/poll cùng lúc chỉ tốn 1 lần gọi upstream.
+    key = (s.local_id, moment_uid)
+    now = time.time()
+    with _VIEWS_LOCK:
+        hit = _VIEWS_CACHE.get(key)
+        if hit and now - hit[0] < _VIEWS_TTL_SEC:
+            return hit[1]
+        ev = _VIEWS_INFLIGHT.get(key)
+        leader = ev is None
+        if leader:
+            ev = threading.Event()
+            _VIEWS_INFLIGHT[key] = ev
+    if not leader:
+        ev.wait(25)
+        with _VIEWS_LOCK:
+            hit = _VIEWS_CACHE.get(key)
+        if hit:
+            return hit[1]
+        raise LocketError("views busy")
+    try:
+        data = _get_moment_views_raw(s, moment_uid)
+        sig_src = json.dumps([(v.get("uid"), v.get("viewed_at"), v.get("reaction"))
+                              for v in data.get("viewers", [])], default=str)
+        data["sig"] = hashlib.md5(sig_src.encode("utf-8")).hexdigest()[:16]
+        with _VIEWS_LOCK:
+            _VIEWS_CACHE[key] = (time.time(), data)
+            if len(_VIEWS_CACHE) > _VIEWS_CACHE_MAX:
+                for k, _ in sorted(_VIEWS_CACHE.items(), key=lambda kv: kv[1][0])[:_VIEWS_CACHE_MAX // 2]:
+                    _VIEWS_CACHE.pop(k, None)
+        return data
+    finally:
+        with _VIEWS_LOCK:
+            _VIEWS_INFLIGHT.pop(key, None)
+        ev.set()
 
 
 @app.route("/api/moments/views")
@@ -7442,9 +7894,12 @@ def api_moment_views():
     uid = request.args.get("uid", "")
 
     def run(s):
-        if not uid or len(uid) > 64:
+        if not uid or not re.match(r"^[A-Za-z0-9_-]{1,64}$", uid):
             raise LocketError("Missing moment id")
-        return get_moment_views(s, uid)
+        data = get_moment_views(s, uid)
+        if request.args.get("sig") and request.args.get("sig") == data.get("sig"):
+            return {"unchanged": True, "sig": data["sig"], "count": data.get("count")}
+        return data
     return _people_call(run)
 
 
@@ -7554,6 +8009,8 @@ def api_img():
         url = unquote(url)
     if not url.startswith("https://"):
         return jsonify({"ok": False, "error": "bad url"}), 400
+    if not _img_host_ok(url):
+        return jsonify({"ok": False, "error": "host not allowed"}), 403
     try:
         max_side = int(request.args.get("w") or 720)
     except Exception:
@@ -7582,7 +8039,7 @@ def api_img():
             r.raise_for_status()
             ctype = (r.headers.get("Content-Type") or "image/webp").split(";")[0].strip()
             resp = Response(r.content, mimetype=ctype)
-            resp.headers["Cache-Control"] = "public, max-age=900"
+            resp.headers["Cache-Control"] = "private, max-age=900"
             return resp
     except Exception:
         pass
@@ -7591,7 +8048,7 @@ def api_img():
         force_convert = not client_supports_webp
         data, mime = fetch_image_as_jpeg(url, max_side=max_side, force_convert=force_convert)
         resp = Response(data, mimetype=mime)
-        resp.headers["Cache-Control"] = "public, max-age=900"
+        resp.headers["Cache-Control"] = "private, max-age=900"
         return resp
     except Exception as e:
         logger.warning("IMG PROXY fail %s: %s", url[:120], e)
