@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
-from PIL import Image
+from PIL import Image, ImageOps
 from flask import Flask, request, session, jsonify, render_template_string
 
 try:
@@ -200,7 +200,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "2.7.1"
+APP_VERSION = "2.8"
 APP_BUILD = "2026.11.01"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
@@ -2376,7 +2376,7 @@ def _to_webp_or_jpeg(data: bytes, content_type: str) -> Tuple[bytes, str, str]:
         if img.size[0] > max_side:
             img = img.resize((max_side, max_side), Image.LANCZOS)
         buf = io.BytesIO()
-        img.save(buf, format="WEBP", quality=85, method=4)
+        img.save(buf, format="WEBP", quality=95, method=5)
         out = buf.getvalue()
         if out:
             return out, "image/webp", "webp"
@@ -2608,6 +2608,11 @@ def upload_media(s: LocketSession, data: bytes, filename: str, content_type: str
 # Locket-style limits: square ~1080, keep visual quality high, shrink if over size cap
 _LOCKET_MAX_SIDE = 1080
 _LOCKET_MAX_BYTES = 1_500_000  # ~1.5MB soft limit before quality steps down
+# Ngân sách thực tế (chỉnh bằng biến môi trường). Locket không công bố giới hạn;
+# 1080px vuông là kích thước của app chính thức, nên giữ nguyên kích thước và dồn chất lượng vào encode.
+_LOCKET_IMG_BUDGET = int(os.environ.get("LOCKET_IMG_MAX_BYTES", "2000000"))
+# Vercel giới hạn body request 4.5MB -> video phải nhỏ hơn mức này (đã trừ phần multipart/thumb).
+_VIDEO_MAX_BYTES = int(os.environ.get("LOCKET_VIDEO_MAX_BYTES", "3800000"))
 
 
 def _new_upload_name() -> str:
@@ -2660,6 +2665,73 @@ def compress_image(raw_bytes: bytes) -> Tuple[bytes, str]:
         if len(data) <= _LOCKET_MAX_BYTES:
             break
     return data, _new_upload_name()
+
+
+def _photo_name(ext: str) -> str:
+    return f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}.{ext}"
+
+
+def prepare_photo(raw: bytes) -> Tuple[bytes, str, str]:
+    # Chỉ MỘT lần encode lossy (hoặc lossless cho ảnh chụp màn hình PNG).
+    # Trước đây: JPEG 0.93 (4:2:0) -> decode -> WebP q85 = hai lần vỡ nét.
+    side = _LOCKET_MAX_SIDE
+    budget = _LOCKET_IMG_BUDGET
+    is_png = raw[:8] == b"\x89PNG\r\n\x1a\n"
+    is_webp = raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"
+    img = Image.open(io.BytesIO(raw))
+    if (is_webp and not getattr(img, "is_animated", False) and img.size[0] == img.size[1]
+            and img.size[0] <= side and len(raw) <= budget):
+        return raw, _photo_name("webp"), "image/webp"   # client đã encode đẹp rồi, không encode lại
+    if img.format == "JPEG":
+        try:
+            img.draft("RGB", (side * 2, side * 2))
+        except Exception:
+            pass
+    if getattr(img, "is_animated", False):
+        img.seek(0)
+    try:
+        img = ImageOps.exif_transpose(img) or img
+    except Exception:
+        pass
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (0, 0, 0))
+        bg.paste(rgba, mask=rgba.split()[-1])
+        img = bg
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+    w, h = img.size
+    if w != h:
+        s = min(w, h)
+        left, top = (w - s) // 2, (h - s) // 2
+        img = img.crop((left, top, left + s, top + s))
+    if img.size[0] > side:
+        img = img.resize((side, side), Image.LANCZOS)   # không phóng to ảnh nhỏ hơn 1080
+    try:
+        out_bytes = None
+        if is_png:
+            buf = io.BytesIO()
+            img.save(buf, format="WEBP", lossless=True, quality=90, method=4)
+            if buf.tell() <= budget:
+                out_bytes = buf.getvalue()
+        if out_bytes is None:
+            for q in (97, 94, 91, 88, 84, 80, 75, 70):
+                buf = io.BytesIO()
+                img.save(buf, format="WEBP", quality=q, method=5)
+                out_bytes = buf.getvalue()
+                if len(out_bytes) <= budget:
+                    break
+        return out_bytes, _photo_name("webp"), "image/webp"
+    except Exception as e:
+        logger.warning("webp encode failed (%s) - JPEG 4:4:4 fallback", e)
+        out_bytes = b""
+        for q in (95, 92, 88, 84, 80, 75):
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=q, subsampling=0, optimize=True)
+            out_bytes = buf.getvalue()
+            if len(out_bytes) <= budget:
+                break
+        return out_bytes, _photo_name("jpg"), "image/jpeg"
 
 
 _ALLOWED_IMG_HOSTS = (
@@ -2774,9 +2846,9 @@ def fetch_image_as_jpeg(url: str, max_side: int = 720, timeout: int = 15, force_
                     img = img.resize((max_side, max(1, int(h * max_side / w))), Image.LANCZOS)
                 else:
                     img = img.resize((max(1, int(w * max_side / h)), max_side), Image.LANCZOS)
-        quality = 65 if max_side <= 400 else (72 if max_side <= 540 else (78 if max_side <= 800 else 85))
+        quality = 65 if max_side <= 400 else (72 if max_side <= 540 else (78 if max_side <= 800 else (85 if max_side < 1000 else 92)))
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality, optimize=False)
+        img.save(buf, format="JPEG", quality=quality, optimize=False, subsampling=(0 if max_side >= 1000 else -1))
         data = buf.getvalue()
         out_mime = "image/jpeg"
     except Exception as e:
@@ -3321,10 +3393,10 @@ body.mv-feed .moments-feed{display:block !important}
 .cropper-line{background:var(--accent)}
 .crop-footer{flex-shrink:0;padding:12px 16px 20px;background:#000}
 .vcrop-area{flex:1;min-height:0;position:relative;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden}
-.vcrop-area video{max-width:100%;max-height:100%;display:block}
+.vcrop-area video{position:absolute;top:0;left:0;width:100%;height:100%;max-width:none;max-height:none;object-fit:contain;background:#000;display:block}
 .vcrop-box{position:absolute;border:2px solid var(--accent);box-shadow:0 0 0 9999px rgba(0,0,0,.6);
   touch-action:none;cursor:move;box-sizing:border-box}
-.vcrop-box::before{content:'';position:absolute;inset:0;border:1px solid rgba(255,255,255,.35);pointer-events:none}
+.vcrop-box::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;border:1px solid rgba(255,255,255,.35);pointer-events:none}
 .speed-head{display:flex;align-items:center;justify-content:space-between;margin:10px 0 8px}
 .speed-head .label{margin:0}
 .speed-value{font-size:15px;font-weight:800;color:var(--accent);letter-spacing:.02em;min-width:3.2em;text-align:right}
@@ -3689,8 +3761,10 @@ const GOLD_BADGE="{{ gold_badge }}", CELEB_BADGE="{{ celeb_badge }}";
 const BOOT_NAME={{ (boot_name or '')|tojson }};
 const BOOT_UID={{ (boot_uid or '')|tojson }};
 const BOOT_PHOTO={{ (boot_photo or '')|tojson }};
+var VIDEO_BUDGET={{ video_budget|int }};
 let croppedBlob=null, originalFile=null, isVideo=false, cropper=null;
 let videoCropPayload=null, videoThumbBlob=null;
+var videoCropOriginal='', _bestPng=true;
 let originalVideoBlob=null, videoSpeedFactor=1, videoSpeedSliderObj=null;
 var CAN_RENDER_VIDEO_SPEED = (typeof MediaRecorder!=='undefined' &&
   typeof document.createElement('canvas').captureStream==='function');
@@ -3699,7 +3773,40 @@ var CAN_RENDER_VIDEO_SPEED = (typeof MediaRecorder!=='undefined' &&
    video} — no extra "view" key. x/y/w/h are in the video's own native pixels
    (not CSS/displayed pixels) — the crop modal below does that conversion. */
 function videoCropJson(vw, vh, x, y, side){
-  return JSON.stringify({type:'video', crop:{x:Math.round(x),y:Math.round(y),w:Math.round(side),h:Math.round(side)}, video:{videoWidth:vw,videoHeight:vh}});
+  side=Math.max(2, Math.min(Math.round(side), vw, vh)); side-=side%2;
+  x=Math.max(0, Math.min(Math.round(x), vw-side)); x-=x%2;
+  y=Math.max(0, Math.min(Math.round(y), vh-side)); y-=y%2;
+  return JSON.stringify({type:'video', crop:{x:x,y:y,w:side,h:side}, video:{videoWidth:vw,videoHeight:vh}});
+}
+function cropFromJson(json, vw, vh){
+  try{
+    var o=JSON.parse(json), c=o&&o.crop;
+    if(!c) return null;
+    var ow=(o.video&&o.video.videoWidth)||vw, oh=(o.video&&o.video.videoHeight)||vh;
+    var s=Math.max(2, Math.min(Math.round(c.w*vw/ow), vw, vh));
+    var x=Math.max(0, Math.min(Math.round(c.x*vw/ow), vw-s));
+    var y=Math.max(0, Math.min(Math.round(c.y*vh/oh), vh-s));
+    return {x:x, y:y, s:s};
+  }catch(e){ return null; }
+}
+/* Preview vuông dùng object-fit:cover -> phải dịch object-position theo vùng crop, nếu không luôn hiện giữa khung */
+function applyPreviewCrop(json){
+  var pv=$('previewVid'); if(!pv) return;
+  var px=50, py=50;
+  try{
+    var o=JSON.parse(json), c=o.crop, vw=o.video.videoWidth, vh=o.video.videoHeight;
+    if(vw>vh && vw-c.w>0) px=Math.max(0, Math.min(100, c.x/(vw-c.w)*100));
+    else if(vh>vw && vh-c.h>0) py=Math.max(0, Math.min(100, c.y/(vh-c.h)*100));
+  }catch(e){}
+  pv.style.objectPosition=px+'% '+py+'%';
+}
+function fixVideoName(name, blob){
+  var t=(blob&&blob.type)||'';
+  var ext=t.indexOf('mp4')>=0?'mp4':(t.indexOf('webm')>=0?'webm':(t.indexOf('quicktime')>=0?'mov':''));
+  if(!ext) return name||'video.mp4';
+  var base=String(name||'video'), i=base.lastIndexOf('.');
+  if(i>0) base=base.slice(0, i);
+  return base+'.'+ext;
 }
 function centerVideoCropJson(vw, vh){
   var side=Math.min(vw, vh);
@@ -3935,6 +4042,7 @@ function setVideoSpeed(x){
     _speedRenderToken++;
     setSpeedBusy(false);
     croppedBlob = originalVideoBlob;
+    videoCropPayload = videoCropOriginal;
     refreshVideoThumb();
     var pv = $('previewVid');
     if(pv){
@@ -3962,178 +4070,148 @@ function setVideoSpeed(x){
   renderVideoAtSpeed(x);
 }
 
-function renderVideoAtSpeed(x){
-  var token = ++_speedRenderToken;
-  setSpeedBusy(true, 'Đang xuất ' + (Math.round(x*10)/10) + '×…');
-
-  var srcVideo = document.createElement('video');
-  srcVideo.muted = true;
-  srcVideo.playsInline = true;
-  srcVideo.setAttribute('playsinline', '');
-  srcVideo.setAttribute('webkit-playsinline', '');
-  srcVideo.preload = 'auto';
-  // Do NOT loop the source during bake — onended ends the recorder
-  srcVideo.loop = false;
-  srcVideo.src = URL.createObjectURL(originalVideoBlob);
-
-  function fail(msg){
-    if(token !== _speedRenderToken) return;
-    setSpeedBusy(false);
-    toast(msg || 'Không xuất được video');
-  }
-
-  srcVideo.onerror = function(){ fail('Không đọc được video gốc'); };
-
-  srcVideo.onloadedmetadata = function(){
-    if(token !== _speedRenderToken) return;
-    var w0 = srcVideo.videoWidth, h0 = srcVideo.videoHeight;
-    var dur = srcVideo.duration;
-    if(!w0 || !h0 || !dur || !isFinite(dur)){ fail('Không đọc được video gốc'); return; }
-
-    // Phone: downscale so encoder keeps realtime; large 1080 canvases drop frames → stutter/missing bits
-    var maxSide = (typeof IS_PHONE !== 'undefined' && IS_PHONE) ? 720 : 1080;
-    var scale = Math.min(1, maxSide / Math.max(w0, h0));
-    var w = Math.max(2, Math.round(w0 * scale / 2) * 2);
-    var h = Math.max(2, Math.round(h0 * scale / 2) * 2);
-
-    var canvas = document.createElement('canvas');
-    canvas.width = w; canvas.height = h;
-    var ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
-    try{ ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'medium'; }catch(e){}
-
-    var outFps = (typeof IS_PHONE !== 'undefined' && IS_PHONE) ? 24 : 30;
-    var stream, rec, mime;
+var _bakeSeq=0;
+function evenInt(n){ n=Math.round(n); return n-(n%2); }
+function pickBakeMime(){
+  var c=['video/mp4;codecs=avc1','video/mp4'];
+  if(!IS_PHONE) c.push('video/webm;codecs=vp9');
+  c.push('video/webm;codecs=vp8','video/webm');
+  for(var i=0;i<c.length;i++){ try{ if(MediaRecorder.isTypeSupported(c[i])) return c[i]; }catch(e){} }
+  return '';
+}
+function recordOnce(v, cr, side, bps, rate, outDur, fps, cancelled){
+  return new Promise(function(res, rej){
+    var canvas=document.createElement('canvas'); canvas.width=side; canvas.height=side;
+    var ctx=canvas.getContext('2d', {alpha:false});
+    try{ ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high'; }catch(e){}
+    var stream, rec, chunks=[], mime=pickBakeMime();
     try{
-      stream = canvas.captureStream(outFps);
-      if(MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/mp4')){
-        mime = 'video/mp4';
-      } else if(MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/webm;codecs=vp8')){
-        mime = 'video/webm;codecs=vp8';
-      } else if(MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/webm')){
-        mime = 'video/webm';
-      } else {
-        mime = '';
-      }
-      var recOpts = mime ? { mimeType: mime } : {};
-      // Lower bitrate on phone — fewer dropped frames under load
-      recOpts.videoBitsPerSecond = (typeof IS_PHONE !== 'undefined' && IS_PHONE) ? 1800000 : 3200000;
-      try{ rec = new MediaRecorder(stream, recOpts); }
-      catch(e1){ rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined); }
-    }catch(e){ fail('Trình duyệt không hỗ trợ xuất video tốc độ'); return; }
-
-    var chunks = [];
-    rec.ondataavailable = function(e){ if(e.data && e.data.size) chunks.push(e.data); };
-    rec.onerror = function(){ fail('Lỗi khi ghi video'); };
-
-    rec.onstop = function(){
+      stream=canvas.captureStream(fps);
+      var o={videoBitsPerSecond:bps}; if(mime) o.mimeType=mime;
+      rec=new MediaRecorder(stream, o);
+    }catch(e){ rej(new Error('Trình duyệt không hỗ trợ xuất video')); return; }
+    var drawing=false, raf=0, vfc=0, settled=false, poll=null, kill=null;
+    function paint(){ try{ ctx.drawImage(v, cr.x, cr.y, cr.s, cr.s, 0, 0, side, side); }catch(e){} }
+    function loopRaf(){ if(!drawing) return; paint(); raf=requestAnimationFrame(loopRaf); }
+    function loopVfc(){
+      if(!drawing) return;
+      paint();
+      try{ vfc=v.requestVideoFrameCallback(loopVfc); }catch(e){ loopRaf(); }
+    }
+    function stop(){
+      drawing=false;
+      try{ if(raf) cancelAnimationFrame(raf); }catch(e){}
+      try{ if(vfc && v.cancelVideoFrameCallback) v.cancelVideoFrameCallback(vfc); }catch(e){}
+      try{ v.pause(); }catch(e){}
+      try{ if(rec.state==='recording') rec.stop(); }catch(e){}
+    }
+    function clear(){ clearTimeout(kill); clearInterval(poll); v.onended=null; v.onplay=null; }
+    rec.ondataavailable=function(ev){ if(ev.data && ev.data.size) chunks.push(ev.data); };
+    rec.onerror=function(){ if(settled) return; settled=true; clear(); stop(); rej(new Error('Lỗi khi ghi video')); };
+    rec.onstop=function(){
       try{ stream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){}
-      try{ URL.revokeObjectURL(srcVideo.src); }catch(e){}
-      if(token !== _speedRenderToken) return;
-      var outType = (mime && mime.indexOf('mp4') >= 0) ? 'video/mp4' : 'video/webm';
-      var outBlob = new Blob(chunks, { type: outType });
+      if(settled) return;
+      settled=true; clear();
+      var type=(mime && mime.indexOf('mp4')>=0)?'video/mp4':'video/webm';
+      res(new Blob(chunks, {type:type}));
+    };
+    v.onended=function(){ paint(); setTimeout(stop, 60); };
+    kill=setTimeout(stop, Math.min(60000, Math.ceil(outDur*1000)+4000));
+    poll=setInterval(function(){
+      if(cancelled && cancelled() && !settled){ settled=true; clear(); stop(); rej(new Error('cancelled')); }
+    }, 300);
+    v.onplay=function(){
+      drawing=true;
+      try{ rec.start(250); }catch(e){ if(!settled){ settled=true; clear(); rej(new Error('Không bắt đầu ghi được')); } return; }
+      if(typeof v.requestVideoFrameCallback==='function'){ try{ vfc=v.requestVideoFrameCallback(loopVfc); }catch(e){ loopRaf(); } }
+      else loopRaf();
+    };
+    try{ v.currentTime=0; }catch(e){}
+    try{ v.playbackRate=rate; }catch(e){}
+    var p=v.play();
+    if(p && p.catch) p.catch(function(){ if(!settled){ settled=true; clear(); rej(new Error('Không phát được video để xuất')); } });
+  });
+}
+/* Xuất video vuông: đúng vùng crop người dùng chọn + tốc độ + vừa ngân sách byte (thử lại tối đa 2 lần). */
+function bakeVideo(blob, cropJson, speed, budget, cancelled){
+  return new Promise(function(resolve, reject){
+    var url=URL.createObjectURL(blob);
+    var v=document.createElement('video');
+    v.muted=true; v.playsInline=true; v.loop=false; v.preload='auto';
+    v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline','');
+    var finished=false;
+    function cleanup(){
+      try{ v.pause(); }catch(e){}
+      try{ v.removeAttribute('src'); v.load(); }catch(e){}
+      try{ URL.revokeObjectURL(url); }catch(e){}
+    }
+    function fail(msg){ if(finished) return; finished=true; cleanup(); reject(new Error(msg)); }
+    function done(r){ if(finished) return; finished=true; cleanup(); resolve(r); }
+    v.onerror=function(){ fail('Không đọc được video gốc'); };
+    v.onloadedmetadata=function(){
+      var vw=v.videoWidth, vh=v.videoHeight, dur=v.duration;
+      if(!vw || !vh || !dur || !isFinite(dur)){ fail('Không đọc được video gốc'); return; }
+      var cr=cropFromJson(cropJson, vw, vh);
+      if(!cr){ var s0=Math.min(vw, vh); cr={x:(vw-s0)/2, y:(vh-s0)/2, s:s0}; }
+      var rate=Math.min(Math.max(Number(speed)||1, 0.0625), 16);
+      var outDur=Math.max(dur/rate, 0.5);
+      var fps=IS_PHONE?24:30;
+      var side=evenInt(Math.min(IS_PHONE?720:1080, cr.s));
+      var bps=Math.min(Math.floor(budget*8*0.8/outDur), IS_PHONE?6000000:12000000);
+      while(bps/(fps*side*side)<0.06 && side>480) side=evenInt(side*0.8);
+      var attempt=0;
+      (function next(){
+        if(cancelled && cancelled()){ fail('cancelled'); return; }
+        recordOnce(v, cr, side, bps, rate, outDur, fps, cancelled).then(function(o){
+          if(o.size>budget && attempt<2){
+            attempt++;
+            bps=Math.floor(bps*budget/o.size*0.85);
+            while(bps/(fps*side*side)<0.05 && side>480) side=evenInt(side*0.8);
+            next(); return;
+          }
+          done({blob:o, cropJson:videoCropJson(side, side, 0, 0, side), over:o.size>budget});
+        }).catch(function(err){ fail((err&&err.message)||'Không xuất được video'); });
+      })();
+    };
+    v.src=url;
+  });
+}
+function renderVideoAtSpeed(x){
+  var token=++_speedRenderToken;
+  setSpeedBusy(true, 'Đang xuất ' + (Math.round(x*10)/10) + '×…');
+  bakeVideo(originalVideoBlob, videoCropOriginal, x, VIDEO_BUDGET, function(){ return token!==_speedRenderToken; })
+    .then(function(r){
+      if(token!==_speedRenderToken) return;
       setSpeedBusy(false);
-      if(!outBlob.size){ toast('Xuất tốc độ thất bại, thử lại'); return; }
-      croppedBlob = outBlob;
-      // Re-capture still AFTER bake so Locket gets a real frame (not 16x16 black)
+      croppedBlob=r.blob; videoCropPayload=r.cropJson;
       refreshVideoThumb();
-      // Do NOT replace preview src with baked blob on phone — switching src feels janky
-      // and the live playbackRate preview is already correct. Keep original for preview.
-      var pv = $('previewVid');
-      if(pv){
-        // Mark that upload blob is baked; preview still uses original + playbackRate
-        try{ pv.dataset.baked = '0'; }catch(e){}
-        applyPreviewSpeed(x);
-      }
-      toast('Đã xuất ' + (Math.round(x*10)/10) + '× — sẵn sàng đăng');
-    };
-
-    var drawing = false;
-    var rafId = 0;
-    var vfcId = 0;
-
-    function paint(){
-      if(!drawing || token !== _speedRenderToken) return;
-      try{ ctx.drawImage(srcVideo, 0, 0, w, h); }catch(e){}
-    }
-
-    function loopRaf(){
-      if(!drawing) return;
-      paint();
-      rafId = requestAnimationFrame(loopRaf);
-    }
-
-    function loopVfc(now, meta){
-      if(!drawing) return;
-      paint();
-      try{
-        vfcId = srcVideo.requestVideoFrameCallback(loopVfc);
-      }catch(e){
-        loopRaf();
-      }
-    }
-
-    function stopBake(){
-      drawing = false;
-      try{ if(rafId) cancelAnimationFrame(rafId); }catch(e){}
-      try{ if(vfcId && srcVideo.cancelVideoFrameCallback) srcVideo.cancelVideoFrameCallback(vfcId); }catch(e){}
-      try{ if(rec && rec.state === 'recording') rec.stop(); }catch(e){}
-    }
-
-    srcVideo.onended = function(){
-      // One extra paint of last frame then stop
-      paint();
-      setTimeout(function(){
-        if(token !== _speedRenderToken) return;
-        stopBake();
-      }, 60);
-    };
-
-    // Cap bake wall time so a long clip at low speed can't hang forever
-    var maxMs = Math.min(45000, Math.ceil((dur / x) * 1000) + 3000);
-    var killTimer = setTimeout(function(){
-      if(token !== _speedRenderToken) return;
-      try{ srcVideo.pause(); }catch(e){}
-      stopBake();
-    }, maxMs);
-
-    srcVideo.onplay = function(){
-      if(token !== _speedRenderToken) return;
-      drawing = true;
-      try{ rec.start(250); }catch(e){ fail('Không bắt đầu ghi được'); return; }
-      if(typeof srcVideo.requestVideoFrameCallback === 'function'){
-        try{ vfcId = srcVideo.requestVideoFrameCallback(loopVfc); }
-        catch(e){ loopRaf(); }
-      } else {
-        loopRaf();
-      }
-    };
-
-    // Set rate BEFORE play so the first frames are already accelerated
-    try{ srcVideo.playbackRate = Math.min(Math.max(x, 0.0625), 16); }catch(e){}
-    // Wait until we can play through a bit — reduces early black/missing frames on cellular
-    var startPlay = function(){
-      if(token !== _speedRenderToken) return;
-      var p = srcVideo.play();
-      if(p && p.catch) p.catch(function(){ fail('Không phát được video để xuất'); });
-    };
-    if(srcVideo.readyState >= 3){
-      startPlay();
-    } else {
-      srcVideo.addEventListener('canplay', function onCan(){
-        srcVideo.removeEventListener('canplay', onCan);
-        startPlay();
-      });
-      // Fallback if canplay never fires
-      setTimeout(startPlay, 1200);
-    }
-
-    // Clear kill timer when stopped cleanly
-    var origOnStop = rec.onstop;
-    rec.onstop = function(ev){
-      clearTimeout(killTimer);
-      if(typeof origOnStop === 'function') origOnStop.call(rec, ev);
-    };
-  };
+      applyPreviewSpeed(x);
+      toast(r.over ? 'Đã xuất nhưng vẫn lớn hơn giới hạn gửi' : 'Đã xuất ' + (Math.round(x*10)/10) + '× — sẵn sàng đăng');
+    }).catch(function(err){
+      if(token!==_speedRenderToken) return;
+      setSpeedBusy(false);
+      if(err && err.message==='cancelled') return;
+      toast((err&&err.message)||'Không xuất được video');
+    });
+}
+/* Video lớn hơn ngân sách (Vercel chỉ nhận ~4.5MB/request): tự cắt đúng vùng + nén lại trước khi gửi. */
+function ensureVideoFit(){
+  if(!isVideo || !croppedBlob || !originalVideoBlob) return Promise.resolve();
+  if(croppedBlob.size<=VIDEO_BUDGET) return Promise.resolve();
+  if(!CAN_RENDER_VIDEO_SPEED){ toast('Video lớn hơn giới hạn gửi và máy này không nén được'); return Promise.resolve(); }
+  var token=++_speedRenderToken;
+  setSpeedBusy(true, 'Đang tối ưu video cho vừa giới hạn…');
+  return bakeVideo(originalVideoBlob, videoCropOriginal, videoSpeedFactor||1, VIDEO_BUDGET, function(){ return token!==_speedRenderToken; })
+    .then(function(r){
+      setSpeedBusy(false);
+      if(token!==_speedRenderToken) return;
+      croppedBlob=r.blob; videoCropPayload=r.cropJson;
+      refreshVideoThumb();
+      if(r.over) toast('Video vẫn lớn hơn giới hạn, có thể bị từ chối');
+    }).catch(function(err){
+      setSpeedBusy(false);
+      toast((err&&err.message)||'Không tối ưu được video');
+    });
 }
 
 /* Locket's real API expects an actual JPEG still (a "thumb" field) alongside the
@@ -4141,7 +4219,7 @@ function renderVideoAtSpeed(x){
    silently fell back to the raw video bytes, which the real API rejects — this
    is what was actually breaking video posts, not a network issue. Captures a
    center-square frame from whichever <video> currently holds the footage. */
-function captureVideoThumb(videoEl){
+function captureVideoThumb(videoEl, cropJson){
   return new Promise(function(resolve){
     try{
       if(!videoEl){ resolve(null); return; }
@@ -4150,8 +4228,9 @@ function captureVideoThumb(videoEl){
         try{
           var vw=videoEl.videoWidth, vh=videoEl.videoHeight;
           if(!vw || !vh){ resolve(null); return; }
-          var side=Math.min(vw,vh);
-          var sx=(vw-side)/2, sy=(vh-side)/2;
+          var side=Math.min(vw,vh), sx=(vw-side)/2, sy=(vh-side)/2;
+          var cr=cropFromJson(cropJson, vw, vh);
+          if(cr){ side=cr.s; sx=cr.x; sy=cr.y; }
           var c=document.createElement('canvas');
           c.width=CAPTURE_SIZE; c.height=CAPTURE_SIZE;
           var ctx=c.getContext('2d');
@@ -4204,7 +4283,7 @@ function captureVideoThumb(videoEl){
 function refreshVideoThumb(){
   var pv = $('previewVid');
   if(!pv || !isVideo) return Promise.resolve(null);
-  return captureVideoThumb(pv).then(function(b){
+  return captureVideoThumb(pv, videoCropOriginal).then(function(b){
     if(b) videoThumbBlob = b;
     return b;
   });
@@ -5923,7 +6002,57 @@ document.addEventListener('paste',(e)=>{
     }
   }
 });
+/* ===== Ảnh: thu nhỏ từng bước (sắc nét) + encode một lần, tốt nhất trong ngân sách ===== */
+function drawSquareHQ(src, sx, sy, sw, sh, size){
+  var cur=src, cx=sx, cy=sy, cs=Math.min(sw, sh);
+  if(!LOW_POWER){
+    while(cs>=size*2){
+      var half=Math.max(size, Math.floor(cs/2));
+      var t=document.createElement('canvas'); t.width=half; t.height=half;
+      var tc=t.getContext('2d');
+      tc.imageSmoothingEnabled=true;
+      try{ tc.imageSmoothingQuality='high'; }catch(e){}
+      tc.drawImage(cur, cx, cy, cs, cs, 0, 0, half, half);
+      cur=t; cx=0; cy=0; cs=half;
+    }
+  }
+  var out=document.createElement('canvas'); out.width=size; out.height=size;
+  var oc=out.getContext('2d');
+  oc.imageSmoothingEnabled=true;
+  try{ oc.imageSmoothingQuality='high'; }catch(e){}
+  oc.drawImage(cur, cx, cy, cs, cs, 0, 0, size, size);
+  return out;
+}
+function encChain(canvas, type, qs, budget, cb){
+  var i=0;
+  (function step(){
+    canvas.toBlob(function(b){
+      if(!b || b.type!==type){ cb(null, false); return; }
+      if(b.size<=budget){ cb(b, false); return; }
+      if(++i>=qs.length){ cb(b, true); return; }
+      step();
+    }, type, qs[i]);
+  })();
+}
+/* PNG (lossless) cho ảnh chụp màn hình nếu đủ nhỏ -> WebP 0.96+ -> JPEG. Server không encode lại ảnh đã đẹp. */
+function bestBlob(canvas, cb){
+  var BUDGET=2800000;
+  function viaJpeg(){ encChain(canvas, 'image/jpeg', [0.95,0.9,0.85,0.8], BUDGET, function(b){ cb(b); }); }
+  function viaWebp(){
+    encChain(canvas, 'image/webp', [0.96,0.92,0.88,0.84], BUDGET, function(b, over){
+      if(b && !over) cb(b); else viaJpeg();
+    });
+  }
+  if(LOW_POWER){ canvas.toBlob(cb, 'image/jpeg', CAPTURE_JPEG_Q); return; }
+  if(_bestPng){
+    canvas.toBlob(function(p){
+      if(p && p.type==='image/png' && p.size<=BUDGET) cb(p); else viaWebp();
+    }, 'image/png');
+  } else viaWebp();
+}
+
 function handleIncomingFile(f){
+  _bestPng=/png/i.test((f&&f.type)||'');
   originalFile=f; isVideo=f.type.startsWith('video');
   const url=URL.createObjectURL(f);
   if(isVideo){
@@ -5936,13 +6065,8 @@ function handleIncomingFile(f){
   const probe=new Image();
   probe.onload=function(){
     if(probe.naturalWidth>0 && probe.naturalWidth===probe.naturalHeight){
-      const c=document.createElement('canvas');
-      c.width=CAPTURE_SIZE; c.height=CAPTURE_SIZE;
-      const ctx=c.getContext('2d');
-      ctx.imageSmoothingEnabled=true;
-      try{ ctx.imageSmoothingQuality='high'; }catch(e){}
-      ctx.drawImage(probe, 0, 0, CAPTURE_SIZE, CAPTURE_SIZE);
-      c.toBlob(function(b){
+      const c=drawSquareHQ(probe, 0, 0, probe.naturalWidth, probe.naturalHeight, CAPTURE_SIZE);
+      bestBlob(c, function(b){
         croppedBlob=b;
         $('previewImg').src=URL.createObjectURL(b);
         $('previewImg').classList.remove('hidden');
@@ -5964,7 +6088,7 @@ function finalizeVideoSelection(blob, cropJson, filename){
   croppedBlob=blob;
   originalVideoBlob=blob;
   videoSpeedFactor=1;
-  videoCropPayload=cropJson;
+  videoCropPayload=cropJson; videoCropOriginal=cropJson; videoThumbBlob=null;
   // Keep prior thumb if caller already captured one (live record); else null until loadeddata/refresh
   if(!videoThumbBlob) videoThumbBlob=null;
   _speedRenderToken++;
@@ -5972,7 +6096,10 @@ function finalizeVideoSelection(blob, cropJson, filename){
   $('previewImg').classList.add('hidden');
   $('previewVid').classList.remove('hidden');
   var pv=$('previewVid');
-  pv.src=URL.createObjectURL(blob);
+  if(pv._u){ try{ URL.revokeObjectURL(pv._u); }catch(e){} }
+  pv._u=URL.createObjectURL(blob);
+  pv.src=pv._u;
+  applyPreviewCrop(cropJson);
   try{ pv.dataset.baked = '0'; }catch(e){}
   try{ pv.playbackRate = 1; }catch(e){}
   $('uploadPlaceholder').classList.add('hidden');
@@ -6011,8 +6138,9 @@ function confirmCrop(){
   if(!cropper)return;
   const btn=document.querySelector('#cropStage .crop-header button:last-child');
   if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner light"></span>'}
-  const canvas=cropper.getCroppedCanvas({width:CAPTURE_SIZE,height:CAPTURE_SIZE,imageSmoothingQuality:'high'});
-  canvas.toBlob(b=>{
+  const rawCv=cropper.getCroppedCanvas(LOW_POWER?{width:CAPTURE_SIZE,height:CAPTURE_SIZE,imageSmoothingQuality:'high'}:{maxWidth:4096,maxHeight:4096,imageSmoothingQuality:'high'});
+  const canvas=LOW_POWER?rawCv:drawSquareHQ(rawCv, 0, 0, rawCv.width, rawCv.height, CAPTURE_SIZE);
+  bestBlob(canvas, b=>{
     croppedBlob=b;
     $('previewImg').src=URL.createObjectURL(b);
     $('previewImg').classList.remove('hidden');
@@ -6518,6 +6646,7 @@ function canvasCaptureFromVideo(v){
 }
 function captureLivePhoto(e){
   if(e)e.preventDefault();
+  _bestPng=false;
   const v=$('lcVideo');
   if(!v || !v.videoWidth) return;
   const btn=$('lcShutterBtn'); btn.disabled=true;
@@ -6554,7 +6683,7 @@ function captureLivePhoto(e){
               if(lcFacing==='user'){ ctx.translate(CAPTURE_SIZE,0); ctx.scale(-1,1); }
               ctx.drawImage(bmp, sx, sy, side, side, 0, 0, CAPTURE_SIZE, CAPTURE_SIZE);
               try{ bmp.close(); }catch(e){}
-              c.toBlob(function(b){ finishLiveStill(b); }, 'image/jpeg', CAPTURE_JPEG_Q);
+              bestBlob(c, function(b){ finishLiveStill(b); });
             }).catch(function(){ fromVideoEl(); });
             return;
           }
@@ -6571,7 +6700,7 @@ function captureLivePhoto(e){
     try{
       var canvas=canvasCaptureFromVideo(v);
       if(!canvas){ btn.disabled=false; toast('Camera chưa sẵn sàng'); return; }
-      canvas.toBlob(function(b){ finishLiveStill(b); }, 'image/jpeg', CAPTURE_JPEG_Q);
+      bestBlob(canvas, function(b){ finishLiveStill(b); });
     }catch(err){
       btn.disabled=false;
       toast('Không chụp được ảnh');
@@ -6621,7 +6750,8 @@ function lcStartRecording(){
   if(!lcStream || lcRecorder) return;
   var mime=pickLcMimeType();
   try{
-    lcRecorder = mime ? new MediaRecorder(lcStream, {mimeType:mime}) : new MediaRecorder(lcStream);
+    var _bps=LOW_POWER?1500000:4000000;
+    lcRecorder = mime ? new MediaRecorder(lcStream, {mimeType:mime, videoBitsPerSecond:_bps}) : new MediaRecorder(lcStream, {videoBitsPerSecond:_bps});
   }catch(e){
     toast('Trình duyệt không hỗ trợ quay video'); return;
   }
@@ -6668,14 +6798,12 @@ function finishVideoCapture(){
   // Grab the thumb frame from the still-live feed before stopLiveCamera() tears
   // down the stream — drawImage() below captures synchronously, so this is safe
   // even though the actual JPEG encode (toBlob) finishes asynchronously after.
-  var thumbP = captureVideoThumb($('lcVideo'));
   stopLiveCamera();
   $('liveCam').classList.add('hidden');
   $('previewBox').classList.remove('hidden');
   originalFile={name:filename};
   openVideoCropStage(blob, function(cropJson, croppedBlobOut){
     finalizeVideoSelection(croppedBlobOut, cropJson, filename);
-    thumbP.then(function(b){ videoThumbBlob=b; });
   });
 }
 
@@ -6822,6 +6950,7 @@ async function enqueueUpload(blob, caption, filename, contentType){
    entirely in that case — caller falls back to direct-send-only. */
 async function enqueueVideoUpload(blob, caption, filename, contentType, cropPayload, thumbBlob){
   if(OLD_IOS) throw new Error('blob-store-unsupported');
+  filename=fixVideoName(filename, blob); contentType=(blob&&blob.type)||contentType;
   const id='j_'+Date.now()+'_'+Math.random().toString(36).slice(2,8);
   let thumbDataUrl='';
   if(thumbBlob){ try{ thumbDataUrl=await blobToDataUrl(thumbBlob); }catch(e){} }
@@ -6994,7 +7123,7 @@ function doSaveQueueOnly(){
     });
   };
   if(isVideo){
-    ensureVideoThumb().then(afterThumb).catch(afterThumb);
+    ensureVideoFit().then(function(){ return ensureVideoThumb(); }).then(afterThumb, afterThumb);
   } else {
     afterThumb();
   }
@@ -7019,7 +7148,7 @@ function doUpload(){
     btn.innerHTML='<span class="spinner"></span> Đang xử lý...';btn.disabled=true;
     const sendDirect=function(){
     const fd=new FormData();
-    fd.append('file',croppedBlob,filename);
+    fd.append('file',croppedBlob,fixVideoName(filename, croppedBlob));
     fd.append('caption',cap);
     fd.append('client_id', 'd_'+Date.now()+'_'+Math.random().toString(36).slice(2,8));
     if(videoCropPayload) fd.append('cropPayload', videoCropPayload);
@@ -7035,7 +7164,7 @@ function doUpload(){
       }
     }).catch(()=>finishFail(navigator.onLine?'Lỗi mạng khi đăng, thử lại':'Mất mạng — video này không lưu được offline trên máy này, thử lại khi có mạng'));
     };
-    ensureVideoThumb().then(sendDirect).catch(sendDirect);
+    ensureVideoFit().then(function(){ return ensureVideoThumb(); }).then(sendDirect, sendDirect);
   };
 
   if(isVideo){
@@ -7043,7 +7172,7 @@ function doUpload(){
     // (or no connection at all) no longer loses the video or shows a bare error —
     // it sits in the queue and the ticker/focus/online listeners retry it.
     btn.disabled=true;
-    ensureVideoThumb().then(function(){
+    ensureVideoFit().then(function(){ return ensureVideoThumb(); }).then(function(){
       return enqueueVideoUpload(croppedBlob, cap, filename, ct, videoCropPayload, videoThumbBlob);
     }).then(job=>{
       btn.innerHTML='Gửi cho tất cả bạn bè';btn.disabled=false;
@@ -7100,7 +7229,7 @@ initRouter();
   if(!pv) return;
   pv.addEventListener('loadeddata', function(){
     if(isVideo && !videoThumbBlob){
-      captureVideoThumb(pv).then(function(b){ videoThumbBlob=b; });
+      captureVideoThumb(pv, videoCropOriginal).then(function(b){ videoThumbBlob=b; });
     }
   });
 })();
@@ -7384,6 +7513,7 @@ def index(mid=None):
         boot_photo=(s.photo_url if s else ""),
         boot_email=(s.email if s else ""),
         app_version=APP_VERSION_STRING,
+        video_budget=_VIDEO_MAX_BYTES,
     )
 
 
@@ -8228,15 +8358,15 @@ def api_upload():
                     "API chính thức cho video chưa được bắt trong HAR — thử ảnh hoặc thử lại sau."
                 ) from e_vid
         else:
-            data, filename = compress_image(raw)
+            data, filename, ptype = prepare_photo(raw)
             # Official path primary (Firebase Storage + postMomentV2 from Android HAR).
             # binhake uploadMedia is broken upstream — keep as silent last-resort only.
             try:
-                result, _dbg = upload_media_official(s, data, "image/jpeg", caption=caption)
+                result, _dbg = upload_media_official(s, data, ptype, caption=caption)
             except Exception as e_off:
                 logger.warning("official postMomentV2 failed (%s) — last-resort binhake", e_off)
                 try:
-                    result, _dbg = upload_media(s, data, filename, "image/jpeg", caption=caption)
+                    result, _dbg = upload_media(s, data, filename, ptype, caption=caption)
                 except Exception as e_bh:
                     logger.error("binhake uploadMedia also failed: %s", e_bh)
                     raise LocketError(
