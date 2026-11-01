@@ -2978,16 +2978,52 @@ body{
 }
 
 /* Fullscreen viewer */
-.viewer{position:fixed;top:0;left:0;right:0;bottom:0;background:#000;z-index:150;display:none;flex-direction:column;align-items:center;justify-content:center}
-.viewer.open,.viewer:not(.hidden){display:flex}
-.viewer img,.viewer video{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;background:#000}
-.viewer-head{position:absolute;top:0;left:0;right:0;padding:24px 16px 30px;
-  z-index:2;background:linear-gradient(180deg,rgba(0,0,0,.7),transparent);display:flex;align-items:center}
 .viewer-close{margin-left:auto;width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.14);
   border:none;color:#fff;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center}
 .viewer-caption{position:absolute;bottom:24px;left:16px;right:16px;z-index:2;
   background:rgba(0,0,0,.6);border-radius:14px;padding:12px 16px;font-size:14px;font-weight:600;text-align:center;
   white-space:normal;word-break:break-word;line-height:1.4;max-height:30vh;overflow-y:auto}
+
+/* ---------- Fullscreen viewer + side panel ---------- */
+.viewer{position:fixed;top:0;left:0;right:0;bottom:0;background:#000;z-index:10000;display:none;flex-direction:row}
+.viewer.open,.viewer:not(.hidden){display:flex}
+.viewer-main{position:relative;flex:1 1 auto;min-width:0;min-height:0;background:#000;overflow:hidden}
+.viewer-media{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;background:#000}
+.viewer-head{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;
+  padding:calc(16px + env(safe-area-inset-top)) 16px 30px;
+  background:linear-gradient(180deg,rgba(0,0,0,.7),transparent);pointer-events:none}
+.viewer-head > *{pointer-events:auto}
+.viewer-error{position:absolute;top:50%;left:0;right:0;transform:translateY(-50%)}
+
+.viewer-side{flex:0 0 360px;width:360px;max-width:42vw;display:flex;flex-direction:column;min-height:0;
+  background:var(--surface);border-left:1px solid var(--border);
+  padding-bottom:env(safe-area-inset-bottom);z-index:4}
+.vs-head{display:flex;align-items:center;justify-content:space-between;flex-shrink:0;
+  padding:calc(16px + env(safe-area-inset-top)) 18px 14px;border-bottom:1px solid var(--border);cursor:default}
+.vs-title{display:flex;align-items:center;font-weight:800;font-size:16px;min-width:0}
+.vs-title .bi{color:var(--accent);margin-right:8px;font-size:17px}
+.vs-meta{display:flex;align-items:center;flex-shrink:0;margin-left:10px}
+.vs-chip{background:rgba(255,255,255,.08);border-radius:500px;padding:3px 9px;font-size:12px;font-weight:800;margin-left:6px}
+.vs-chev{display:none;margin-left:10px;font-size:16px;color:var(--text2);transition:transform .2s}
+.viewer-side .viewer-list{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 18px 18px}
+.viewer-side .viewer-reaction{font-size:20px}
+.vs-retry{margin-top:8px;padding:7px 16px;border-radius:500px;border:1px solid var(--border);
+  background:var(--surface2);color:var(--text);font-family:inherit;font-weight:800;font-size:12.5px;cursor:pointer}
+
+@media (max-width:768px){
+  .viewer{flex-direction:column}
+  .viewer-side{flex:0 0 auto;width:100%;max-width:none;max-height:46vh;border-left:none;
+    border-top:1px solid var(--border);border-radius:18px 18px 0 0;box-shadow:0 -8px 30px rgba(0,0,0,.45)}
+  .vs-head{padding:14px 18px 12px;cursor:pointer;position:relative}
+  .vs-head:before{content:'';position:absolute;top:6px;left:50%;margin-left:-18px;width:36px;height:4px;
+    border-radius:4px;background:rgba(255,255,255,.2)}
+  .vs-chev{display:inline-block}
+  .viewer-side.collapsed .viewer-list{display:none}
+  .viewer-side.collapsed .vs-chev{transform:rotate(180deg)}
+}
+@media (max-width:900px) and (orientation:landscape) and (min-width:769px){
+  .viewer-side{flex-basis:300px;width:300px}
+}
 
 @media (max-width:375px){
   .moment-card,.moments-feed .feed-card{border-radius:10px;box-shadow:none}
@@ -3028,9 +3064,6 @@ body{
 .p-adv summary span{font-weight:600;margin-left:6px;color:var(--accent)}
 .p-adv-body{display:flex;margin-top:8px}
 .p-adv-body .input{flex:1 1 auto;min-width:0;margin-right:8px}
-#viewsPanel{position:fixed;left:0;right:0;bottom:0;max-height:70vh;background:var(--card);border-top-left-radius:20px;border-top-right-radius:20px;box-shadow:0 -8px 30px rgba(0,0,0,.4);z-index:220;display:flex;flex-direction:column;overflow:hidden}
-.viewer-head-row{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;font-weight:800;font-size:16px;border-bottom:1px solid var(--border)}
-.viewer-head-row .viewer-close{background:none;border:none;color:var(--text);font-size:16px;cursor:pointer;padding:4px 8px}
 .viewer-list{overflow-y:auto;padding:4px 18px 18px}
 .viewer-row{display:flex;align-items:center;padding:9px 0;border-bottom:1px solid var(--border)}
 .viewer-row:last-child{border-bottom:none}
@@ -3040,7 +3073,6 @@ body{
 .viewer-user{font-size:12px;color:var(--text2)}
 .viewer-reaction{font-size:18px;margin-right:10px}
 .viewer-time{font-size:12px;color:var(--text2);flex:0 0 auto}
-.viewer-views-btn{display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:500px;padding:8px 14px;font-weight:800;font-size:13px;cursor:pointer;margin-left:auto}
 .friend-info{min-width:0;flex:1}
 .friend-name{font-weight:800;font-size:16.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .friend-user{font-size:13px;color:var(--text2);font-weight:600;margin-top:2px}
@@ -3234,7 +3266,6 @@ body{
 .cropper-point{background:var(--accent);width:8px;height:8px}
 .cropper-line{background:var(--accent)}
 .crop-footer{flex-shrink:0;padding:12px 16px 20px;background:#000}
-.viewer{z-index:10000}
 .vcrop-area{flex:1;min-height:0;position:relative;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden}
 .vcrop-area video{max-width:100%;max-height:100%;display:block}
 .vcrop-box{position:absolute;border:2px solid var(--accent);box-shadow:0 0 0 9999px rgba(0,0,0,.6);
@@ -3578,7 +3609,6 @@ body{
   </div>
 
   <div class="viewer hidden" id="viewerStage"></div>
-<div id="viewsPanel" class="hidden"></div>
 
   {% endif %}
 </div>
@@ -5408,6 +5438,9 @@ function viewerMediaError(el, msg){
     }
   }catch(e){}
 }
+var _viewsToken=0, _viewsTimer=null, _viewsCache={};
+var VIEWS_REFRESH_MS=20000;
+
 function openViewer(idx){
   const m=(window._momentItems||[])[idx]; if(!m)return;
   const v=$('viewerStage');
@@ -5416,16 +5449,92 @@ function openViewer(idx){
   const src=isVid?raw:mediaSrc(raw, 1080);
   const poster=(isVid&&m.thumbnail_url)?mediaSrc(m.thumbnail_url,1080):'';
   const cap=extractCaption(m);
-  const isMine=BOOT_UID && m.user===BOOT_UID;
+  const mid=m.canonical_uid||m.id||'';
+  const showSide=!!(BOOT_UID && m.user===BOOT_UID && mid);
+
+  const media=isVid
+    ? `<video class="viewer-media" src="${esc(src)}" ${poster?`poster="${esc(poster)}"`:''} controls autoplay playsinline onerror="viewerMediaError(this,'Không phát được video')"></video>`
+    : `<img class="viewer-media" src="${esc(src)}" alt="" onerror="viewerMediaError(this,'Không tải được ảnh')">`;
+
+  const side=showSide?`
+    <aside class="viewer-side" id="viewerSide">
+      <div class="vs-head" onclick="toggleViewsSide()">
+        <div class="vs-title"><i class="bi bi-eye-fill"></i><span id="vsCount">Lượt xem</span></div>
+        <div class="vs-meta"><span id="vsReact"></span><i class="bi bi-chevron-down vs-chev"></i></div>
+      </div>
+      <div class="viewer-list" id="viewerList">
+        <div class="skeleton" style="height:48px;margin:8px 0"></div>
+        <div class="skeleton" style="height:48px;margin:8px 0"></div>
+        <div class="skeleton" style="height:48px;margin:8px 0"></div>
+      </div>
+    </aside>`:'';
+
   v.innerHTML=`
-    <div class="viewer-head"><button class="viewer-close" onclick="closeViewer()" aria-label="Đóng">✕</button>${isMine?`<button type="button" class="viewer-views-btn" onclick='openMomentViews(${JSON.stringify(m).replace(/'/g,"&#39;")})'><i class="bi bi-eye-fill"></i> Views</button>`:''}</div>
-    ${isVid?`<video src="${esc(src)}" ${poster?`poster="${esc(poster)}"`:''} controls autoplay playsinline style="max-width:100%;max-height:100%;object-fit:contain" onerror="viewerMediaError(this,'Không phát được video')"></video>`
-           :`<img src="${esc(src)}" alt="" style="max-width:100%;max-height:100%;object-fit:contain" onerror="viewerMediaError(this,'Không tải được ảnh')">`}
-    ${cap?`<div class="viewer-caption">${esc(cap)}</div>`:''}
-  `;
+    <div class="viewer-main">
+      <div class="viewer-head"><button type="button" class="viewer-close" onclick="closeViewer()" aria-label="Đóng">✕</button></div>
+      ${media}
+      ${cap?`<div class="viewer-caption">${esc(cap)}</div>`:''}
+    </div>${side}`;
   v.classList.remove('hidden');
+  document.body.style.overflow='hidden';
+  if(showSide) startViews(mid);
 }
-function closeViewer(){$('viewerStage').classList.add('hidden');$('viewerStage').innerHTML='';closeMomentViews();}
+function closeViewer(){
+  stopViews();
+  const v=$('viewerStage');
+  v.classList.add('hidden');
+  v.innerHTML='';
+  document.body.style.overflow='';
+}
+function toggleViewsSide(){
+  var s=$('viewerSide'); if(s) s.classList.toggle('collapsed');
+}
+function stopViews(){
+  _viewsToken++;
+  if(_viewsTimer){ clearInterval(_viewsTimer); _viewsTimer=null; }
+}
+function startViews(mid){
+  stopViews();
+  var token=_viewsToken;
+  if(_viewsCache[mid]) renderViews(_viewsCache[mid]);
+  loadViews(mid, token, !!_viewsCache[mid]);
+  _viewsTimer=setInterval(function(){ loadViews(mid, token, true); }, VIEWS_REFRESH_MS);
+}
+function loadViews(mid, token, silent){
+  apiTimeout('/api/moments/views?uid='+encodeURIComponent(mid), null, 25000).then(function(d){
+    if(token!==_viewsToken) return;
+    if(!d||!d.ok){ if(!silent) renderViewsError((d&&d.error)||'Không tải được lượt xem', mid); return; }
+    _viewsCache[mid]=d;
+    renderViews(d);
+  }).catch(function(){
+    if(token!==_viewsToken) return;
+    if(!silent) renderViewsError('Lỗi mạng', mid);
+  });
+}
+function renderViewsError(msg, mid){
+  var list=$('viewerList'); if(!list) return;
+  list.innerHTML='<div class="people-msg">'+esc(msg)+'<br><button type="button" class="vs-retry" data-mid="'+esc(mid)+'" onclick="startViews(this.getAttribute(\\'data-mid\\'))">Thử lại</button></div>';
+}
+function renderViews(d){
+  var list=$('viewerList'); if(!list) return;
+  var viewers=d.viewers||[], count=d.count||viewers.length;
+  var c=$('vsCount'); if(c) c.textContent='Lượt xem · '+count;
+  var tally={};
+  viewers.forEach(function(v){ if(v.reaction) tally[v.reaction]=(tally[v.reaction]||0)+1; });
+  var r=$('vsReact');
+  if(r) r.innerHTML=Object.keys(tally).map(function(e){
+    return '<span class="vs-chip">'+esc(e)+' '+tally[e]+'</span>';
+  }).join('');
+  var keep=list.scrollTop;
+  list.innerHTML=viewers.length
+    ? viewers.map(viewerRow).join('')
+    : '<div class="people-msg" style="text-align:center;padding:28px 0">Chưa có ai xem</div>';
+  list.scrollTop=keep;
+}
+document.addEventListener('keydown',function(e){
+  var v=$('viewerStage');
+  if(e.key==='Escape' && v && !v.classList.contains('hidden')) closeViewer();
+});
 function timeAgoShort(sec){
   if(!sec) return '';
   var d=Math.max(0, Math.floor(Date.now()/1000 - sec));
@@ -5441,32 +5550,7 @@ function viewerRow(v){
     '<div class="viewer-info"><div class="viewer-name">'+esc(name)+'</div>'+
     (v.username?'<div class="viewer-user">@'+esc(v.username)+'</div>':'')+'</div>'+
     (v.reaction?'<span class="viewer-reaction">'+esc(v.reaction)+'</span>':'')+
-    '<span class="viewer-time">'+timeAgoShort(v.viewed_at)+'</span></div>';
-}
-function openMomentViews(moment){
-  var panel=$('viewsPanel');
-  if(!panel) return;
-  var mid=moment.canonical_uid||moment.id||'';
-  if(!mid){ toast('No id for this moment'); return; }
-  panel.classList.remove('hidden');
-  panel.innerHTML='<div class="viewer-head-row"><span>Views</span><button type="button" class="viewer-close" onclick="closeMomentViews()">✕</button></div><div class="viewer-list" id="viewerList"><div class="skeleton" style="height:48px;margin:8px 0"></div><div class="skeleton" style="height:48px;margin:8px 0"></div></div>';
-  apiTimeout('/api/moments/views?uid='+encodeURIComponent(mid),null,25000).then(function(d){
-    var list=$('viewerList');
-    if(!list) return;
-    if(!d||!d.ok){ list.innerHTML='<div class="people-msg">'+esc((d&&d.error)||'Could not load views')+'</div>'; return; }
-    var count=d.count||(d.viewers||[]).length;
-    var head=panel.querySelector('.viewer-head-row span');
-    if(head) head.textContent='Views · '+count;
-    if(!d.viewers || !d.viewers.length){ list.innerHTML='<div class="people-msg">No views yet</div>'; return; }
-    list.innerHTML=d.viewers.map(viewerRow).join('');
-  }).catch(function(){
-    var list=$('viewerList');
-    if(list) list.innerHTML='<div class="people-msg">Network error</div>';
-  });
-}
-function closeMomentViews(){
-  var panel=$('viewsPanel');
-  if(panel){ panel.classList.add('hidden'); panel.innerHTML=''; }
+    '<span class="viewer-time">'+(v.viewed_at?timeAgo(v.viewed_at):'')+'</span></div>';
 }
 
 
