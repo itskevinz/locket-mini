@@ -200,7 +200,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "2.8"
+APP_VERSION = "2.9"
 APP_BUILD = "2026.11.01"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
@@ -602,6 +602,30 @@ def _friends_sparse(friends: List[Dict[str, Any]]) -> bool:
     return rich < max(1, len(friends) // 5)
 
 
+_FRIEND_META: Dict[str, Dict[str, Any]] = {}
+
+
+def _fs_doc_time(doc: Dict[str, Any]) -> int:
+    # Ưu tiên field "date" (nếu có), sau đó createTime/updateTime của document Firestore.
+    from datetime import datetime, timezone
+    cands: List[str] = []
+    f = (doc.get("fields") or {}).get("date")
+    if isinstance(f, dict) and f.get("timestampValue"):
+        cands.append(str(f["timestampValue"]))
+    for k in ("createTime", "updateTime"):
+        if doc.get(k):
+            cands.append(str(doc[k]))
+    for raw in cands:
+        m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z?$", raw)
+        if not m:
+            continue
+        try:
+            return int(datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
+        except Exception:
+            continue
+    return 0
+
+
 def list_friend_uids_firestore(s: LocketSession, timeout: int = 25
                                  ) -> Tuple[List[str], List[Dict[str, Any]]]:
     """Official friends list via Firestore REST (same source the Android app
@@ -634,6 +658,8 @@ def list_friend_uids_firestore(s: LocketSession, timeout: int = 25
 
     uids: List[str] = []
     seen = set()
+    meta: Dict[str, int] = {}
+    complete = True
     for doc in (body.get("documents") or []):
         if not isinstance(doc, dict):
             continue
@@ -650,6 +676,7 @@ def list_friend_uids_firestore(s: LocketSession, timeout: int = 25
         if uid and uid not in seen:
             seen.add(uid)
             uids.append(uid)
+            meta[uid] = _fs_doc_time(doc)
     # pagination
     next_token = body.get("nextPageToken")
     while next_token:
@@ -673,11 +700,14 @@ def list_friend_uids_firestore(s: LocketSession, timeout: int = 25
                 if uid and uid not in seen:
                     seen.add(uid)
                     uids.append(uid)
+                    meta[uid] = _fs_doc_time(doc)
             next_token = body2.get("nextPageToken")
         except Exception as e:
             logger.warning("firestore friends page skip: %s", e)
+            complete = False
             break
     logger.info("firestore friends → %d uids", len(uids))
+    _FRIEND_META[s.local_id] = {"items": meta, "complete": complete, "at": time.time()}
     return uids, debug
 
 
@@ -3151,6 +3181,25 @@ body.mv-feed .moments-feed{display:block !important}
   .cap-track .cap-in + .cap-in{display:none}
 }
 
+/* ---------- Hoạt động bạn bè ---------- */
+.fa-card{background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:4px 14px 12px;margin:4px 0 14px}
+.fa-tabs{display:flex;margin:6px 0 2px;border-bottom:1px solid var(--border)}
+.fa-tabs button{flex:1;background:none;border:none;border-bottom:2px solid transparent;color:var(--text2);
+  font-family:inherit;font-weight:800;font-size:13px;padding:11px 4px;cursor:pointer;-webkit-appearance:none}
+.fa-tabs button.active{color:var(--accent);border-bottom-color:var(--accent)}
+.fa-count{display:inline-block;min-width:20px;margin-left:6px;padding:1px 7px;border-radius:500px;
+  background:rgba(255,255,255,.1);font-size:11px;font-weight:800}
+.fa-tabs button.active .fa-count{background:var(--accent);color:#111}
+.fa-sum{font-size:12px;color:var(--text2);font-weight:700;padding:10px 2px 2px}
+.fa-sum b{color:var(--accent)}
+.fa-list{max-height:380px;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.fa-time{flex-shrink:0;margin-left:10px;font-size:12px;font-weight:800;color:var(--text2);text-align:right}
+.fa-tag{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:500px;font-size:10px;font-weight:800;
+  background:rgba(255,184,0,.15);color:var(--accent)}
+.fa-empty{text-align:center;color:var(--muted);font-size:13px;font-weight:700;padding:22px 8px}
+.fa-foot{font-size:11px;color:var(--muted);font-weight:600;line-height:1.5;padding:10px 2px 0}
+.fa-foot a{color:var(--accent)}
+
 @media (max-width:375px){
   .moment-card,.moments-feed .feed-card{border-radius:10px;box-shadow:none}
   .page.active{animation:none}
@@ -3696,6 +3745,14 @@ body.mv-feed .moments-feed{display:block !important}
         <button type="button" class="p-btn" onclick="saveAppCheck();return false;">Save</button>
       </div>
     </details>
+    <div class="fa-card" id="friendActivity">
+      <div class="fa-tabs">
+        <button type="button" class="active" data-fa="new">Bạn mới<span class="fa-count" id="faNewCount">0</span></button>
+        <button type="button" data-fa="gone">Đã xoá kết bạn<span class="fa-count" id="faGoneCount">0</span></button>
+      </div>
+      <div id="faBody"><div class="fa-empty">Đang tải…</div></div>
+      <div class="fa-foot" id="faFoot"></div>
+    </div>
     <div class="friends-count" id="friendsCountLine">Đang tải...</div>
     <div id="friendsList"></div>
     <div class="friends-empty hidden" id="friendsEmpty">
@@ -4527,7 +4584,7 @@ function _showPage(name){
     stopMomentsPoll();
     if(name !== 'friends') hideProgress(0);
   }
-  if(name==='friends'){ loadFriends(); loadPeopleRequests(); }
+  if(name==='friends'){ loadFriends(Date.now()-(friendsFetchedAt||0)>300000); loadPeopleRequests(); }
   if(name==='upload'){
     if(isLiveCamera() && !croppedBlob){
       $('previewBox').classList.add('hidden');
@@ -4651,6 +4708,7 @@ function writeFriendsLocal(friends,count){
 }
 function paintFriends(friends,count){
   friendsCache=friends||[];
+  try{ renderFriendActivity(); }catch(e){}
   const list=$('friendsList');
   if($('friendCountPill')) $('friendCountPill').textContent=count!=null?count:friendsCache.length;
   if($('friendsCountLine')) $('friendsCountLine').innerHTML=`Tổng cộng <b>${count!=null?count:friendsCache.length}</b> bạn bè`;
@@ -4677,7 +4735,7 @@ function loadFriends(force){
     $('friendsEmpty').classList.add('hidden');
     list.innerHTML=Array(5).fill('<div class="skeleton" style="height:68px;margin-bottom:10px"></div>').join('');
   }
-  apiTimeout('/api/friends', null, 15000).then(d=>{
+  apiTimeout('/api/friends?check=1', null, 20000).then(d=>{
     if(!d.ok){
       if(!friendsCache||!friendsCache.length){
         toast(d.error||'Không tải được bạn bè');
@@ -4689,6 +4747,7 @@ function loadFriends(force){
     }
     const friends=d.friends||[];
     const count=d.count!=null?d.count:friends.length;
+    try{ trackFriends(friends, d.complete!==false); }catch(e){ console.warn(e); }
     // Smart skip re-paint if same size and not forced
     const same=friendsCache && friendsCache.length===friends.length && !force;
     writeFriendsLocal(friends, count);
@@ -4716,6 +4775,142 @@ function preloadFriends(){
   const need=!(local && (Date.now()-(local.ts||0)<FRIENDS_TTL_MS));
   if(need) loadFriends(false);
 }
+/* ===== Hoạt động bạn bè: bạn mới + ai đã xoá kết bạn =====
+   - "Bạn mới": lấy từ thời điểm tạo tài liệu bạn bè trên Firestore (added_at), có dự phòng theo lần phát hiện.
+   - "Đã xoá": so sánh danh sách bạn bè với lần trước (lưu trong trình duyệt, theo từng tài khoản).
+     Chỉ coi là xoá sau 2 lần kiểm tra cách nhau >= 5 phút để tránh báo nhầm khi API lỗi tạm thời. */
+var FSNAP_KEY='locket_friends_snap_v1_'+BOOT_UID, FLOG_KEY='locket_unfriend_log_v1_'+BOOT_UID;
+var FA_CONFIRM_GAP=300, FA_MAX_LOG=100;
+var _faTab='new', _faFriends=null;
+function jread(k, d){ try{ var r=localStorage.getItem(k); return r?JSON.parse(r):d; }catch(e){ return d; } }
+function jwrite(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
+function slimUser(u){
+  return {uid:u.uid, first_name:u.first_name||'', last_name:u.last_name||'', username:u.username||'',
+          profile_picture_url:u.profile_picture_url||'', celebrity:!!u.celebrity, badge:u.badge||''};
+}
+function hasIdentity(u){ return !!(u && (u.first_name||u.last_name||u.username||u.profile_picture_url)); }
+function trackFriends(friends, complete){
+  _faFriends=friends||null;
+  if(!friends || !friends.length || complete===false){ renderFriendActivity(); return; }
+  var now=Math.floor(Date.now()/1000);
+  var snap=jread(FSNAP_KEY, null), log=jread(FLOG_KEY, []);
+  var cur={};
+  friends.forEach(function(f){ if(f && f.uid) cur[f.uid]=slimUser(f); });
+  if(!snap || !snap.profiles){
+    snap={since:now, ts:now, profiles:cur, pend:{}, fresh:{}};
+  } else {
+    var prev=snap.profiles, pend=snap.pend||{}, fresh=snap.fresh||{};
+    var prevCount=Object.keys(prev).length, curCount=Object.keys(cur).length;
+    // Danh sách tụt bất thường (>40%) gần như chắc chắn là lỗi tải, không phải xoá thật
+    if(prevCount>=10 && curCount<prevCount*0.6){ renderFriendActivity(); return; }
+    var keep={};
+    Object.keys(cur).forEach(function(uid){
+      var p=cur[uid];
+      if(!hasIdentity(p) && prev[uid] && hasIdentity(prev[uid])) p=prev[uid];
+      keep[uid]=p;
+      if(!prev[uid]) fresh[uid]=fresh[uid]||now;
+      delete pend[uid];
+    });
+    Object.keys(prev).forEach(function(uid){
+      if(cur[uid]) return;
+      var pe=pend[uid]||{n:0, t:0};
+      if(now-pe.t>=FA_CONFIRM_GAP) pe={n:pe.n+1, t:now};
+      pend[uid]=pe;
+      if(pe.n>=2){
+        log.unshift({uid:uid, profile:prev[uid], at:now});
+        delete pend[uid];
+      } else keep[uid]=prev[uid];
+    });
+    Object.keys(fresh).forEach(function(uid){ if(!keep[uid] || now-fresh[uid]>60*86400) delete fresh[uid]; });
+    snap={since:snap.since||now, ts:now, profiles:keep, pend:pend, fresh:fresh};
+    log=log.slice(0, FA_MAX_LOG);
+  }
+  jwrite(FSNAP_KEY, snap);
+  jwrite(FLOG_KEY, log);
+  renderFriendActivity();
+}
+function faTimeLabel(sec){
+  if(!sec) return '';
+  var t=timeAgo(sec);
+  return t==='vừa xong' ? t : (t+' trước');
+}
+function faDate(sec){
+  try{ return new Date(sec*1000).toLocaleDateString('vi-VN'); }catch(e){ return ''; }
+}
+function faRow(u, right, tag, sub){
+  var name=((u.first_name||'')+' '+(u.last_name||'')).trim()||u.username||u.uid||'';
+  var line=(u.username?'@'+esc(u.username):'')+(sub?(u.username?' · ':'')+esc(sub):'');
+  return '<div class="friend-row">'+renderAvatar(u, 48)+
+    '<div class="friend-info"><div class="friend-name">'+esc(name)+(tag?'<span class="fa-tag">'+esc(tag)+'</span>':'')+'</div>'+
+    '<div class="friend-user">'+line+'</div></div>'+
+    (right?'<div class="fa-time">'+esc(right)+'</div>':'')+'</div>';
+}
+function renderFriendActivity(){
+  var body=$('faBody'); if(!body) return;
+  var friends=_faFriends||friendsCache||[];
+  var snap=jread(FSNAP_KEY, null)||{}, log=jread(FLOG_KEY, []);
+  var now=Math.floor(Date.now()/1000), cut30=now-30*86400, cut7=now-7*86400;
+  var fresh=snap.fresh||{}, pend=snap.pend||{}, profiles=snap.profiles||{};
+  var curSet={};
+  friends.forEach(function(f){ if(f&&f.uid) curSet[f.uid]=1; });
+
+  var recent=friends.map(function(f){ return {u:f, t:f.added_at||fresh[f.uid]||0}; })
+    .filter(function(x){ return x.t && x.t>=cut30; })
+    .sort(function(a,b){ return b.t-a.t; });
+  var n7=recent.filter(function(x){ return x.t>=cut7; }).length;
+  var pendList=Object.keys(pend).filter(function(uid){ return !curSet[uid] && profiles[uid]; });
+
+  var cn=$('faNewCount'), cg=$('faGoneCount');
+  if(cn) cn.textContent=recent.length;
+  if(cg) cg.textContent=log.length;
+  var tabs=document.querySelectorAll('#friendActivity [data-fa]');
+  for(var i=0;i<tabs.length;i++) tabs[i].classList.toggle('active', tabs[i].getAttribute('data-fa')===_faTab);
+
+  var html='';
+  if(_faTab==='new'){
+    if(!friends.length){ html='<div class="fa-empty">Đang tải…</div>'; }
+    else if(!recent.length){ html='<div class="fa-empty">Chưa có bạn mới trong 30 ngày qua</div>'; }
+    else {
+      html='<div class="fa-sum">7 ngày qua: <b>'+n7+'</b> người · 30 ngày qua: <b>'+recent.length+'</b> người</div><div class="fa-list">'+
+        recent.slice(0, 40).map(function(x){
+          return faRow(x.u, faTimeLabel(x.t), x.t>=cut7?'Mới':'', faDate(x.t));
+        }).join('')+'</div>';
+    }
+  } else {
+    if(!log.length && !pendList.length){
+      html='<div class="fa-empty">Chưa phát hiện ai xoá kết bạn</div>';
+    } else {
+      html='<div class="fa-sum">Đã xác nhận: <b>'+log.length+'</b> người'+(pendList.length?' · đang xác nhận: '+pendList.length:'')+'</div><div class="fa-list">'+
+        log.slice(0, 50).map(function(g){
+          var back=!!curSet[g.uid];
+          return faRow(g.profile||{uid:g.uid}, faTimeLabel(g.at), back?'Đã kết bạn lại':'', 'phát hiện '+faDate(g.at));
+        }).join('')+
+        pendList.map(function(uid){
+          return faRow(profiles[uid], '', 'Đang xác nhận…', '');
+        }).join('')+'</div>';
+    }
+  }
+  body.innerHTML=html;
+  var foot=$('faFoot');
+  if(foot){
+    foot.innerHTML=(snap.since?'Theo dõi từ '+esc(faDate(snap.since))+'. ':'')+
+      'So sánh danh sách bạn bè với lần mở trước; không phân biệt được ai xoá ai, chỉ biết người đó không còn trong danh sách. '+
+      (log.length?'<a href="#" onclick="clearFriendLog();return false;">Xoá lịch sử</a>':'');
+  }
+}
+function clearFriendLog(){
+  jwrite(FLOG_KEY, []);
+  var s=jread(FSNAP_KEY, null);
+  if(s){ s.pend={}; jwrite(FSNAP_KEY, s); }
+  renderFriendActivity();
+}
+document.addEventListener('click', function(ev){
+  var b=ev.target&&ev.target.closest?ev.target.closest('#friendActivity [data-fa]'):null;
+  if(!b) return;
+  _faTab=b.getAttribute('data-fa')==='gone'?'gone':'new';
+  renderFriendActivity();
+});
+
 function peoplePost(path, body){
   return apiTimeout(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},25000);
 }
@@ -8136,8 +8331,29 @@ def api_friends():
         return jsonify({"ok": False, "error": "Not logged in"})
     try:
         s = ensure_fresh_token(s)
-        friends = get_friends_cached(s, force=request.args.get("force") == "1")
-        return jsonify({"ok": True, "friends": friends, "count": len(friends)})
+        force = request.args.get("force") == "1"
+        if request.args.get("check") == "1" and not force:
+            # Rẻ: chỉ 1 request lấy danh sách UID; nếu khác bản cache mới tải lại profile.
+            try:
+                fresh_uids, _ = list_friend_uids_firestore(s)
+                cached = {f.get("uid") for f in (_profile_state(s.local_id)["friends"] or [])}
+                if cached and set(fresh_uids) != cached:
+                    force = True
+            except Exception as e:
+                logger.debug("friends check skipped: %s", e)
+        friends = get_friends_cached(s, force=force)
+        meta = _FRIEND_META.get(s.local_id) or {}
+        times = meta.get("items") or {}
+        fresh_meta = bool(meta) and (time.time() - float(meta.get("at") or 0)) < 15 * 60
+        out_friends = []
+        for f in friends:
+            item = dict(f)
+            ts = times.get(item.get("uid"))
+            if ts:
+                item["added_at"] = ts
+            out_friends.append(item)
+        return jsonify({"ok": True, "friends": out_friends, "count": len(out_friends),
+                        "complete": bool(fresh_meta and meta.get("complete", False))})
     except Exception as e:
         logger.error("FRIENDS error: %s", e)
         return jsonify({"ok": False, "error": str(e)})
