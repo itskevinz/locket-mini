@@ -3509,6 +3509,10 @@ body.mv-feed .moments-feed{display:block !important}
 .cropper-view-box,.cropper-face{border-radius:0}
 .cropper-point{background:var(--accent);width:9px;height:9px}
 .cropper-line{background:var(--accent)}
+.fit-seg{display:flex;gap:6px;justify-content:center;margin-bottom:10px}
+.fit-seg button{flex:1;max-width:130px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.08);color:rgba(255,255,255,.78);font-family:inherit;font-weight:700;font-size:13px;padding:9px 6px;border-radius:12px;cursor:pointer}
+.fit-seg button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.fit-preview{display:none;position:absolute;top:0;bottom:0;left:0;right:0;margin:auto;border-radius:6px;box-shadow:0 0 0 1px rgba(255,255,255,.12)}
 .crop-footer{flex-shrink:0;padding:12px 16px calc(20px + env(safe-area-inset-bottom));background:#000}
 .vcrop-area{flex:1;min-height:0;position:relative;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden}
 .vcrop-area video{position:absolute;top:0;left:0;width:100%;height:100%;max-width:none;max-height:none;object-fit:contain;background:#000;display:block}
@@ -3976,8 +3980,8 @@ body.mv-feed .moments-feed{display:block !important}
       <span>Crop ảnh 1:1</span>
       <button onclick="confirmCrop()">Xong</button>
     </div>
-    <div class="crop-area"><img id="cropImg" alt=""></div>
-    <div class="crop-footer"><div style="text-align:center;color:rgba(255,255,255,.62);font-size:12px">Kéo, phóng to/nhỏ để căn ảnh vuông</div></div>
+    <div class="crop-area" id="cropArea"><img id="cropImg" alt=""><canvas id="fitPreview" class="fit-preview" width="640" height="640"></canvas></div>
+    <div class="crop-footer"><div class="fit-seg" id="fitSeg"><button type="button" data-m="crop" onclick="setCropMode('crop')">Cắt vuông</button><button type="button" data-m="black" onclick="setCropMode('black')">Giữ nguyên · đen</button><button type="button" data-m="blur" onclick="setCropMode('blur')">Giữ nguyên · mờ</button></div><div id="cropHint" style="text-align:center;color:rgba(255,255,255,.62);font-size:12px">Kéo, phóng to/nhỏ để căn ảnh vuông</div></div>
   </div>
 
   <div class="crop-stage" id="videoCropStage">
@@ -6509,6 +6513,77 @@ function finalizeVideoSelection(blob, cropJson, filename){
   // Always grab a still from the finalized clip (full square, not black)
   refreshVideoThumb();
 }
+
+/* ---- Đăng không crop: giữ nguyên ảnh, lấp khung 1:1 bằng nền đen hoặc nền mờ ---- */
+var cropMode='crop';
+try{ var _cm=localStorage.getItem('lm_cropmode'); if(_cm==='black'||_cm==='blur') cropMode=_cm; }catch(e){}
+function composeFit(img, mode, S){
+  var w=img.naturalWidth||img.width, h=img.naturalHeight||img.height;
+  var f=Math.min(S/w, S/h);
+  var dw=Math.max(1,Math.round(w*f)), dh=Math.max(1,Math.round(h*f));
+  // 1) thu nhỏ ảnh về đúng kích thước hiển thị (giảm nửa nhiều bước cho nét)
+  var cur=img, cw=w, ch=h;
+  while(!LOW_POWER && cw/2>=dw && ch/2>=dh){
+    var nw=Math.floor(cw/2), nh=Math.floor(ch/2);
+    var t=document.createElement('canvas'); t.width=nw; t.height=nh;
+    var tc=t.getContext('2d'); tc.imageSmoothingEnabled=true;
+    try{ tc.imageSmoothingQuality='high'; }catch(e){}
+    tc.drawImage(cur,0,0,cw,ch,0,0,nw,nh);
+    cur=t; cw=nw; ch=nh;
+  }
+  var small=document.createElement('canvas'); small.width=dw; small.height=dh;
+  var sc=small.getContext('2d'); sc.imageSmoothingEnabled=true;
+  try{ sc.imageSmoothingQuality='high'; }catch(e){}
+  sc.drawImage(cur,0,0,cw,ch,0,0,dw,dh);
+  // 2) khung vuông
+  var out=document.createElement('canvas'); out.width=S; out.height=S;
+  var c=out.getContext('2d');
+  c.fillStyle='#000'; c.fillRect(0,0,S,S);
+  if(mode==='blur' && (dw<S || dh<S)){
+    // nền mờ dạng gradient: lấy vùng giữa ảnh, thu cực nhỏ rồi phóng to mượt (chạy được cả Safari)
+    var side=Math.min(dw,dh), sx=Math.floor((dw-side)/2), sy=Math.floor((dh-side)/2);
+    var tiny=document.createElement('canvas'); tiny.width=tiny.height=16;
+    var tn=tiny.getContext('2d'); tn.imageSmoothingEnabled=true;
+    try{ tn.imageSmoothingQuality='high'; }catch(e){}
+    tn.drawImage(small,sx,sy,side,side,0,0,16,16);
+    var mid=document.createElement('canvas'); mid.width=mid.height=Math.max(64,Math.round(S/8));
+    var md=mid.getContext('2d'); md.imageSmoothingEnabled=true;
+    try{ md.imageSmoothingQuality='high'; }catch(e){}
+    md.drawImage(tiny,0,0,mid.width,mid.height);
+    c.imageSmoothingEnabled=true;
+    try{ c.imageSmoothingQuality='high'; }catch(e){}
+    c.drawImage(mid,0,0,S,S);
+    c.fillStyle='rgba(0,0,0,.30)'; c.fillRect(0,0,S,S);
+  }
+  c.drawImage(small,Math.round((S-dw)/2),Math.round((S-dh)/2));
+  return out;
+}
+function setCropMode(m){
+  cropMode=m;
+  try{ localStorage.setItem('lm_cropmode', m); }catch(e){}
+  var seg=$('fitSeg');
+  if(seg) Array.prototype.forEach.call(seg.querySelectorAll('button'), function(b){
+    b.classList.toggle('on', b.getAttribute('data-m')===m);
+  });
+  var cont=document.querySelector('#cropStage .cropper-container');
+  var pv=$('fitPreview'), area=$('cropArea'), hint=$('cropHint');
+  if(m==='crop'){
+    if(pv) pv.style.display='none';
+    if(cont) cont.style.display='';
+    try{ if(cropper) cropper.resize(); }catch(e){}
+    if(hint) hint.textContent='Kéo, phóng to/nhỏ để căn ảnh vuông';
+    return;
+  }
+  if(cont) cont.style.display='none';
+  if(hint) hint.textContent = m==='black' ? 'Giữ nguyên toàn bộ ảnh, phần thừa tô đen' : 'Giữ nguyên toàn bộ ảnh, phần thừa là nền mờ cùng màu ảnh';
+  if(!pv || !area) return;
+  var side=Math.max(120, Math.min(area.clientWidth, area.clientHeight));
+  pv.style.width=side+'px'; pv.style.height=side+'px';
+  pv.style.display='block';
+  var src=composeFit($('cropImg'), m, 640);
+  pv.getContext('2d').drawImage(src,0,0,640,640);
+}
+
 function openCropStage(url){
   $('cropImg').src=url;
   const stage=$('cropStage');
@@ -6520,6 +6595,7 @@ function openCropStage(url){
     cropper=new Cropper($('cropImg'),{
       aspectRatio:1,viewMode:1,autoCropArea:1,dragMode:'move',
       guides:true,center:true,highlight:false,background:false,responsive:true,toggleDragModeOnDblclick:false,
+      ready:function(){ setCropMode(cropMode); },
     });
   },50);
 }
@@ -6535,8 +6611,13 @@ function confirmCrop(){
   if(!cropper)return;
   const btn=document.querySelector('#cropStage .crop-header button:last-child');
   if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner light"></span>'}
-  const rawCv=cropper.getCroppedCanvas(LOW_POWER?{width:CAPTURE_SIZE,height:CAPTURE_SIZE,imageSmoothingQuality:'high'}:{maxWidth:4096,maxHeight:4096,imageSmoothingQuality:'high'});
-  const canvas=LOW_POWER?rawCv:drawSquareHQ(rawCv, 0, 0, rawCv.width, rawCv.height, CAPTURE_SIZE);
+  let canvas;
+  if(cropMode!=='crop'){
+    canvas=composeFit($('cropImg'), cropMode, CAPTURE_SIZE);
+  } else {
+    const rawCv=cropper.getCroppedCanvas(LOW_POWER?{width:CAPTURE_SIZE,height:CAPTURE_SIZE,imageSmoothingQuality:'high'}:{maxWidth:4096,maxHeight:4096,imageSmoothingQuality:'high'});
+    canvas=LOW_POWER?rawCv:drawSquareHQ(rawCv, 0, 0, rawCv.width, rawCv.height, CAPTURE_SIZE);
+  }
   bestBlob(canvas, b=>{
     croppedBlob=b;
     $('previewImg').src=URL.createObjectURL(b);
