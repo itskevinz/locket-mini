@@ -65,7 +65,8 @@ class ColorFormatter(logging.Formatter):
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(ColorFormatter())
 logger = logging.getLogger("LocketWeb")
-logger.setLevel(logging.DEBUG)
+VERBOSE = os.environ.get("LOCKET_VERBOSE", "0") == "1"
+logger.setLevel(logging.DEBUG if VERBOSE else logging.INFO)
 logger.handlers = []
 logger.addHandler(handler)
 
@@ -77,6 +78,11 @@ def _snip(text: Optional[str], n: int = 900) -> str:
 
 
 def console_log(label: str, method: str, url: str, payload=None, status=None, resp_text=None, duration=None):
+    if not VERBOSE:
+        # One compact line, no json.dumps / banner building on the hot path.
+        logger.info("%s %s -> %s %s", label, method, status if status is not None else "-",
+                    f"{duration:.2f}s" if duration is not None else "")
+        return
     lines = [f"{'='*60}", f"  {label}", f"  {method} {url}"]
     if payload is not None:
         try:
@@ -262,7 +268,7 @@ def _web_headers(id_token: str, ua: str) -> Dict[str, str]:
 def _make_http() -> requests.Session:
     s = requests.Session()
     adapter = HTTPAdapter(
-        pool_connections=10, pool_maxsize=10,
+        pool_connections=20, pool_maxsize=40,
         # GET only — retrying POST automatically risks double-submitting a non-idempotent
         # action (e.g. posting the same moment twice) if the first attempt actually landed
         # server-side but the response got lost. Reads are safe to retry, writes aren't.
@@ -859,11 +865,14 @@ def _enrich_moments(s: LocketSession, items: List[Dict[str, Any]]) -> List[Dict[
             logger.debug("self profile failed: %s", e)
 
     missing: List[str] = []
+    _seen_missing = set()
     for m in items:
         uid = m.get("user")
-        if isinstance(uid, str) and uid and uid not in profiles and uid not in missing:
+        if isinstance(uid, str) and uid and uid not in profiles and uid not in _seen_missing:
+            _seen_missing.add(uid)
             missing.append(uid)
-    missing = missing[:12]
+            if len(missing) >= 12:
+                break
     if missing:
         with ThreadPoolExecutor(max_workers=min(6, len(missing))) as pool:
             futs = {pool.submit(fetch_user_v2, s, u, 12): u for u in missing}
@@ -2774,9 +2783,44 @@ _ALLOWED_IMG_HOSTS = (
     "locket.binhake.dev",
 )
 # cache key = (url, max_side) → (ts, bytes, mime)
-_img_cache: Dict[Tuple[str, int], Tuple[float, bytes, str]] = {}
-_IMG_CACHE_TTL = 900
-_IMG_CACHE_MAX = 160
+from collections import OrderedDict as _OD
+_img_cache: "_OD[Tuple[str, int, bool], Tuple[float, bytes, str]]" = _OD()
+_img_cache_bytes = 0
+_img_cache_lock = threading.Lock()
+_IMG_CACHE_TTL = 3600
+_IMG_CACHE_MAX = 600
+_IMG_CACHE_BYTES = int(os.environ.get("LOCKET_IMG_CACHE_MB", "96")) * 1024 * 1024
+_img_inflight: Dict[Tuple[str, int, bool], threading.Event] = {}
+
+
+def _img_cache_get(key):
+    with _img_cache_lock:
+        hit = _img_cache.get(key)
+        if hit and time.time() - hit[0] < _IMG_CACHE_TTL:
+            _img_cache.move_to_end(key)
+            return hit
+        if hit:
+            _drop_locked(key)
+    return None
+
+
+def _drop_locked(key):
+    global _img_cache_bytes
+    old = _img_cache.pop(key, None)
+    if old:
+        _img_cache_bytes -= len(old[1])
+
+
+def _img_cache_put(key, data: bytes, mime: str):
+    global _img_cache_bytes
+    if len(data) > _IMG_CACHE_BYTES // 4:
+        return
+    with _img_cache_lock:
+        _drop_locked(key)
+        _img_cache[key] = (time.time(), data, mime)
+        _img_cache_bytes += len(data)
+        while _img_cache and (len(_img_cache) > _IMG_CACHE_MAX or _img_cache_bytes > _IMG_CACHE_BYTES):
+            _drop_locked(next(iter(_img_cache)))
 
 def _img_host_ok(url: str) -> bool:
     from urllib.parse import urlparse
@@ -2808,6 +2852,32 @@ def _client_needs_jpeg(request) -> bool:
 
 
 def fetch_image_as_jpeg(url: str, max_side: int = 720, timeout: int = 15, force_convert: bool = False) -> Tuple[bytes, str]:
+    """Single-flight wrapper: N identical concurrent requests -> 1 download + 1 encode."""
+    max_side = max(64, min(int(max_side or 720), 1280))
+    key = (url, max_side, force_convert)
+    hit = _img_cache_get(key)
+    if hit:
+        return hit[1], hit[2]
+    with _img_cache_lock:
+        ev = _img_inflight.get(key)
+        leader = ev is None
+        if leader:
+            ev = _img_inflight[key] = threading.Event()
+    if not leader:
+        ev.wait(timeout + 5)
+        hit = _img_cache_get(key)
+        if hit:
+            return hit[1], hit[2]
+    try:
+        return _fetch_image_impl(url, max_side, timeout, force_convert)
+    finally:
+        if leader:
+            with _img_cache_lock:
+                _img_inflight.pop(key, None)
+            ev.set()
+
+
+def _fetch_image_impl(url: str, max_side: int = 720, timeout: int = 15, force_convert: bool = False) -> Tuple[bytes, str]:
     """Download remote media. Smart convert: only re-encode to JPEG when the
     browser cannot display the original format (WebP on old Safari) or when
     resize is needed. Otherwise pass through untouched — saves CPU, bandwidth,
@@ -2815,9 +2885,6 @@ def fetch_image_as_jpeg(url: str, max_side: int = 720, timeout: int = 15, force_
     max_side = max(64, min(int(max_side or 720), 1280))
     cache_key = (url, max_side, force_convert)
     now = time.time()
-    hit = _img_cache.get(cache_key)
-    if hit and now - hit[0] < _IMG_CACHE_TTL:
-        return hit[1], hit[2]
     from urllib.parse import urlparse
     host = (urlparse(url).hostname or "").lower()
     if not host or not any(host == h or host.endswith("." + h) for h in _ALLOWED_IMG_HOSTS):
@@ -2843,7 +2910,7 @@ def fetch_image_as_jpeg(url: str, max_side: int = 720, timeout: int = 15, force_
             w0, h0 = img.size
             needs_resize = max(w0, h0) > max_side
             if not needs_resize:
-                _img_cache[cache_key] = (now, raw, ctype)
+                _img_cache_put(cache_key, raw, ctype)
                 return raw, ctype
         except Exception:
             pass
@@ -2869,13 +2936,8 @@ def fetch_image_as_jpeg(url: str, max_side: int = 720, timeout: int = 15, force_
             img = bg
         elif img.mode != "RGB":
             img = img.convert("RGB")
-        if needs_resize:
-            w, h = img.size
-            if max(w, h) > max_side:
-                if w >= h:
-                    img = img.resize((max_side, max(1, int(h * max_side / w))), Image.LANCZOS)
-                else:
-                    img = img.resize((max(1, int(w * max_side / h)), max_side), Image.LANCZOS)
+        if needs_resize and max(img.size) > max_side:
+            img.thumbnail((max_side, max_side), Image.BILINEAR, reducing_gap=2.0)
         quality = 65 if max_side <= 400 else (72 if max_side <= 540 else (78 if max_side <= 800 else (85 if max_side < 1000 else 92)))
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=False, subsampling=(0 if max_side >= 1000 else -1))
@@ -2887,10 +2949,7 @@ def fetch_image_as_jpeg(url: str, max_side: int = 720, timeout: int = 15, force_
             data, out_mime = raw, ctype
         else:
             raise LocketError(f"cannot convert image ({ctype}): {e}")
-    if len(_img_cache) >= _IMG_CACHE_MAX:
-        oldest = min(_img_cache.items(), key=lambda kv: kv[1][0])[0]
-        _img_cache.pop(oldest, None)
-    _img_cache[cache_key] = (now, data, out_mime)
+    _img_cache_put(cache_key, data, out_mime)
     return data, out_mime
 
 
@@ -3632,6 +3691,19 @@ body.mv-feed .moments-feed{display:block !important}
 @media (prefers-reduced-motion:reduce){
   *,*:before,*:after{animation-duration:.001s !important;animation-iteration-count:1 !important;transition-duration:.001s !important}
   .spinner,.pp-spin,.icon-spin{animation-duration:.7s !important;animation-iteration-count:infinite !important}
+}
+</style>
+<style id="perf-boost">
+/* Skip layout/paint work for cards that are off-screen */
+.moment-card{content-visibility:auto;contain-intrinsic-size:auto 180px;contain:layout paint style}
+.feed-slide{content-visibility:auto;contain-intrinsic-size:auto 520px}
+.moment-card img,.feed-card img{transform:translateZ(0);image-rendering:auto}
+/* Heavy blur on scrolling content is the #1 cause of jank on phones */
+@media (max-width:820px){
+  .moment-top,.moment-overlay,.moment-video-badge{-webkit-backdrop-filter:none!important;backdrop-filter:none!important}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
 }
 </style>
 </head>
@@ -4492,7 +4564,7 @@ var LOCAL_FRIENDS_CAP = 200;
 
 /* ---------- Low-power mode: manual toggle + auto-detect old iOS ---------- */
 var OLD_IOS = (function(){
-  var m = navigator.userAgent.match(/OS (\d+)_/);
+  var m = navigator.userAgent.match(/OS (\\d+)_/);
   return !!(m && parseInt(m[1],10) <= 12 && /iPhone|iPad|iPod/.test(navigator.userAgent));
 })();
 function isLowPower(){
@@ -5302,6 +5374,7 @@ function buildMomentCard(m, idx, friendMap, eager){
     '<div class="moment-top">'+renderAvatar(displayProf,20)+'<span class="mname">'+esc(fullName)+'</span><span class="mtime" data-ts="'+t+'">'+timeAgo(t)+'</span></div>'+
     (cap?captionHtml(cap):'');
   var imgEl = card.querySelector('img');
+  if(imgEl){ imgEl.decoding='async'; }
   if(imgEl && imgUrl){
     if(eager) enqueueImg(imgEl, imgUrl);
     else imgEl.setAttribute('data-lazy', imgUrl);
@@ -5329,6 +5402,7 @@ function buildFeedSlide(m, idx, friendMap, eager){
       '<div class="feed-name">'+renderAvatar(displayProf,28)+'<span>'+esc(name)+'</span><span class="mtime" data-ts="'+t+'" style="margin-left:auto;color:var(--muted);font-size:12px;font-weight:700">'+timeAgo(t)+'</span></div>'+
     '</div>';
   var imgEl = slide.querySelector('img');
+  if(imgEl){ imgEl.decoding='async'; }
   if(imgEl && imgUrl){
     if(eager) enqueueImg(imgEl, imgUrl);
     else imgEl.setAttribute('data-lazy', imgUrl);
@@ -5673,6 +5747,7 @@ let _timeTicker=null;
 function startRelativeTimeTicker(){
   if(_timeTicker)return;
   _timeTicker=setInterval(()=>{
+    if(document.hidden) return;
     document.querySelectorAll('.mtime[data-ts]').forEach(el=>{
       const ts=Number(el.getAttribute('data-ts'));
       if(ts) el.textContent=timeAgo(ts);
@@ -5968,7 +6043,10 @@ function preloadMoments(){
     setTimeout(run, 2800);
   }
 }
+var _pollBusy=false;
 function pollMomentsOnce(){
+  if(document.hidden||_pollBusy) return;            // don't poll in background tabs / overlap requests
+  _pollBusy=true; setTimeout(function(){_pollBusy=false},1500);
   try{ pumpMore(); updateMoreLabel(); }catch(e){}
   apiTimeout('/api/moments/poll?since='+encodeURIComponent(momentsUpdatedAt||0), null, 20000).then(function(d){
     if(!d.ok||!d.changed)return;
@@ -7871,6 +7949,51 @@ def get_session() -> Optional[LocketSession]:
     )
 
 
+# ---- performance layer -------------------------------------------------------
+import gzip as _gzip
+import hashlib as _hashlib
+from flask import Response as _Response
+
+try:                                   # Flask >= 2.2
+    app.json.sort_keys = False         # sorting 1500 moments per response is wasted CPU
+    app.json.compact = True
+    app.json.ensure_ascii = False      # smaller payload for Vietnamese text
+except Exception:
+    app.config["JSON_SORT_KEYS"] = False
+app.config["TEMPLATES_AUTO_RELOAD"] = False
+app.jinja_env.auto_reload = False
+app.jinja_env.cache_size = 0
+
+# render_template_string() re-parses + re-compiles the whole 230 KB template on EVERY
+# request. Compile once at import time instead.
+_HTML_TPL = app.jinja_env.from_string(HTML)
+_PAGE_CACHE: "_OD[str, Tuple[str, bytes, str]]" = _OD()   # key -> (etag, gzip bytes, raw html)
+_PAGE_CACHE_LOCK = threading.Lock()
+_GZIP_TYPES = ("text/", "application/json", "application/javascript",
+               "application/manifest+json", "image/svg+xml")
+
+
+@app.after_request
+def _compress(resp):
+    try:
+        if (resp.status_code != 200 or resp.direct_passthrough or "Content-Encoding" in resp.headers
+                or "gzip" not in (request.headers.get("Accept-Encoding") or "")):
+            return resp
+        ctype = (resp.mimetype or "")
+        if not ctype.startswith(_GZIP_TYPES):
+            return resp
+        body = resp.get_data()
+        if len(body) < 700:
+            return resp
+        resp.set_data(_gzip.compress(body, compresslevel=4))
+        resp.headers["Content-Encoding"] = "gzip"
+        resp.headers["Content-Length"] = str(len(resp.get_data()))
+        resp.headers.add("Vary", "Accept-Encoding")
+    except Exception:
+        pass
+    return resp
+
+
 @app.route("/")
 @app.route("/login")
 @app.route("/upload")
@@ -7879,8 +8002,7 @@ def get_session() -> Optional[LocketSession]:
 @app.route("/friends")
 def index(mid=None):
     s = get_session()
-    return render_template_string(
-        HTML,
+    ctx = dict(
         logged_in=bool(s),
         gold_badge=GOLD_BADGE, celeb_badge=CELEB_BADGE,
         font_url=FONT_URL, favicon_url=FAVICON_URL,
@@ -7891,6 +8013,27 @@ def index(mid=None):
         app_version=APP_VERSION_STRING,
         video_budget=_VIDEO_MAX_BYTES,
     )
+    key = repr(sorted(ctx.items()))
+    with _PAGE_CACHE_LOCK:
+        hit = _PAGE_CACHE.get(key)
+        if hit:
+            _PAGE_CACHE.move_to_end(key)
+    if not hit:
+        html = _HTML_TPL.render(**ctx)
+        etag = '"%s"' % _hashlib.md5(html.encode("utf-8")).hexdigest()[:16]
+        hit = (etag, html.encode("utf-8"))
+        with _PAGE_CACHE_LOCK:
+            _PAGE_CACHE[key] = hit
+            while len(_PAGE_CACHE) > 64:
+                _PAGE_CACHE.popitem(last=False)
+    etag, body = hit
+    if request.headers.get("If-None-Match") == etag:
+        r = _Response(status=304)
+    else:
+        r = _Response(body, mimetype="text/html")
+    r.headers["ETag"] = etag
+    r.headers["Cache-Control"] = "private, no-cache"
+    return r
 
 
 @app.route("/manifest.webmanifest")
@@ -8658,11 +8801,18 @@ def api_img():
     try:
         if client_supports_webp and not needs_resize and (url.lower().endswith(".webp") or "image/webp" in (request.headers.get("Accept") or "")):
             # Pass-through: redirect hoặc proxy gốc
-            r = _http.get(url, timeout=15, headers={"User-Agent": IOS_UA, "Accept": "image/webp,image/*,*/*;q=0.8"})
-            r.raise_for_status()
-            ctype = (r.headers.get("Content-Type") or "image/webp").split(";")[0].strip()
-            resp = Response(r.content, mimetype=ctype)
-            resp.headers["Cache-Control"] = "private, max-age=900"
+            _pk = (url, -1, False)
+            _hit = _img_cache_get(_pk)
+            if _hit:
+                body, ctype = _hit[1], _hit[2]
+            else:
+                r = _http.get(url, timeout=15, headers={"User-Agent": IOS_UA, "Accept": "image/webp,image/*,*/*;q=0.8"})
+                r.raise_for_status()
+                body = r.content
+                ctype = (r.headers.get("Content-Type") or "image/webp").split(";")[0].strip()
+                _img_cache_put(_pk, body, ctype)
+            resp = Response(body, mimetype=ctype)
+            resp.headers["Cache-Control"] = "private, max-age=86400, immutable"
             return resp
     except Exception:
         pass
@@ -8671,7 +8821,8 @@ def api_img():
         force_convert = not client_supports_webp
         data, mime = fetch_image_as_jpeg(url, max_side=max_side, force_convert=force_convert)
         resp = Response(data, mimetype=mime)
-        resp.headers["Cache-Control"] = "private, max-age=900"
+        # A given storage URL never changes content -> let the browser keep it a day.
+        resp.headers["Cache-Control"] = "private, max-age=86400, immutable"
         return resp
     except requests.HTTPError as e:
         code_up = getattr(getattr(e, "response", None), "status_code", 0) or 0
@@ -8826,4 +8977,11 @@ def lumen_sticker(name):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     logger.info("Starting Locket Mini (%s) on http://0.0.0.0:%d", APP_VERSION_STRING, port)
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    try:
+        from waitress import serve        # pip install waitress  (much faster than Werkzeug's dev server)
+        logger.info("Serving with waitress (16 threads)")
+        serve(app, host="0.0.0.0", port=port, threads=16, connection_limit=400,
+              channel_timeout=120, ident="Lumen")
+    except ImportError:
+        logger.info("waitress not installed -> Werkzeug threaded server (pip install waitress for speed)")
+        app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
