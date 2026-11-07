@@ -2523,9 +2523,46 @@ def _locket_analytics() -> Dict[str, Any]:
     }
 
 
+# ---- Caption presets (official Locket badge styles: gradient + emoji) -----------------
+_CAPTION_PRESETS_JSON = r'''{"standard":{"overlay_id":"caption:standard","type":"standard","text":"","icon":null,"colors":[],"text_color":"#FFFFFF","section":"🎨 General"},"halloween_2026":{"overlay_id":"caption:halloween_2026","type":"static_content","text":"Halloween","icon":"🎃","colors":["#150804","#C8540D"],"text_color":"#FFB182","section":"🎨 Holiday Caption"},"christmas_eve_2026":{"overlay_id":"caption:christmas_eve_2026","type":"static_content","text":"Giáng sinh an lành","icon":"🕯","colors":["#2FA85F","#176B3A"],"text_color":"#FFFFFF","section":"🎨 Holiday Caption"},"christmas_day_2026":{"overlay_id":"caption:christmas_day_2026","type":"static_content","text":"Giáng sinh an lành","icon":"🎄","colors":["#E53935","#A81818"],"text_color":"#FFFFFF","section":"🎨 Holiday Caption"},"new_years_eve_2026":{"overlay_id":"caption:new_years_eve_2026","type":"static_content","text":"Xin chào 2027!","icon":"🥂","colors":["#FFC64B","#FFEDBF"],"text_color":"#643F00","section":"🎨 Holiday Caption"},"new_years_day_2027":{"overlay_id":"caption:new_years_day_2027","type":"static_content","text":"Xin chào 2027!","icon":"💫","colors":["#3B00EC","#823FFF"],"text_color":"#FFFFFF","section":"🎨 Holiday Caption"},"new_years_day_2027_alternate":{"overlay_id":"caption:new_years_day_2027_alternate","type":"static_content","text":"2027","icon":null,"colors":["#FF0062","#FF783F"],"text_color":"#FFFFFF","section":"🎨 Holiday Caption"},"review":{"overlay_id":"caption:review","type":"review","text":"","icon":null,"colors":[],"text_color":"#FFFFFF","section":"🎨 General"},"music":{"overlay_id":"caption:music","type":"music","text":"","icon":null,"colors":[],"text_color":"#FFFFFF","section":"🎨 General"},"location":{"overlay_id":"caption:location","type":"location","text":"","icon":null,"colors":[],"text_color":"#FFFFFF","section":"🎨 General"},"weather":{"overlay_id":"caption:weather","type":"weather","text":"","icon":null,"colors":[],"text_color":"#FFFFFF","section":"🎨 General"},"time":{"overlay_id":"caption:time","type":"time","text":"","icon":null,"colors":[],"text_color":"#FFFFFF","section":"🎨 General"},"streak":{"overlay_id":"caption:streak","type":"streak","text":"","icon":null,"colors":[],"text_color":"#FFFFFF","section":"🎨 General"},"star_sign":{"overlay_id":"caption:star_sign","type":"star_sign","text":"","icon":null,"colors":[],"text_color":"#FFFFFF","section":"🎨 General"},"poll":{"overlay_id":"caption:poll","type":"poll","text":"","icon":null,"colors":[],"text_color":"#FFFFFF","section":"🎨 General"},"color_palette":{"overlay_id":"caption:color_palette","type":"color_palette","text":"","icon":null,"colors":[],"text_color":"#FFFFFF","section":"General"},"party_time":{"overlay_id":"caption:party_time","type":"static_content","text":"Party Time!","icon":"🪩","colors":["#5EFFF5","#FCFF57"],"text_color":"#000000E6","section":"🎨 Decorative by Locket"},"locket_count":{"overlay_id":"caption:locket_count","type":"locket_count","text":"","icon":null,"colors":[],"text_color":"#FFFFFF","section":"🎨 General"},"good_morning":{"overlay_id":"caption:good_morning","type":"static_content","text":"Good morning","icon":"☀","colors":["#EF7402","#EABF0F"],"text_color":"#FFFFFFE5","section":"🎨 Decorative by Locket"},"goodnight":{"overlay_id":"caption:goodnight","type":"static_content","text":"Goodnight","icon":"🌙","colors":["#370C6F","#575CD4"],"text_color":"#FFFFFFE6","section":"🎨 Decorative by Locket"},"ootd":{"overlay_id":"caption:ootd","type":"static_content","text":"OOTD","icon":"🕶","colors":["#FFFFFF","#DBDBDB"],"text_color":"#101010E6","section":"🎨 Decorative by Locket"},"miss_you":{"overlay_id":"caption:miss_you","type":"static_content","text":"Miss you","icon":"🥰","colors":["#EC0C00","#FF493F"],"text_color":"#FFFFFFDB","section":"🎨 Decorative by Locket"},"custom_4281443912454362723":{"overlay_id":"caption:custom_4281443912454362723","type":"static_content","text":"Dỗi rồi","icon":"😤","colors":["#FF5F6D","#FFC371"],"text_color":"#FFFFFF","section":"In Love 💘"},"custom_4278420056830692855":{"overlay_id":"caption:custom_4278420056830692855","type":"static_content","text":"Đang bận tương tư","icon":"💭","colors":["#1A2980","#26D0CE"],"text_color":"#FFFFFF","section":"In Love 💘"},"custom_-5230082930652109611":{"overlay_id":"caption:custom_-5230082930652109611","type":"static_content","text":"Rep tin nhắn đi","icon":"📩","colors":["#F00000","#DC281E"],"text_color":"#FFFFFF","section":"In Love 💘"},"custom_-3194172128167113174":{"overlay_id":"caption:custom_-3194172128167113174","type":"static_content","text":"Mỏ hỗn nhưng tâm hiền","icon":"🐤","colors":["#FFB75E","#ED8F03"],"text_color":"#FFFFFF","section":"In Love 💘"},"custom_951140262642706115":{"overlay_id":"caption:custom_951140262642706115","type":"static_content","text":"Muốn được ôm","icon":"🫂","colors":["#FF9A9E","#FECFEF"],"text_color":"#FFFFFF","section":"In Love 💘"},"custom_-2517074947356721928":{"overlay_id":"caption:custom_-2517074947356721928","type":"static_content","text":"Hơi bị nhớ","icon":"🤏","colors":["#A18CD1","#FBC2EB"],"text_color":"#FFFFFF","section":"In Love 💘"},"custom_8704346769822013791":{"overlay_id":"caption:custom_8704346769822013791","type":"static_content","text":"Đang ghen","icon":"🔥","colors":["#F00000","#DC281E"],"text_color":"#FFFFFF","section":"In Love 💘"},"custom_-6322769402934766020":{"overlay_id":"caption:custom_-6322769402934766020","type":"static_content","text":"Ngủ ngon giấc mơ có em","icon":"🌌","colors":["#30CFD0","#330867"],"text_color":"#FFFFFF","section":"In Love 💘"},"custom_-7748601173102319221":{"overlay_id":"caption:custom_-7748601173102319221","type":"static_content","text":"Hảo hán","icon":"🗡","colors":["#114357","#F29492"],"text_color":"#FFFFFF","section":"Gen Z Life 🩻"},"custom_5086729225261087312":{"overlay_id":"caption:custom_5086729225261087312","type":"static_content","text":"Cảm lạnh","icon":"🤧","colors":["#2193B0","#6DD5ED"],"text_color":"#FFFFFF","section":"Gen Z Life 🩻"},"custom_-8827799067762644667":{"overlay_id":"caption:custom_-8827799067762644667","type":"static_content","text":"Bất lực","icon":"🏳","colors":["#2C3E50","#3498DB"],"text_color":"#FFFFFF","section":"Gen Z Life 🩻"},"custom_1207712346050008572":{"overlay_id":"caption:custom_1207712346050008572","type":"static_content","text":"Xin lũi được chưa","icon":"🥺","colors":["#F6D365","#FDA085"],"text_color":"#000000","section":"Gen Z Life 🩻"},"custom_7843091339669964287":{"overlay_id":"caption:custom_7843091339669964287","type":"static_content","text":"Rớt nước mắt","icon":"😭","colors":["#1CB5E0","#000046"],"text_color":"#FFFFFF","section":"Gen Z Life 🩻"},"custom_-6209580156274658388":{"overlay_id":"caption:custom_-6209580156274658388","type":"static_content","text":"Gục ngã","icon":"📉","colors":["#3A1C71","#D76D77"],"text_color":"#FFFFFF","section":"Gen Z Life 🩻"},"custom_2624241615109400076":{"overlay_id":"caption:custom_2624241615109400076","type":"static_content","text":"Tiền đình","icon":"🌪","colors":["#C33764","#1D2671"],"text_color":"#FFFFFF","section":"Gen Z Life 🩻"},"custom_6333530155972530884":{"overlay_id":"caption:custom_6333530155972530884","type":"static_content","text":"Chê mạnh","icon":"👎","colors":["#FF4E50","#F9D423"],"text_color":"#FFFFFF","section":"Gen Z Life 🩻"},"custom_5236262895016786086":{"overlay_id":"caption:custom_5236262895016786086","type":"static_content","text":"Xinh gái ấn phím 1","icon":"💅","colors":["#F77062","#FE5196"],"text_color":"#FFFFFF","section":"Gen Z Life 🩻"},"custom_4629360466318251663":{"overlay_id":"caption:custom_4629360466318251663","type":"static_content","text":"Đi làm vì đam mê","icon":"🤡","colors":["#FDC830","#F37335"],"text_color":"#FFFFFF","section":"Gen Z Life 🩻"},"custom_2356683405459396780":{"overlay_id":"caption:custom_2356683405459396780","type":"static_content","text":"Yeuu Emm","icon":"💖","colors":["#FF0844","#FFB199"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-156517413958162274":{"overlay_id":"caption:custom_-156517413958162274","type":"static_content","text":"Yeuu Anhh","icon":"💙","colors":["#00C6FF","#0072FF"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-1002616293585878253":{"overlay_id":"caption:custom_-1002616293585878253","type":"static_content","text":"Hồi chiều trời mưa","icon":"🌧","colors":["#5C258D","#4389A2"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_2988924028358029735":{"overlay_id":"caption:custom_2988924028358029735","type":"static_content","text":"côn viên lá làn","icon":"🍂","colors":["#12C2E9","#F64F59"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-776650182805465343":{"overlay_id":"caption:custom_-776650182805465343","type":"static_content","text":"aiiii hoiiii ?","icon":"🐽","colors":["#FA709A","#FEE140"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_8807240841082552583":{"overlay_id":"caption:custom_8807240841082552583","type":"static_content","text":"Tai ông để ngoài đầu à","icon":"👂","colors":["#F953C6","#B91D73"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_9142722434980417998":{"overlay_id":"caption:custom_9142722434980417998","type":"static_content","text":"Chan bố mày đi","icon":"🙄","colors":["#870000","#190A05"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-2275483743616875628":{"overlay_id":"caption:custom_-2275483743616875628","type":"static_content","text":"oách xà lách","icon":"🥬","colors":["#11998E","#38EF7D"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-1964354746873974650":{"overlay_id":"caption:custom_-1964354746873974650","type":"static_content","text":"è hé","icon":"🤭","colors":["#FFE000","#799F0C"],"text_color":"#000000","section":"Wordsmith 📖"},"custom_-8051687911840908357":{"overlay_id":"caption:custom_-8051687911840908357","type":"static_content","text":"Ủa alo","icon":"📞","colors":["#8E2DE2","#4A00E0"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_5306143805773536410":{"overlay_id":"caption:custom_5306143805773536410","type":"static_content","text":"Máy chủ lá đu đủ","icon":"🍃","colors":["#0BA360","#3CBA92"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_8500361098265117961":{"overlay_id":"caption:custom_8500361098265117961","type":"static_content","text":"lạnh thấy mẹ","icon":"🥶","colors":["#E0EAFC","#CFDEF3"],"text_color":"#000000","section":"Wordsmith 📖"},"custom_9196689374819632769":{"overlay_id":"caption:custom_9196689374819632769","type":"static_content","text":"Đấy Là Cái Việc","icon":"🤷♂","colors":["#FF512F","#F09819"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-1593423561129370554":{"overlay_id":"caption:custom_-1593423561129370554","type":"static_content","text":"Đẹp trai ấn phím 2","icon":"📱","colors":["#F7B733","#FC4A1A"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_1826983258186006295":{"overlay_id":"caption:custom_1826983258186006295","type":"static_content","text":"Nho anh ch?","icon":"🥺","colors":["#FF758C","#FF7EB3"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-7090905829866915796":{"overlay_id":"caption:custom_-7090905829866915796","type":"static_content","text":"Biển ơi húuuuuuu","icon":"🌊","colors":["#0052D4","#6FB1FC"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_5774090202020534389":{"overlay_id":"caption:custom_5774090202020534389","type":"static_content","text":"Yêu Mẹ","icon":"❤","colors":["#D31027","#EA384D"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_158060084751342837":{"overlay_id":"caption:custom_158060084751342837","type":"static_content","text":"nhớ ngy","icon":"💔","colors":["#FF007F","#FF5E62"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-8740976725662466401":{"overlay_id":"caption:custom_-8740976725662466401","type":"static_content","text":"Oằn tà là vằn","icon":"🌀","colors":["#FF00CC","#333399"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_2881592073605293252":{"overlay_id":"caption:custom_2881592073605293252","type":"static_content","text":"Khả Năng Cao","icon":"🤔","colors":["#757F9A","#D7DDE8"],"text_color":"#000000","section":"Wordsmith 📖"},"custom_530435604131815207":{"overlay_id":"caption:custom_530435604131815207","type":"static_content","text":"ơ quá kiêu","icon":"💅","colors":["#FF9966","#FF5E62"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_3095077949020722512":{"overlay_id":"caption:custom_3095077949020722512","type":"static_content","text":"lạnh nhớ ai","icon":"❄","colors":["#89F7FE","#66A6FF"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-1835481008846003750":{"overlay_id":"caption:custom_-1835481008846003750","type":"static_content","text":"Đừng nhăng nhít","icon":"🙅♂","colors":["#CB2D3E","#EF473A"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_2800157096924376465":{"overlay_id":"caption:custom_2800157096924376465","type":"static_content","text":"hôm nay tôi buồn","icon":"🥀","colors":["#141E30","#243B55"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-1606761404320333220":{"overlay_id":"caption:custom_-1606761404320333220","type":"static_content","text":"gặp nhau cái nhỉ","icon":"🍻","colors":["#F09819","#EDDE5D"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-985711000650511532":{"overlay_id":"caption:custom_-985711000650511532","type":"static_content","text":"ank iu eim","icon":"🥰","colors":["#F53844","#42378F"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_8417033934333284867":{"overlay_id":"caption:custom_8417033934333284867","type":"static_content","text":"Mong tôn hoa sen thấy cảnh này","icon":"🪷","colors":["#FDB99B","#CF8BF3"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-8088027983880581018":{"overlay_id":"caption:custom_-8088027983880581018","type":"static_content","text":"đấm nhau không","icon":"🥊","colors":["#FF416C","#FF4B2B"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_2329667605952175965":{"overlay_id":"caption:custom_2329667605952175965","type":"static_content","text":"siêu cấp bá khí","icon":"🐉","colors":["#F857A6","#FF5858"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-3231089972810420922":{"overlay_id":"caption:custom_-3231089972810420922","type":"static_content","text":"dự án ma","icon":"👻","colors":["#0F2027","#203A43"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_5553591653597204903":{"overlay_id":"caption:custom_5553591653597204903","type":"static_content","text":"đọc số tài khoản","icon":"💳","colors":["#00B4DB","#0083B0"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-666096677004943582":{"overlay_id":"caption:custom_-666096677004943582","type":"static_content","text":"ai sợ thì đi về","icon":"🚶♂","colors":["#000000","#E52D27"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-3548848387881782452":{"overlay_id":"caption:custom_-3548848387881782452","type":"static_content","text":"còn cái nịt","icon":"🧶","colors":["#3E5151","#DECBA4"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_1285814533953315227":{"overlay_id":"caption:custom_1285814533953315227","type":"static_content","text":"cảnh báo có hát","icon":"🎤","colors":["#DA22FF","#9733EE"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-7627856025199367222":{"overlay_id":"caption:custom_-7627856025199367222","type":"static_content","text":"Thân chưa mà dỡn","icon":"😒","colors":["#16222A","#3A6073"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_1443622437168042269":{"overlay_id":"caption:custom_1443622437168042269","type":"static_content","text":"Ai mượn?","icon":"🤨","colors":["#FF512F","#DD2476"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_2923223443268332123":{"overlay_id":"caption:custom_2923223443268332123","type":"static_content","text":"Hay ra dẻ quá à!","icon":"🙄","colors":["#4CA1AF","#C4E0E5"],"text_color":"#000000","section":"Wordsmith 📖"},"custom_5807806141447560156":{"overlay_id":"caption:custom_5807806141447560156","type":"static_content","text":"Giảm sức mạnh con tướng này","icon":"🎮","colors":["#00C9FF","#92FE9D"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_7816289860114210553":{"overlay_id":"caption:custom_7816289860114210553","type":"static_content","text":"Mắc cỡ quá hai ơi","icon":"🫣","colors":["#ED4264","#FFEDBC"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-5360614187519837840":{"overlay_id":"caption:custom_-5360614187519837840","type":"static_content","text":"Mình là lốp","icon":"🛞","colors":["#4B79A1","#283E51"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"custom_-6998405490882227027":{"overlay_id":"caption:custom_-6998405490882227027","type":"static_content","text":"Đẹp trai có gì sai","icon":"😎","colors":["#F12711","#F5AF19"],"text_color":"#FFFFFF","section":"Wordsmith 📖"},"colors":{"overlay_id":"caption:colors","type":"colors","text":"","icon":null,"colors":[],"text_color":"#FFFFFF","section":"🎨 General"},"autumn_2026":{"overlay_id":"caption:autumn_2026","type":"static_content","text":"Xin chào Mùa Thu","icon":"🍂","colors":["#FFE0A0","#F6A53A"],"text_color":"#FFFFFF","section":"🎨 Holiday Caption"},"toi_nho_em":{"overlay_id":"caption:toi_nho_em","type":"static_content","text":"보고 싶어 🥺","icon":null,"colors":["#FFFFFF","#6D9EEB"],"text_color":"#000000E6","section":"🎨 Decorative by Locket"},"feeling_cute":{"overlay_id":"caption:feeling_cute","type":"static_content","text":"Feeling Cute","icon":"🌷","colors":["#F8BBD0","#E91E63"],"text_color":"#FFFFFFE5","section":"🎨 Decorative Presets"},"cu":{"overlay_id":"caption:cu","type":"static_content","text":"Cu 🐎","icon":null,"colors":["#FFD6A5","#FFF1A8","#FFC4D6"],"text_color":"#633B24","section":"🎨 Decorative Presets"},"wedding_time":{"overlay_id":"caption:wedding_time","type":"static_content","text":"Wedding Time!","icon":"💍","colors":["#FFE4E1","#E73C7E"],"text_color":"#FFFFFFE6","section":"🎨 Decorative Presets"},"cam_thay_hanh_phuc":{"overlay_id":"caption:cam_thay_hanh_phuc","type":"static_content","text":"Cảm thấy hạnh phúc","icon":"🇻🇳","colors":["#EC407A","#F8BBD0"],"text_color":"#FFFFFFE6","section":"🎨 Decorative Presets"},"coffee_time":{"overlay_id":"caption:coffee_time","type":"static_content","text":"Coffee Time!","icon":"☕","colors":["#4E342E","#8D6E63"],"text_color":"#FFFFFFE6","section":"🎨 Decorative Presets"},"snake_vibes":{"overlay_id":"caption:snake_vibes","type":"static_content","text":"Snake Vibes","icon":"🐍","colors":["#2E7D32","#66BB6A"],"text_color":"#FFFFFFE6","section":"🎨 Decorative Presets"},"mixue_time":{"overlay_id":"caption:mixue_time","type":"static_content","text":"Mixue Time!","icon":"🍦","colors":["#FFF9C4","#F8BBD0"],"text_color":"#000000E6","section":"🎨 Decorative Presets"},"locket_time":{"overlay_id":"caption:locket_time","type":"static_content","text":"Locket Time!","icon":"📷","colors":["#ECEFF1","#B3E5FC"],"text_color":"#000000E6","section":"🎨 Decorative Presets"},"cinema_time":{"overlay_id":"caption:cinema_time","type":"static_content","text":"Cinema Time!","icon":"🎬","colors":["#1A237E","#455A64"],"text_color":"#FFFFFFE6","section":"🎨 Decorative Presets"},"dating_time":{"overlay_id":"caption:dating_time","type":"static_content","text":"Dating Time!","icon":"💕","colors":["#E91E63","#F44336"],"text_color":"#FFFFFFE6","section":"🎨 Decorative Presets"},"graduation_day":{"overlay_id":"caption:graduation_day","type":"static_content","text":"Happy Graduation Day!","icon":"🎓","colors":["#1A237E","#283593"],"text_color":"#FFFFFFE6","section":"🎨 Decorative Presets"},"shopping_time":{"overlay_id":"caption:shopping_time","type":"static_content","text":"Shopping Time!","icon":"🛍","colors":["#B3E5FC","#FFFFFF"],"text_color":"#000000E6","section":"🎨 Decorative Presets"},"dinner_time":{"overlay_id":"caption:dinner_time","type":"static_content","text":"Dinner Time!","icon":"🍽","colors":["#FFCCBC","#FF8A80"],"text_color":"#FFFFFFE6","section":"🎨 Decorative Presets"},"chilling_time":{"overlay_id":"caption:chilling_time","type":"static_content","text":"Chilling Time!","icon":"🌴","colors":["#E1BEE7","#F8BBD0"],"text_color":"#FFFFFFE6","section":"🎨 Decorative Presets"},"xin_vinh_biet_cu":{"overlay_id":"caption:xin_vinh_biet_cu","type":"static_content","text":"Xin vĩnh biệt cụ","icon":"🕯","colors":["#232526","#414345"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"chay_ngay_di":{"overlay_id":"caption:chay_ngay_di","type":"static_content","text":"Chạy ngay đi","icon":"🏃💨","colors":["#D31027","#EA384D"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"cu_tu_tu_khoai_se_nhu":{"overlay_id":"caption:cu_tu_tu_khoai_se_nhu","type":"static_content","text":"Cứ từ từ khoai sẽ nhừ","icon":"🥔","colors":["#56AB2F","#A8E063"],"text_color":"#000000E6","section":"🌸 Độc lạ"},"kiem_tra_nhan_pham":{"overlay_id":"caption:kiem_tra_nhan_pham","type":"static_content","text":"Kiểm tra nhân phẩm","icon":"🎲","colors":["#654EA3","#EAAFC8"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"doc_so_tai_khoan":{"overlay_id":"caption:doc_so_tai_khoan","type":"static_content","text":"đọc số tài khoản","icon":"💳","colors":["#1E90FF","#00D4FF"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"ai_so_thi_di_ve":{"overlay_id":"caption:ai_so_thi_di_ve","type":"static_content","text":"ai sợ thì đi về","icon":"🏃","colors":["#B71C1C","#FF5722"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"con_cai_nit":{"overlay_id":"caption:con_cai_nit","type":"static_content","text":"còn cái nịt","icon":"🧶","colors":["#D7CCC8","#8D6E63"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"canh_bao_co_hat":{"overlay_id":"caption:canh_bao_co_hat","type":"static_content","text":"cảnh báo có hát","icon":"🎤","colors":["#9C27B0","#E91E63"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"than_chua_ma_don":{"overlay_id":"caption:than_chua_ma_don","type":"static_content","text":"Thân chưa mà dỡn","icon":"😔","colors":["#607D8B","#37474F"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"ai_muon":{"overlay_id":"caption:ai_muon","type":"static_content","text":"Ai mượn?","icon":"🤔","colors":["#E91E63","#F44336"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"hay_ra_de_qua_a":{"overlay_id":"caption:hay_ra_de_qua_a","type":"static_content","text":"Hay ra dẻ quá à!","icon":"🥺","colors":["#FFF59D","#80DEEA"],"text_color":"#000000E6","section":"🌸 Độc lạ"},"giam_suc_manh_con_tuong":{"overlay_id":"caption:giam_suc_manh_con_tuong","type":"static_content","text":"Giảm sức mạnh con tướng","icon":"🎮","colors":["#4CAF50","#00BCD4"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"mac_co_qua_hai_oi":{"overlay_id":"caption:mac_co_qua_hai_oi","type":"static_content","text":"Mắc cỡ quá hai ơi","icon":"😭","colors":["#FFB74D","#F8BBD0"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"minh_la_lop":{"overlay_id":"caption:minh_la_lop","type":"static_content","text":"Mình là lốp","icon":"🛞","colors":["#263238","#455A64"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"dep_trai_co_gi_sai":{"overlay_id":"caption:dep_trai_co_gi_sai","type":"static_content","text":"Đẹp trai có gì sai","icon":"😎","colors":["#FF5722","#FFC107"],"text_color":"#000000E6","section":"🌸 Độc lạ"},"mong_ton_hoa_sen":{"overlay_id":"caption:mong_ton_hoa_sen","type":"static_content","text":"Mong tôn hoa sen thấy cảnh này","icon":"🪷","colors":["#D8B4E2","#F8BBD0"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"dam_nhau_khong":{"overlay_id":"caption:dam_nhau_khong","type":"static_content","text":"đấm nhau không","icon":"🥊","colors":["#E53935","#FF7043"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"sieu_cap_ba_khi":{"overlay_id":"caption:sieu_cap_ba_khi","type":"static_content","text":"siêu cấp bá khí","icon":"🐉","colors":["#EC407A","#F44336"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"du_an_ma":{"overlay_id":"caption:du_an_ma","type":"static_content","text":"dự án ma","icon":"👻","colors":["#263238","#455A64"],"text_color":"#FFFFFFE6","section":"🌸 Độc lạ"},"hoi_chieu_troi_mua":{"overlay_id":"caption:hoi_chieu_troi_mua","type":"static_content","text":"Hồi chiều trời mưa...","icon":"🌧","colors":["#546E7A","#263238"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"tuyet_doi_khong_nghe":{"overlay_id":"caption:tuyet_doi_khong_nghe","type":"static_content","text":"Tuyệt đối không nghe","icon":"🙉","colors":["#FF416C","#FF4B2B"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"flex_den_hoi_tho_cuoi":{"overlay_id":"caption:flex_den_hoi_tho_cuoi","type":"static_content","text":"Flex đến hơi thở cuối","icon":"💎","colors":["#F7971E","#FFD200"],"text_color":"#000000E6","section":"🌸 Trend TikTok"},"overthinking_vai_chuong":{"overlay_id":"caption:overthinking_vai_chuong","type":"static_content","text":"Overthinking vai chưởng","icon":"🤯","colors":["#2C3E50","#4CA1AF"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"ke_chuyen_nghe_choi":{"overlay_id":"caption:ke_chuyen_nghe_choi","type":"static_content","text":"Kể chuyện nghe chơi","icon":"🍿","colors":["#8A2387","#E94057"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"xinh_dep_tuyet_voi":{"overlay_id":"caption:xinh_dep_tuyet_voi","type":"static_content","text":"Xinh đẹp tuyệt vời","icon":"💅","colors":["#FC5C7D","#6A82FB"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"tram_cam_nhe":{"overlay_id":"caption:tram_cam_nhe","type":"static_content","text":"Trầm cảm nhẹ","icon":"🫠","colors":["#1F1C2C","#928DAB"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"chua_du_wow":{"overlay_id":"caption:chua_du_wow","type":"static_content","text":"Chưa đủ wow","icon":"⭐","colors":["#FF5349","#EB0C00"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"boc_trung_sit_rit":{"overlay_id":"caption:boc_trung_sit_rit","type":"static_content","text":"Bóc trúng sít rịt","icon":"🎁","colors":["#9C27B0","#7B1FA2"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"hen_lam_moi_xui_duoc_vay_a":{"overlay_id":"caption:hen_lam_moi_xui_duoc_vay_a","type":"static_content","text":"Hèn lắm mới xui được vậy á","icon":"😅","colors":["#00BCD4","#0097A7"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"ra_duong_ne_moi_anh":{"overlay_id":"caption:ra_duong_ne_moi_anh","type":"static_content","text":"Ra đường nể mỗi anh","icon":"👤","colors":["#2196F3","#1976D2"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"cung_cung_di":{"overlay_id":"caption:cung_cung_di","type":"static_content","text":"Cũng cứng đi","icon":"🚀","colors":["#FFC107","#FFA000"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"tuyet_doi_dien_anh":{"overlay_id":"caption:tuyet_doi_dien_anh","type":"static_content","text":"Tuyệt đối điện ảnh","icon":"📷","colors":["#455A64","#263238"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"du_ba_khi_chua":{"overlay_id":"caption:du_ba_khi_chua","type":"static_content","text":"Đủ bá khí chưa","icon":"⚡","colors":["#FF5722","#E64A19"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"ua_alo":{"overlay_id":"caption:ua_alo","type":"static_content","text":"Ủa alo?","icon":"❓","colors":["#9C27B0","#7B1FA2"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"cai_gi_vay_troi":{"overlay_id":"caption:cai_gi_vay_troi","type":"static_content","text":"Cái gì vậy trời","icon":"❗","colors":["#F44336","#D32F2F"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"nay_la_het_cuu":{"overlay_id":"caption:nay_la_het_cuu","type":"static_content","text":"Này là hết cứu","icon":"❌","colors":["#607D8B","#455A64"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"qua_la_dien_anh":{"overlay_id":"caption:qua_la_dien_anh","type":"static_content","text":"Quá là điện ảnh","icon":"📷","colors":["#26A69A","#00897B"],"text_color":"#FFFFFFE6","section":"🌸 Trend TikTok"},"cuoi_xiu":{"overlay_id":"caption:cuoi_xiu","type":"static_content","text":"Cười xỉu","icon":"😎","colors":["#FFEB3B","#FF9800"],"text_color":"#000000E6","section":"🌸 Meme vui nhộn"},"toang_that_roi":{"overlay_id":"caption:toang_that_roi","type":"static_content","text":"Toang thật rồi","icon":"🐉","colors":["#F44336","#B71C1C"],"text_color":"#FFFFFFE6","section":"🌸 Meme vui nhộn"},"toi_roi_toi_roi":{"overlay_id":"caption:toi_roi_toi_roi","type":"static_content","text":"Tới rồi tới rồi","icon":"❗","colors":["#673AB7","#512DA8"],"text_color":"#FFFFFFE6","section":"🌸 Meme vui nhộn"},"khong_the_tin_noi":{"overlay_id":"caption:khong_the_tin_noi","type":"static_content","text":"Không thể tin nổi","icon":"❓","colors":["#00BCD4","#0097A7"],"text_color":"#FFFFFFE6","section":"🌸 Meme vui nhộn"},"ngay_moi_vui_ve":{"overlay_id":"caption:ngay_moi_vui_ve","type":"static_content","text":"Ngày mới vui vẻ","icon":"☀","colors":["#4CAF50","#2E7D32"],"text_color":"#FFFFFFE6","section":"🌸 Đời sống"},"ngu_ngon":{"overlay_id":"caption:ngu_ngon","type":"static_content","text":"Ngủ ngon","icon":"🌙","colors":["#3F51B5","#1A237E"],"text_color":"#FFFFFFE6","section":"🌸 Đời sống"},"an_com_chua":{"overlay_id":"caption:an_com_chua","type":"static_content","text":"Ăn cơm chưa?","icon":"🍽","colors":["#FF9800","#F57C00"],"text_color":"#FFFFFFE6","section":"🌸 Đời sống"},"di_choi_khong":{"overlay_id":"caption:di_choi_khong","type":"static_content","text":"Đi chơi không?","icon":"✈","colors":["#E91E63","#C2185B"],"text_color":"#FFFFFFE6","section":"🌸 Đời sống"},"tinh_hoa_hoi_tu":{"overlay_id":"caption:tinh_hoa_hoi_tu","type":"static_content","text":"Tinh hoa hội tụ","icon":"✨","colors":["#FFD700","#FF8C00"],"text_color":"#000000E6","section":"🌸 Gen Z Slay"},"phu_tinh_khong_phu_ban":{"overlay_id":"caption:phu_tinh_khong_phu_ban","type":"static_content","text":"Phụ tình không phụ bản","icon":"🕶","colors":["#8E2DE2","#4A00E0"],"text_color":"#FFFFFFE6","section":"🌸 Gen Z Slay"},"ngoan_xinh_yeu":{"overlay_id":"caption:ngoan_xinh_yeu","type":"static_content","text":"Ngoan xinh yêu của ai?","icon":"🌸","colors":["#FFAFBD","#FFC3A0"],"text_color":"#000000E6","section":"🌸 Gen Z Slay"},"nhin_la_biet_uy_tin":{"overlay_id":"caption:nhin_la_biet_uy_tin","type":"static_content","text":"Nhìn là biết uy tín","icon":"👌","colors":["#2980B9","#2C3E50"],"text_color":"#FFFFFFE6","section":"🌸 Gen Z Slay"},"luon_vui_tuoi":{"overlay_id":"caption:luon_vui_tuoi","type":"static_content","text":"Luôn vui tươi","icon":"🤡","colors":["#00F2FE","#4FACFE"],"text_color":"#FFFFFFE6","section":"🌸 Bất ổn & Khó đỡ"},"bat_on_that_su":{"overlay_id":"caption:bat_on_that_su","type":"static_content","text":"Bất ổn thật sự","icon":"🫠","colors":["#636363","#A2AB58"],"text_color":"#FFFFFFE6","section":"🌸 Bất ổn & Khó đỡ"},"khong_cam_xuc":{"overlay_id":"caption:khong_cam_xuc","type":"static_content","text":"Không cảm xúc","icon":"🗿","colors":["#434343","#000000"],"text_color":"#FFFFFFE6","section":"🌸 Bất ổn & Khó đỡ"},"phu_huynh_dung_xem":{"overlay_id":"caption:phu_huynh_dung_xem","type":"static_content","text":"Phụ huynh đừng xem","icon":"🙈","colors":["#FF0844","#FFB199"],"text_color":"#FFFFFFE6","section":"🌸 Bất ổn & Khó đỡ"},"check_var":{"overlay_id":"caption:check_var","type":"static_content","text":"Check VAR liền","icon":"📺","colors":["#11998E","#38EF7D"],"text_color":"#FFFFFFE6","section":"🌸 Check VAR & Hóng hớt"},"qua_nhieu_su_de_thuong":{"overlay_id":"caption:qua_nhieu_su_de_thuong","type":"static_content","text":"Quá nhiều sự dễ thương","icon":"🎀","colors":["#F38181","#FCE38A"],"text_color":"#000000E6","section":"🌸 Check VAR & Hóng hớt"},"mac_bay_tinh_yeu":{"overlay_id":"caption:mac_bay_tinh_yeu","type":"static_content","text":"Mắc bẫy tình yêu","icon":"💘","colors":["#EE9CA7","#FFDDE1"],"text_color":"#000000E6","section":"🌸 Check VAR & Hóng hớt"},"song_gio_phu_doi_trai":{"overlay_id":"caption:song_gio_phu_doi_trai","type":"static_content","text":"Sóng gió phủ đời trai","icon":"🌪","colors":["#3A1C71","#D76D77"],"text_color":"#FFFFFFE6","section":"🌸 Check VAR & Hóng hớt"},"deadline_ruot":{"overlay_id":"caption:deadline_ruot","type":"static_content","text":"Deadline dí tụt quần","icon":"🔥","colors":["#ED213A","#93291E"],"text_color":"#FFFFFFE6","section":"🌸 Góc Deadline & Đi Làm"},"tien_dau_ma_tieu":{"overlay_id":"caption:tien_dau_ma_tieu","type":"static_content","text":"Tiền đâu mà tiêu","icon":"💸","colors":["#11998E","#38EF7D"],"text_color":"#FFFFFFE6","section":"🌸 Góc Deadline & Đi Làm"},"nghien_cuu_khoa_hoc":{"overlay_id":"caption:nghien_cuu_khoa_hoc","type":"static_content","text":"Cần nạp cafein gấp","icon":"☕","colors":["#0F2027","#2C5364"],"text_color":"#FFFFFFE6","section":"🌸 Góc Deadline & Đi Làm"}}'''
+CAPTION_PRESETS: Dict[str, Dict[str, Any]] = json.loads(_CAPTION_PRESETS_JSON)
+_CAP_SECTION_ORDER: List[str] = []
+for _v in CAPTION_PRESETS.values():
+    if _v.get("section") not in _CAP_SECTION_ORDER:
+        _CAP_SECTION_ORDER.append(_v.get("section"))
+
+
+def _preset_overlay(key: str, text: str = "", icon: str = "") -> Optional[Dict[str, Any]]:
+    """Build a caption overlay for a preset key (mirrors the official badge payload)."""
+    p = CAPTION_PRESETS.get((key or "").replace("caption:", ""))
+    if not p or p.get("type") == "standard":
+        return None
+    final_text = (text or "").strip() or (p.get("text") or "")
+    if not final_text:                      # dynamic badges (time/location/...) need text
+        return None
+    final_icon = (icon or "").strip()[:8] or (p.get("icon") or "")
+    colors = list(p.get("colors") or [])
+    data: Dict[str, Any] = {
+        "text": final_text[:200],
+        "type": p.get("type") or "static_content",
+        "text_color": p.get("text_color") or "#FFFFFFE6",
+        "max_lines": {"value": "1", "@type": "type.googleapis.com/google.protobuf.Int64Value"},
+        "background": {"material_blur": "regular" if colors else "ultra_thin", "colors": colors},
+    }
+    if final_icon:
+        data["icon"] = {"data": final_icon, "type": "emoji"}
+    return {
+        "overlay_id": p.get("overlay_id") or ("caption:" + key),
+        "overlay_type": "caption",
+        "alt_text": (final_icon + " " + final_text) if final_icon else final_text,
+        "data": data,
+    }
+
+
 def post_moment_v2(s: LocketSession, thumbnail_url: str, md5_hex: str,
                    caption: str = "", recipients: Optional[List[str]] = None,
-                   timeout: int = 30) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+                   timeout: int = 30, overlay: Optional[Dict[str, Any]] = None
+                   ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Official Locket post endpoint (api.locketcamera.com/postMomentV2).
 
     Payload shape captured from Android 1.237.0 (2026-08-26 HAR):
@@ -2538,7 +2575,9 @@ def post_moment_v2(s: LocketSession, thumbnail_url: str, md5_hex: str,
     debug: List[Dict[str, Any]] = []
     overlays: List[Dict[str, Any]] = []
     cap = (caption or "").strip()
-    if cap:
+    if overlay:
+        overlays.append(overlay)
+    elif cap:
         overlays.append({
             "overlay_id": "caption:standard",
             "overlay_type": "caption",
@@ -2577,7 +2616,8 @@ def post_moment_v2(s: LocketSession, thumbnail_url: str, md5_hex: str,
 
 
 def upload_media_official(s: LocketSession, data: bytes, content_type: str = "image/jpeg",
-                           caption: str = "", timeout: int = 90
+                           caption: str = "", timeout: int = 90,
+                           overlay: Optional[Dict[str, Any]] = None
                            ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Photo post via official Firebase Storage + postMomentV2 (binhake fallback)."""
     debug: List[Dict[str, Any]] = []
@@ -2585,7 +2625,7 @@ def upload_media_official(s: LocketSession, data: bytes, content_type: str = "im
     object_name = f"users/{s.local_id}/moments/thumbnails/{_random_storage_name(ext)}"
     media_url, md5_hex, d1 = upload_to_firebase_storage(s, blob, ct, object_name, timeout=timeout)
     debug.extend(d1)
-    result, d2 = post_moment_v2(s, media_url, md5_hex, caption=caption, timeout=min(30, timeout))
+    result, d2 = post_moment_v2(s, media_url, md5_hex, caption=caption, timeout=min(30, timeout), overlay=overlay)
     debug.extend(d2)
     return result, debug
 
@@ -3281,6 +3321,40 @@ body.mv-feed .moments-feed{display:block !important}
 
 /* Caption pill: long text scrolls sideways */
 .moment-caption{position:absolute;left:6%;right:6%;bottom:12px;z-index:3;text-align:center;pointer-events:none;display:block}
+.cap-row{display:flex;gap:8px;align-items:stretch}
+.cap-row .input{flex:1;min-width:0}
+.cap-open{flex:0 0 auto;width:54px;border:none;border-radius:20px;background:var(--field);color:var(--text);font-size:22px;cursor:pointer}
+.cap-open:active{transform:scale(.94)}
+.cap-selbar{display:flex;align-items:center;gap:8px;margin-top:10px}
+.cap-selbar .cap-static{flex:1;min-width:0}
+.cap-selbar button{flex:0 0 auto;border:none;background:var(--field);color:var(--text);border-radius:50%;width:32px;height:32px;cursor:pointer;font-size:14px}
+.cap-static{display:flex;justify-content:center}
+.cap-static .cap-clip{white-space:normal}
+.cap-pill.rich{-webkit-backdrop-filter:none;backdrop-filter:none}
+.cap-ico{display:inline-block;margin-right:6px;font-size:1.08em;line-height:1}
+.cap-sw{display:inline-block;width:14px;height:14px;border-radius:50%;margin-right:4px;vertical-align:-2px;box-shadow:0 0 0 1px rgba(255,255,255,.35)}
+.cap-sheet{position:fixed;top:0;left:0;right:0;bottom:0;z-index:2000;display:flex;align-items:flex-end;justify-content:center}
+.cap-sheet-bg{position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.55)}
+.cap-sheet-body{position:relative;width:100%;max-width:560px;height:84vh;display:flex;flex-direction:column;background:var(--surface);color:var(--text);border-radius:24px 24px 0 0;padding:14px 14px calc(12px + env(safe-area-inset-bottom));box-shadow:0 -10px 40px rgba(0,0,0,.4)}
+.cap-sheet-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;font-weight:800;font-size:16px}
+.cap-sheet-head button{border:none;background:var(--field);color:var(--text);width:32px;height:32px;border-radius:50%;cursor:pointer}
+.cap-emoji{display:flex;gap:4px;overflow-x:auto;padding:8px 0;margin:6px 0 0;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.cap-emoji::-webkit-scrollbar{display:none}
+.cap-emoji button{flex:0 0 auto;border:2px solid transparent;background:var(--field);border-radius:12px;width:40px;height:40px;font-size:21px;cursor:pointer;padding:0}
+.cap-emoji button.on{border-color:var(--accent)}
+.cap-tabs{display:flex;gap:6px;overflow-x:auto;padding:6px 0 8px;scrollbar-width:none}
+.cap-tabs::-webkit-scrollbar{display:none}
+.cap-tabs button{flex:0 0 auto;border:none;background:var(--field);color:var(--text2);font-family:inherit;font-weight:700;font-size:12.5px;padding:8px 13px;border-radius:999px;cursor:pointer;white-space:nowrap}
+.cap-tabs button.on{background:var(--accent);color:var(--on-accent)}
+.cap-grid{flex:1;overflow-y:auto;display:flex;flex-direction:column;align-items:flex-start;gap:10px;padding:6px 2px 8px;-webkit-overflow-scrolling:touch}
+.cap-item{border:none;background:none;padding:0;cursor:pointer;max-width:100%;text-align:left}
+.cap-item .cap-pill{max-width:100%}
+.cap-item:active{transform:scale(.97)}
+.cap-empty{color:var(--text2);font-size:13px;padding:20px 4px}
+.cap-hint{color:var(--text2);font-size:12px;margin:2px 4px 0}
+.moment-caption{display:flex;flex-direction:column;align-items:center;gap:6px}
+.moment-caption .cap-pill{max-width:100%}
+
 .cap-pill{display:inline-block;max-width:100%;vertical-align:bottom;background:rgba(0,0,0,.5);border-radius:500px;
   -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
 .cap-clip{overflow:hidden;margin:0 16px;padding:8px 0;white-space:nowrap;font-size:13px;font-weight:800;line-height:1.35;color:#fff;text-align:left}
@@ -3897,7 +3971,8 @@ body.mv-feed .moments-feed{display:block !important}
     <input type="file" id="fileInput" accept="image/*,video/*" onchange="onFilePick(event)">
     <input type="file" id="cameraInput" accept="image/*" capture="environment" class="hidden" onchange="onFilePick(event)">
     <label class="label" style="margin-top:18px">Chú thích</label>
-    <input class="input" id="caption" placeholder="Viết gì đó..." maxlength="200">
+    <div class="cap-row"><input class="input" id="caption" placeholder="Viết gì đó..." maxlength="200" oninput="capSelRefresh()"><button type="button" class="cap-open" id="capOpen" onclick="openCapPicker()" aria-label="Caption mẫu và emoji">✨</button></div>
+    <div class="cap-selbar hidden" id="capSelBar"></div>
     <div class="send-row"><button class="btn" onclick="doUpload()" id="uploadBtn">Gửi cho tất cả bạn bè</button></div>
     <div class="queue-box hidden" id="queueBox">
       <div class="qb-head"><span>Hàng đợi đăng</span><span id="queueCount">0</span></div>
@@ -5376,7 +5451,7 @@ function buildMomentCard(m, idx, friendMap, eager){
     '<div class="moment-overlay"></div>'+
     (isVid?'<div class="moment-video-badge"><i class="bi bi-play-fill"></i></div>':'')+
     '<div class="moment-top">'+renderAvatar(displayProf,20)+'<span class="mname">'+esc(fullName)+'</span><span class="mtime" data-ts="'+t+'">'+timeAgo(t)+'</span></div>'+
-    (cap?captionHtml(cap):'');
+    captionHtml(cap,m);
   var imgEl = card.querySelector('img');
   if(imgEl){ imgEl.decoding='async'; }
   if(imgEl && imgUrl){
@@ -5400,7 +5475,7 @@ function buildFeedSlide(m, idx, friendMap, eager){
       '<img src="'+TINY_PIXEL+'" data-real="'+esc(imgUrl)+'" alt="" style="background:var(--surface2)">'+
       '<div class="moment-overlay"></div>'+
       (isVid?'<div class="moment-video-badge"><i class="bi bi-play-fill"></i></div>':'')+
-      (cap?captionHtml(cap):'')+
+      captionHtml(cap,m)+
     '</div>'+
     '<div class="feed-meta">'+
       '<div class="feed-name">'+renderAvatar(displayProf,28)+'<span>'+esc(name)+'</span><span class="mtime" data-ts="'+t+'" style="margin-left:auto;color:var(--muted);font-size:12px;font-weight:700">'+timeAgo(t)+'</span></div>'+
@@ -5414,9 +5489,70 @@ function buildFeedSlide(m, idx, friendMap, eager){
   return slide;
 }
 /* ===== Caption pill: tự chạy chữ khi dài hơn khung ===== */
-function captionHtml(cap){
-  return '<div class="moment-caption"><div class="cap-pill"><div class="cap-clip"><span class="cap-in">'+esc(cap)+'</span></div></div></div>';
+/* ===== Caption: render đủ loại (standard, static_content gradient + emoji, time, location, weather, music, streak...) ===== */
+var CAP_DEFAULT_ICON={location:'📍',weather:'🌤',time:'🕒',music:'🎵',streak:'🔥',review:'⭐',star_sign:'✨',poll:'📊',color_palette:'🎨',colors:'🎨',locket_count:'🔢'};
+var CAP_UTILS=[
+  {key:'time',label:'Giờ',icon:'🕒',hint:'Giờ hiện tại'},
+  {key:'location',label:'Vị trí',icon:'📍',hint:'Bạn đang ở đâu?'},
+  {key:'weather',label:'Thời tiết',icon:'🌤',hint:'VD: 28° nắng nhẹ'},
+  {key:'music',label:'Nhạc',icon:'🎵',hint:'Tên bài - ca sĩ'},
+  {key:'streak',label:'Streak',icon:'🔥',hint:'VD: 7 ngày liên tiếp'},
+  {key:'review',label:'Đánh giá',icon:'⭐',hint:'VD: 5/5 ngon xỉu'},
+  {key:'star_sign',label:'Cung hoàng đạo',icon:'✨',hint:'VD: Bạch Dương'},
+  {key:'poll',label:'Bình chọn',icon:'📊',hint:'Câu hỏi bình chọn'}
+];
+var CAP_EMOJIS=['😀','😂','🥹','😍','🥰','😎','🤩','😭','😤','🥱','😴','🤪','🙃','😇','🤔','🫠','🔥','✨','💖','💜','🖤','💀','👀','🙌','👏','🙏','💪','🎉','🎂','🍕','🍜','☕','🧋','🍺','🌈','🌙','☀','⭐','🌸','🌊','🏖','✈','📍','🎵','🎧','📸','💼','📚','🛵','🐶','🐱'];
+function capNorm(t){ try{ return String(t||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/đ/g,'d').toLowerCase(); }catch(e){ return String(t||'').toLowerCase(); } }
+function capSafeColor(c){ return (typeof c==='string' && /^#[0-9a-fA-F]{3,8}$/.test(c)) ? c : ''; }
+function capIconOf(ov){
+  var d=ov&&ov.data||{}, ic=d.icon;
+  if(ic && typeof ic==='object') ic=ic.data||ic.emoji||ic.text||'';
+  return (typeof ic==='string')?ic.slice(0,8):'';
 }
+function capOverlay(m){
+  var ovs=m&&m.overlays; if(!Array.isArray(ovs)) return null;
+  var pick=null, i, o;
+  for(i=0;i<ovs.length;i++){
+    o=ovs[i]; if(!o||typeof o!=='object') continue;
+    var id=String(o.overlay_id||'');
+    if(o.overlay_type==='caption'||id.indexOf('caption')===0){
+      if(id==='caption:standard') return o;
+      if(!pick) pick=o;
+    }
+  }
+  return pick;
+}
+function capSpecFromMoment(m, cap){
+  var ov=capOverlay(m), d=(ov&&ov.data)||{};
+  var type=String(d.type||'standard');
+  var colors=[], bg=d.background&&d.background.colors;
+  if(Array.isArray(bg)) for(var i=0;i<bg.length&&i<4;i++){ var c=capSafeColor(bg[i]); if(c) colors.push(c); }
+  var text=cap||d.text||'';
+  if(!text && type==='time'){
+    var t=(m.date&&m.date._seconds)||m.timestamp||m.created_at||0;
+    if(t){ var dt=new Date(t*1000); text=('0'+dt.getHours()).slice(-2)+':'+('0'+dt.getMinutes()).slice(-2); }
+  }
+  var icon=capIconOf(ov);
+  if(!icon && type!=='standard' && type!=='static_content') icon=CAP_DEFAULT_ICON[type]||'';
+  return {text:text, icon:icon, colors:colors, color:capSafeColor(d.text_color), type:type,
+          swatches: (type==='color_palette'||type==='colors') ? colors : []};
+}
+function capPillHtml(sp){
+  var bgcss='', rich=false;
+  if(sp.colors.length>=2){ bgcss='background:linear-gradient(135deg,'+sp.colors.join(',')+');'; rich=true; }
+  else if(sp.colors.length===1 && !sp.swatches.length){ bgcss='background:'+sp.colors[0]+';'; rich=true; }
+  var sw='';
+  if(sp.swatches.length){ for(var i=0;i<sp.swatches.length;i++) sw+='<span class="cap-sw" style="background:'+sp.swatches[i]+'"></span>'; bgcss=''; rich=false; }
+  var ico=sp.icon?'<span class="cap-ico">'+esc(sp.icon)+'</span>':'';
+  var col=sp.color?'color:'+sp.color+';':'';
+  return '<div class="cap-pill'+(rich?' rich':'')+'" style="'+bgcss+'"><div class="cap-clip" style="'+col+'"><span class="cap-in">'+sw+ico+esc(sp.text)+'</span></div></div>';
+}
+function captionHtml(cap, m){
+  var sp=capSpecFromMoment(m||{}, cap);
+  if(!sp.text && !sp.swatches.length) return '';
+  return '<div class="moment-caption">'+capPillHtml(sp)+'</div>';
+}
+
 var _capRaf=0, _capForce=false, _capResizeT=null;
 function fitCaptionsSoon(force){
   if(force) _capForce=true;
@@ -5427,6 +5563,125 @@ function fitCaptionsSoon(force){
     fitCaptions(f);
   });
 }
+
+/* ===== Bộ chọn caption mẫu + emoji ===== */
+var capSel={key:'',icon:''}, CAP_DATA=null, capTab='', capSheetEl=null, capLoading=false;
+function resetCapSel(){ capSel={key:'',icon:''}; capSelRefresh(); }
+function capPresetSpec(key, icon, text){
+  var p=(CAP_DATA&&CAP_DATA.presets&&CAP_DATA.presets[key])||null;
+  var type=p?p.type:'standard';
+  var colors=[]; if(p&&Array.isArray(p.colors)) p.colors.forEach(function(c){ c=capSafeColor(c); if(c) colors.push(c); });
+  var ic=icon||(p&&p.icon)||CAP_DEFAULT_ICON[type]||'';
+  return {text:text, icon:ic, colors:colors, color:capSafeColor(p&&p.text_color), type:type, swatches:[]};
+}
+function capSelRefresh(){
+  var bar=$('capSelBar'); if(!bar) return;
+  var txt=($('caption')&&$('caption').value||'').trim();
+  if(!capSel.key && !capSel.icon){ bar.classList.add('hidden'); bar.innerHTML=''; return; }
+  var sp=capPresetSpec(capSel.key, capSel.icon, txt||(capSel.key&&CAP_DATA&&CAP_DATA.presets[capSel.key]&&CAP_DATA.presets[capSel.key].text)||'Xem trước caption');
+  bar.innerHTML='<div class="cap-static">'+capPillHtml(sp)+'</div><button type="button" onclick="resetCapSel()" aria-label="Bỏ caption mẫu">✕</button>';
+  bar.classList.remove('hidden');
+}
+function capLoadData(cb){
+  if(CAP_DATA) return cb();
+  if(capLoading) return;
+  capLoading=true;
+  fetch('/api/caption-presets').then(function(r){return r.json()}).then(function(j){
+    CAP_DATA=j; capLoading=false; cb();
+  }).catch(function(){ capLoading=false; toast&&toast('Không tải được caption mẫu'); });
+}
+function ensureCapSheet(){
+  if(capSheetEl) return capSheetEl;
+  var el=document.createElement('div'); el.className='cap-sheet hidden'; el.id='capSheet';
+  el.innerHTML='<div class="cap-sheet-bg" onclick="closeCapPicker()"></div>'+
+    '<div class="cap-sheet-body">'+
+      '<div class="cap-sheet-head"><span>Caption mẫu &amp; emoji</span><button type="button" onclick="closeCapPicker()" aria-label="Đóng">✕</button></div>'+
+      '<input class="input" id="capSearch" placeholder="Tìm caption..." oninput="renderCapGrid()" autocomplete="off">'+
+      '<div class="cap-emoji" id="capEmoji"></div>'+
+      '<div class="cap-tabs" id="capTabs"></div>'+
+      '<div class="cap-grid" id="capGrid"></div>'+
+    '</div>';
+  document.body.appendChild(el); capSheetEl=el; return el;
+}
+function openCapPicker(){
+  capLoadData(function(){
+    ensureCapSheet().classList.remove('hidden');
+    if(!capTab) capTab='__utils';
+    renderCapEmoji(); renderCapTabs(); renderCapGrid();
+  });
+}
+function closeCapPicker(){ if(capSheetEl) capSheetEl.classList.add('hidden'); }
+function renderCapEmoji(){
+  var box=$('capEmoji'); if(!box) return;
+  var h='<button type="button" data-e="" class="'+(!capSel.icon?'on':'')+'" title="Dùng icon mặc định của mẫu" aria-label="Dùng icon mặc định của mẫu">🚫</button>';
+  CAP_EMOJIS.forEach(function(e){ h+='<button type="button" data-e="'+e+'" class="'+(capSel.icon===e?'on':'')+'">'+e+'</button>'; });
+  box.innerHTML=h;
+  box.onclick=function(ev){
+    var b=ev.target.closest&&ev.target.closest('button'); if(!b) return;
+    capSel.icon=b.getAttribute('data-e')||'';
+    renderCapEmoji(); capSelRefresh(); renderCapGrid();
+  };
+}
+function renderCapTabs(){
+  var box=$('capTabs'); if(!box||!CAP_DATA) return;
+  var h='<button type="button" data-t="__utils" class="'+(capTab==='__utils'?'on':'')+'">Tiện ích</button>';
+  CAP_DATA.sections.forEach(function(sec,i){
+    if(sec==null) return;
+    h+='<button type="button" data-t="'+i+'" class="'+(capTab===String(i)?'on':'')+'">'+esc(sec)+'</button>';
+  });
+  box.innerHTML=h;
+  box.onclick=function(ev){
+    var b=ev.target.closest&&ev.target.closest('button'); if(!b) return;
+    capTab=b.getAttribute('data-t'); renderCapTabs(); renderCapGrid();
+    var g=$('capGrid'); if(g) g.scrollTop=0;
+  };
+}
+function renderCapGrid(){
+  var grid=$('capGrid'); if(!grid||!CAP_DATA) return;
+  var q=capNorm((($('capSearch')&&$('capSearch').value)||'').trim());
+  var h='', n=0;
+  if(capTab==='__utils' && !q){
+    h+='<div class="cap-hint">Chọn loại rồi gõ nội dung vào ô chú thích.</div>';
+    CAP_UTILS.forEach(function(u){
+      var sp=capPresetSpec(u.key, capSel.icon||u.icon, u.label);
+      h+='<button type="button" class="cap-item" data-k="'+u.key+'">'+capPillHtml(sp)+'</button>'; n++;
+    });
+  } else {
+    var secName=(capTab&&capTab!=='__utils')?CAP_DATA.sections[parseInt(capTab,10)]:null;
+    var keys=Object.keys(CAP_DATA.presets);
+    for(var i=0;i<keys.length && n<160;i++){
+      var k=keys[i], p=CAP_DATA.presets[k];
+      if(p.type!=='static_content') continue;
+      if(q){ if(capNorm(p.text).indexOf(q)<0 && capNorm(p.section).indexOf(q)<0) continue; }
+      else if(secName!=null && p.section!==secName) continue;
+      var sp2=capPresetSpec(k, capSel.icon||p.icon||'', p.text||'');
+      h+='<button type="button" class="cap-item" data-k="'+esc(k)+'">'+capPillHtml(sp2)+'</button>'; n++;
+    }
+  }
+  grid.innerHTML = n ? h : '<div class="cap-empty">Không có caption phù hợp.</div>';
+  grid.onclick=function(ev){
+    var b=ev.target.closest&&ev.target.closest('.cap-item'); if(!b) return;
+    pickCapPreset(b.getAttribute('data-k'));
+  };
+}
+function pickCapPreset(key){
+  var p=CAP_DATA.presets[key]; if(!p) return;
+  var inp=$('caption'), util=null;
+  CAP_UTILS.forEach(function(u){ if(u.key===key) util=u; });
+  capSel.key=key;
+  if(!capSel.icon) capSel.icon=''; // giữ emoji người dùng đã chọn, nếu không dùng icon mặc định của mẫu
+  if(util){
+    if(inp){
+      if(key==='time'){ var d=new Date(); inp.value=('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2); }
+      else { inp.value=''; inp.placeholder=util.hint; }
+    }
+  } else if(inp){
+    inp.value=p.text||'';
+  }
+  closeCapPicker(); capSelRefresh();
+  if(inp && util && key!=='time'){ try{ inp.focus(); }catch(e){} }
+}
+
 function fitCaptions(force){
   var clips=document.querySelectorAll('#momentsGrid .cap-clip, #momentsFeed .cap-clip');
   var todo=[], i, c;
@@ -6633,6 +6888,7 @@ function confirmCrop(){
   },'image/jpeg',CAPTURE_JPEG_Q);
 }
 function clearUpload(){
+  try{ resetCapSel(); }catch(e){}
   croppedBlob=null;originalFile=null;isVideo=false;videoCropPayload=null;videoThumbBlob=null;
   originalVideoBlob=null;videoSpeedFactor=1;
   $('fileInput').value='';
@@ -7415,7 +7671,7 @@ async function enqueueUpload(blob, caption, filename, contentType){
   try{ if(blob.type&&blob.type.startsWith('image')) preview=await blobToDataUrl(blob); }catch(e){}
   let dataUrl='';
   try{ dataUrl=await blobToDataUrl(blob); }catch(e){ toast('Không lưu được ảnh offline'); throw e; }
-  const job={id, kind:'photo', created:Date.now(), caption:caption||'', filename, contentType, dataUrl, preview, status:'pending', error:''};
+  const job={id, kind:'photo', created:Date.now(), caption:caption||'', capPreset:capSel.key||'', capIcon:capSel.icon||'', filename, contentType, dataUrl, preview, status:'pending', error:''};
   await qPut(job);
   await renderQueue();
   return job;
@@ -7432,7 +7688,7 @@ async function enqueueVideoUpload(blob, caption, filename, contentType, cropPayl
   const id='j_'+Date.now()+'_'+Math.random().toString(36).slice(2,8);
   let thumbDataUrl='';
   if(thumbBlob){ try{ thumbDataUrl=await blobToDataUrl(thumbBlob); }catch(e){} }
-  const job={id, kind:'video', created:Date.now(), caption:caption||'', filename, contentType,
+  const job={id, kind:'video', created:Date.now(), caption:caption||'', capPreset:capSel.key||'', capIcon:capSel.icon||'', filename, contentType,
              videoBlob:blob, cropPayload:cropPayload||'', thumbDataUrl, status:'pending', error:''};
   await qPut(job);
   await renderQueue();
@@ -7463,6 +7719,8 @@ async function postJobInner(job){
     const fd=new FormData();
     fd.append('file', blob, job.filename||(isVideoJob?'video.mp4':'moment.jpg'));
     fd.append('caption', job.caption||'');
+    if(job.capPreset) fd.append('cap_preset', job.capPreset);
+    if(job.capIcon) fd.append('cap_icon', job.capIcon);
     fd.append('client_id', job.id);
     if(isVideoJob && job.cropPayload) fd.append('cropPayload', job.cropPayload);
     if(isVideoJob && job.thumbDataUrl){
@@ -7628,6 +7886,8 @@ function doUpload(){
     const fd=new FormData();
     fd.append('file',croppedBlob,fixVideoName(filename, croppedBlob));
     fd.append('caption',cap);
+    if(capSel.key) fd.append('cap_preset', capSel.key);
+    if(capSel.icon) fd.append('cap_icon', capSel.icon);
     fd.append('client_id', 'd_'+Date.now()+'_'+Math.random().toString(36).slice(2,8));
     if(videoCropPayload) fd.append('cropPayload', videoCropPayload);
     if(videoThumbBlob) fd.append('thumb', videoThumbBlob, 'thumb.jpg');
@@ -8115,6 +8375,13 @@ def index(mid=None):
     r.headers["ETag"] = etag
     r.headers["Cache-Control"] = "private, no-cache"
     return r
+
+
+@app.route("/api/caption-presets")
+def api_caption_presets():
+    resp = jsonify({"presets": CAPTION_PRESETS, "sections": _CAP_SECTION_ORDER})
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
 
 
 @app.route("/manifest.webmanifest")
@@ -8928,6 +9195,14 @@ def api_upload():
     f = request.files["file"]
     thumb_f = request.files.get("thumb")
     caption = request.form.get("caption", "")
+    cap_preset = (request.form.get("cap_preset") or "").strip()[:60]
+    cap_icon = (request.form.get("cap_icon") or "").strip()[:8]
+    cap_overlay = _preset_overlay(cap_preset, caption, cap_icon) if cap_preset else None
+    if cap_overlay:
+        # plain-text fallback (video / binhake) keeps the icon + text
+        caption = cap_overlay["alt_text"]
+    elif cap_icon and caption.strip():
+        caption = cap_icon + " " + caption.strip()
     crop_payload = request.form.get("cropPayload") or None
     client_id = request.form.get("client_id") or None
     if f.filename == "":
@@ -8991,7 +9266,7 @@ def api_upload():
             # Official path primary (Firebase Storage + postMomentV2 from Android HAR).
             # binhake uploadMedia is broken upstream — keep as silent last-resort only.
             try:
-                result, _dbg = upload_media_official(s, data, ptype, caption=caption)
+                result, _dbg = upload_media_official(s, data, ptype, caption=caption, overlay=cap_overlay)
             except Exception as e_off:
                 logger.warning("official postMomentV2 failed (%s) — last-resort binhake", e_off)
                 try:
