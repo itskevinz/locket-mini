@@ -1006,6 +1006,24 @@ def _overlay_to_client_shape(ov: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_OV_SEEN: set = set()
+
+
+def _log_overlay_sample(ov: Dict[str, Any]) -> None:
+    try:
+        d = ov.get("data") if isinstance(ov.get("data"), dict) else {}
+        kind = str(d.get("type") or ov.get("overlay_type") or "?")
+        if kind in ("standard", "static_content"):
+            return
+        key = (kind, str(ov.get("overlay_id") or "")[:40])
+        if key in _OV_SEEN or len(_OV_SEEN) > 60:
+            return
+        _OV_SEEN.add(key)
+        logger.info("overlay sample [%s]: %s", kind, json.dumps(ov, ensure_ascii=False)[:900])
+    except Exception:
+        pass
+
+
 def _normalize_overlays(overlays: Any) -> List[Dict[str, Any]]:
     if overlays is None:
         return []
@@ -1088,6 +1106,8 @@ def _normalize_moment_official(m: Dict[str, Any]) -> Dict[str, Any]:
 
     # overlays → list; caption text
     ovs = _normalize_overlays(out.get("overlays"))
+    for _o in ovs:
+        _log_overlay_sample(_o)
     out["overlays"] = ovs
     if not out.get("caption"):
         for ov in ovs:
@@ -3358,7 +3378,7 @@ body.mv-feed .moments-feed{display:block !important}
 .cap-top{display:flex;gap:8px}
 .cap-top #capSearch{flex:1;min-width:0}
 .cap-top .cap-emo-in{flex:0 0 84px;width:84px;text-align:center;padding-left:8px;padding-right:8px}
-.cap-sw{display:inline-block;width:14px;height:14px;border-radius:50%;margin-right:4px;vertical-align:-2px;box-shadow:0 0 0 1px rgba(255,255,255,.35)}
+.cap-sw{display:inline-block;width:17px;height:17px;border-radius:50%;margin:0 2px;vertical-align:-4px;box-shadow:inset 0 1px 1px rgba(255,255,255,.2)}
 .cap-sheet{position:fixed;top:0;left:0;right:0;bottom:0;z-index:2000;display:flex;align-items:flex-end;justify-content:center}
 .cap-sheet-bg{position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.55)}
 .cap-sheet-body{position:relative;width:100%;max-width:560px;height:84vh;display:flex;flex-direction:column;background:var(--surface);color:var(--text);border-radius:24px 24px 0 0;padding:14px 14px calc(12px + env(safe-area-inset-bottom));box-shadow:0 -10px 40px rgba(0,0,0,.4)}
@@ -3810,8 +3830,6 @@ body.mv-feed .moments-feed{display:block !important}
 </style>
 <style id="perf-boost">
 /* Skip layout/paint work for cards that are off-screen */
-.moment-card{content-visibility:auto;contain-intrinsic-size:auto 180px;contain:layout paint style}
-.feed-slide{content-visibility:auto;contain-intrinsic-size:auto 520px}
 .moment-card img,.feed-card img{transform:translateZ(0);image-rendering:auto}
 /* Heavy blur on scrolling content is the #1 cause of jank on phones */
 @media (max-width:820px){
@@ -5666,6 +5684,8 @@ function capIconHtml(ic){
   if(!ic) return '';
   var s=String(ic);
   if(s.indexOf('https://')===0){
+    var zm=/star_signs[/]([A-Za-z]+)[.]png/.exec(s);
+    if(zm && CAP_ZODIAC[zm[1].toLowerCase()]) return '<span class="cap-ico">'+CAP_ZODIAC[zm[1].toLowerCase()]+String.fromCharCode(65038)+'</span>';
     try{
       var u=new URL(s);
       if(CAP_IMG_HOSTS.indexOf(u.hostname)>=0) return '<img class="cap-ico-img" src="'+esc(s)+'" alt="" referrerpolicy="no-referrer" decoding="async">';
@@ -5683,6 +5703,41 @@ function capIconHtml(ic){
   return '<span class="cap-ico">'+esc(s)+'</span>';
 }
 function capSafeColor(c){ return (typeof c==='string' && /^#[0-9a-fA-F]{3,8}$/.test(c)) ? c : ''; }
+/* Bảng màu: gom mọi mã màu hex nằm trong overlay (colors, background, values, alt_text...) */
+function capIsHex6(t){ return /^#?[0-9a-fA-F]{6}$/.test(t); }
+function capCollectHex(o, out, depth){
+  if(o==null || depth>6 || out.length>=12) return;
+  if(typeof o==='string'){
+    var whole=o.trim();
+    if(capIsHex6(whole)){ out.push('#'+whole.replace('#','').toUpperCase()); return; }
+    var toks=o.replace(/[^#0-9a-fA-F]+/g,' ').split(' '), i;
+    for(i=0;i<toks.length;i++){
+      var t=toks[i];
+      if(t.charAt(0)==='#' && capIsHex6(t)) out.push(t.toUpperCase());
+    }
+    return;
+  }
+  if(Array.isArray(o)){ for(var a=0;a<o.length;a++) capCollectHex(o[a], out, depth+1); return; }
+  if(typeof o==='object'){
+    for(var k in o){
+      if(!Object.prototype.hasOwnProperty.call(o,k)) continue;
+      if(k==='text_color'||k==='overlay_id'||k==='icon') continue;
+      capCollectHex(o[k], out, depth+1);
+    }
+  }
+}
+function capPaletteColors(ov){
+  var raw=[]; capCollectHex(ov, raw, 0);
+  var seen={}, res=[];
+  raw.forEach(function(c){ if(!seen[c]){ seen[c]=1; res.push(c); } });
+  return res.slice(0,5);
+}
+function capIsPalette(ov, type){
+  if(type==='color_palette'||type==='colors') return true;
+  var probe=((ov&&ov.overlay_id)||'')+' '+((ov&&ov.alt_text)||'')+' '+capIconOf(ov)+' '+(((ov&&ov.data)||{}).text||'');
+  return /palette/i.test(probe);
+}
+var CAP_ZODIAC={aries:'♈',taurus:'♉',gemini:'♊',cancer:'♋',leo:'♌',virgo:'♍',libra:'♎',scorpio:'♏',sagittarius:'♐',capricorn:'♑',aquarius:'♒',pisces:'♓'};
 function capIconOf(ov){
   var d=ov&&ov.data||{}, ic=d.icon;
   if(ic && typeof ic==='object') ic=ic.data||ic.emoji||ic.text||ic.name||'';
@@ -5715,8 +5770,11 @@ function capSpecFromMoment(m, cap){
   }
   var icon=capIconOf(ov);
   if(!icon && type!=='standard' && type!=='static_content') icon=CAP_DEFAULT_ICON[type]||'';
-  return {text:text, icon:icon, colors:colors, color:capSafeColor(d.text_color)||(st&&st.color)||'', type:type,
-          swatches: (type==='color_palette'||type==='colors') ? colors : []};
+  if(ov && capIsPalette(ov, type)){
+    var pal=capPaletteColors(ov);
+    if(pal.length) return {text:'', icon:'', colors:[], color:'#FFFFFF', type:'color_palette', swatches:pal};
+  }
+  return {text:text, icon:icon, colors:colors, color:capSafeColor(d.text_color)||(st&&st.color)||'', type:type, swatches:[]};
 }
 function capPillHtml(sp){
   var bgcss='', rich=false;
@@ -6344,6 +6402,17 @@ function applyMomentsNetworkResult(items, updatedAt, preferPrepend, opts){
     return;
   }
 
+  // The feed paints lazily in batches, so "fullyPainted" is almost never true while the user is
+  // browsing. Falling through to renderMomentsUI(items,true) used to reset the list to the top
+  // on every refresh (tab focus, resume, background sync). While scrolled down, keep the DOM and
+  // offer the tappable "new moments" pill instead.
+  var _sy=0;
+  try{ var _sc=momentsScrollEl(); _sy=(_sc&&_sc.scrollTop)||window.pageYOffset||document.documentElement.scrollTop||0; }catch(e){}
+  if(hadCache && painted.length && _sy>250){
+    showNewMomentsPill(items);
+    prefetchMomentImages(items, PREFETCH_COUNT);
+    return;
+  }
   if(preferPrepend && hadCache && prependNewMoments(items)){
     prefetchMomentImages(items, PREFETCH_COUNT);
     return;
