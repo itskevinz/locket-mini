@@ -206,7 +206,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 APP_BUILD = "2026.11.14"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
@@ -1539,7 +1539,8 @@ def detect_history_method(s: LocketSession, candidates: List[Tuple[str, str]],
 
 
 def fetch_history_page(s: LocketSession, page_token: Optional[str] = None,
-                        page_size: int = FEED_HISTORY_PAGE, timeout: int = 20
+                        page_size: int = FEED_HISTORY_PAGE, timeout: int = 20,
+                        only_user: Optional[str] = None
                         ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     url = (f"https://firestore.googleapis.com/v1/projects/locket-4252a/databases/"
            f"{FEED_HISTORY_DB}/documents/history/{s.local_id}/entries")
@@ -1573,6 +1574,10 @@ def fetch_history_page(s: LocketSession, page_token: Optional[str] = None,
     for doc in data.get("documents") or []:
         if not isinstance(doc, dict):
             continue
+        if only_user:
+            raw_u = ((doc.get("fields") or {}).get("user") or {})
+            if isinstance(raw_u, dict) and "stringValue" in raw_u and raw_u["stringValue"] != only_user:
+                continue
         flat = flatten_firestore(doc)
         if not isinstance(flat, dict):
             continue
@@ -3284,6 +3289,7 @@ body:before{
 .mu-btn{display:inline-flex;align-items:center;gap:8px;max-width:100%;min-width:0;border:none;background:var(--field);color:var(--text);font:inherit;font-weight:700;font-size:14px;padding:9px 14px;border-radius:999px;cursor:pointer}
 .mu-btn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:52vw}
 .mu-btn.on{background:var(--accent);color:var(--on-accent)}
+.mu-stat{flex:1;min-width:0;font-size:12px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mu-clear{flex:0 0 auto;border:none;background:var(--field);color:var(--text);width:34px;height:34px;border-radius:50%;cursor:pointer;font-size:14px}
 .mu-clear.hidden{display:none}
 .mu-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding:10px 2px 6px;-webkit-overflow-scrolling:touch}
@@ -4064,6 +4070,7 @@ body.mv-feed .moments-feed{display:block !important}
     </div>
     <div class="mu-bar" id="muBar">
       <button type="button" class="mu-btn" id="muBtn" onclick="openUserPicker()" aria-haspopup="dialog"><i class="bi bi-people-fill"></i><span id="muBtnText">Tất cả bạn bè</span><i class="bi bi-chevron-down"></i></button>
+      <span class="mu-stat" id="muStat"></span>
       <button type="button" class="mu-clear hidden" id="muClear" onclick="selectUser('','')" aria-label="Xem moments của tất cả bạn bè">✕</button>
     </div>
     <button type="button" class="moments-new-pill" id="momentsNewPill" onclick="applyPendingMoments();return false;"></button>
@@ -6217,6 +6224,7 @@ function startUserMoments(uid, name, fresh){
   renderMomentsUI([], true);
   var emp=$('momentsEmpty'); if(emp) emp.classList.add('hidden');
   showProgress('Đang tải moments của '+name+'…', 0, 1);
+  var st1=$('muStat'); if(st1) st1.textContent='Đang tải…';
   fetchUserMoments(false, !!fresh);
 }
 function fetchUserMoments(auto, fresh){
@@ -6244,14 +6252,18 @@ function fetchUserMoments(auto, fresh){
     }
     updateMoreLabel(); pumpMore();
     // keep scanning on its own until the first screen is reasonably full
-    if(M.hasMore && (window._momentItems||[]).length<24 && ++M.rounds<8){
-      setTimeout(function(){ fetchUserMoments(true); }, 200);
+    var cnt=(window._momentItems||[]).length, stat=$('muStat');
+    if(stat) stat.textContent = M.hasMore ? ('Đang tìm thêm… '+cnt+' ảnh') : (cnt+' ảnh');
+    // keep paging in the background until the whole history is in (older ones are appended silently)
+    if(M.hasMore && ++M.rounds<120){
+      setTimeout(function(){ fetchUserMoments(true); }, 120);
     }
   }).catch(function(){ if(gen===M.gen){ M.busy=false; hideProgress(0); updateMoreLabel(); } });
 }
 function clearUserFilter(){
   var M=window._mu; if(!M.uid) return;
   M.uid=''; M.name=''; M.gen++; M.items=[]; M.busy=false; M.started=false;
+  var st0=$('muStat'); if(st0) st0.textContent='';
   updateUserBtn();
   _momentsHasMore=M.saved?M.saved.hasMore:true; _momentsEmptyStreak=0; M.saved=null;
   var all=momentsCache||[];
@@ -9496,9 +9508,10 @@ def api_moments():
 _USER_FEEDS: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _USER_FEEDS_LOCK = threading.Lock()
 _USER_FEED_TTL_SEC = 20 * 60
-_USER_FEED_BUDGET_SEC = 7.0       # per request; the client keeps asking until done
-_USER_FEED_PAGE = 100
-_USER_FEED_MAX_PAGES = 8
+_USER_FEED_BUDGET_SEC = 2.5       # per request: short slices so the first photos show up fast
+_USER_FEED_PAGE = 300             # Firestore max page size (history fallback)
+_USER_FS_LIMIT = 300
+_USER_FS = {"ok": None, "at": 0.0}
 _UID_RE = re.compile(r"^[A-Za-z0-9_.\-]{6,128}$")
 
 
@@ -9508,8 +9521,9 @@ def _user_feed_state(local_id: str, uid: str, fresh: bool) -> Dict[str, Any]:
     with _USER_FEEDS_LOCK:
         st = _USER_FEEDS.get(key)
         if fresh or st is None or now - st["at"] > _USER_FEED_TTL_SEC:
-            st = {"lock": threading.Lock(), "items": {}, "token": None, "started": False,
-                  "done": False, "scanned": 0, "at": now, "warn": ""}
+            st = {"lock": threading.Lock(), "items": {}, "started": False, "done": False,
+                  "scanned": 0, "at": now, "warn": "", "mode": "sync", "sync_token": None,
+                  "sync_progress": False, "fs_complete": False, "hist_token": None, "phase": ""}
             _USER_FEEDS[key] = st
         if len(_USER_FEEDS) > 40:
             oldest = min(_USER_FEEDS.items(), key=lambda kv: kv[1]["at"])[0]
@@ -9521,41 +9535,133 @@ def _user_feed_key(m: Dict[str, Any]) -> str:
     return _moment_id(m) or str(m.get("thumbnail_url") or m.get("video_url") or id(m))
 
 
+def _entries_to_moments(raw: List[Any], uid: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for entry in raw or []:
+        if not isinstance(entry, dict):
+            continue
+        author = _moment_author(entry)
+        if author and author != uid:
+            continue
+        mm = _feed_entry_to_moment(entry)
+        if mm is not None:
+            out.append(mm)
+    return out
+
+
+def _user_oldest(ust: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    return min(ust["items"].values(), key=_moment_timestamp) if ust["items"] else None
+
+
 def _scan_user_feed(s: LocketSession, main_st: Dict[str, Any], uid: str, ust: Dict[str, Any],
                     budget: float = _USER_FEED_BUDGET_SEC) -> None:
-    """Advance the scan of the global history (newest -> oldest), keeping only `uid`'s moments."""
+    """Fast path first (official per-friend feed + filtered Firestore query, in parallel);
+    then keep paging per friend; scanning everybody's history is only the last resort."""
     t0 = time.time()
     with main_st["lock"]:
         dropped = set(main_st.get("deleted_ids") or ())
-        seed = [] if ust["started"] else [m for m in main_st["items"] if _moment_author(m) == uid]
-    for m in seed:
-        ust["items"][_user_feed_key(m)] = m
-    ust["started"] = True
-    pages = 0
-    while not ust["done"] and pages < _USER_FEED_MAX_PAGES and time.time() - t0 < budget:
+    try:
+        others = [u for u in (_friend_uids(s, main_st) + [s.local_id]) if u and u != uid]
+    except Exception:
+        others = []
+
+    def add(ms: List[Dict[str, Any]]) -> int:
+        n = 0
+        for m in ms:
+            if _moment_id(m) in dropped:
+                continue
+            k = _user_feed_key(m)
+            if k not in ust["items"]:
+                ust["items"][k] = m
+                n += 1
+        return n
+
+    # ---------- stage 1 (first request only): everything cheap, in parallel ----------
+    if not ust["started"]:
+        with main_st["lock"]:
+            add([m for m in main_st["items"] if _moment_author(m) == uid])
+
+        def official_latest():
+            raw, _ = _official_feed_page(s, None, others, quiet=True, timeout=12)
+            return _entries_to_moments(raw, uid)
+
+        def fs_query():
+            if not FEED_FIRESTORE_HISTORY:
+                return None
+            if _USER_FS["ok"] is False and time.time() - _USER_FS["at"] < 1800:
+                return None
+            try:
+                res = fetch_user_history_firestore(s, uid, _USER_FS_LIMIT, timeout=12)
+                _USER_FS.update(ok=True, at=time.time())
+                return res
+            except Exception as e:
+                _USER_FS.update(ok=False, at=time.time())
+                logger.debug("user firestore query unavailable: %s", e)
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fa, fb = ex.submit(official_latest), ex.submit(fs_query)
+            try:
+                add(fa.result())
+            except Exception as e:
+                ust["warn"] = str(e)[:160]
+            fs_items = None
+            try:
+                fs_items = fb.result()
+            except Exception:
+                pass
+        if fs_items is not None:
+            add(fs_items)
+            if len(fs_items) < _USER_FS_LIMIT:
+                ust["fs_complete"] = True
+                ust["done"] = True          # server-side filter returned everything there is
+                ust["phase"] = "firestore"
+        ust["started"] = True
+        old = _user_oldest(ust)
+        ust["sync_token"] = _moment_id(old) if old else None
+        ust["scanned"] = len(ust["items"])
+        return
+
+    # ---------- later requests: keep paging ----------
+    while not ust["done"] and time.time() - t0 < budget:
+        if ust["mode"] == "sync":
+            token = ust["sync_token"]
+            if not token:
+                ust["mode"] = "history"
+                continue
+            try:
+                raw, _ = _official_feed_page(s, token, others, quiet=True, timeout=12)
+            except Exception as e:
+                ust["warn"] = str(e)[:160]
+                ust["mode"] = "history"
+                continue
+            old = _user_oldest(ust)
+            old_ts = _moment_timestamp(old) if old else 0
+            fresh = [m for m in _entries_to_moments(raw, uid)
+                     if _user_feed_key(m) not in ust["items"] and _moment_timestamp(m) < old_ts]
+            if fresh:
+                add(fresh)
+                ust["sync_progress"] = True
+                ust["phase"] = "sync"
+                ust["scanned"] = len(ust["items"])
+                ust["sync_token"] = _moment_id(_user_oldest(ust))
+                continue
+            if ust["sync_progress"] or ust["fs_complete"]:
+                ust["done"] = True          # per-friend paging ran dry: that's the whole history
+            else:
+                ust["mode"] = "history"     # sync paging not supported here -> last resort
+            continue
+        # ---- last resort: walk the shared history, discarding other people's docs early ----
         try:
-            page, nxt = fetch_history_page(s, ust["token"], _USER_FEED_PAGE, timeout=15)
+            page, nxt = fetch_history_page(s, ust["hist_token"], _USER_FEED_PAGE, timeout=15, only_user=uid)
         except Exception as e:
             ust["warn"] = str(e)[:160]
-            if not ust["items"]:
-                # history unavailable -> latest few of just this friend via the official feed
-                try:
-                    others = [u for u in (_friend_uids(s, main_st) + [s.local_id]) if u and u != uid]
-                    raw, _ = _official_feed_page(s, None, others, quiet=True, timeout=15)
-                    for entry in raw:
-                        mm = _feed_entry_to_moment(entry) if isinstance(entry, dict) else None
-                        if mm is not None:
-                            ust["items"][_user_feed_key(mm)] = mm
-                except Exception as e2:
-                    ust["warn"] = (ust["warn"] + " | " + str(e2))[:200]
             ust["done"] = True
             break
-        pages += 1
-        ust["scanned"] += len(page)
-        for m in page:
-            if _moment_author(m) == uid and _moment_id(m) not in dropped:
-                ust["items"][_user_feed_key(m)] = m
-        ust["token"] = nxt
+        ust["phase"] = "history"
+        ust["scanned"] += _USER_FEED_PAGE
+        add([m for m in page if _moment_author(m) == uid])
+        ust["hist_token"] = nxt
         if not nxt:
             ust["done"] = True
 
@@ -9581,10 +9687,10 @@ def api_moments_user():
                 _scan_user_feed(s, main_st, uid, ust)
             ust["at"] = time.time()
             items = sorted(ust["items"].values(), key=_moment_timestamp, reverse=True)
-            done, scanned, warn = ust["done"], ust["scanned"], ust["warn"]
+            done, scanned, warn, phase = ust["done"], ust["scanned"], ust["warn"], ust["phase"]
         items = _enrich_moments(s, items)
         return jsonify({"ok": True, "uid": uid, "moments": items, "count": len(items),
-                        "has_more": not done, "scanned": scanned, "warning": warn})
+                        "has_more": not done, "scanned": scanned, "warning": warn, "phase": phase})
     except Exception as e:
         logger.error("MOMENTS USER error: %s", e)
         return jsonify({"ok": False, "error": str(e)})
