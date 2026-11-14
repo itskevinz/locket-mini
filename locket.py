@@ -206,8 +206,8 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "2.9"
-APP_BUILD = "2026.11.04"
+APP_VERSION = "3.0"
+APP_BUILD = "2026.11.14"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
 
@@ -3280,6 +3280,20 @@ body:before{
 
 /* ---------- Moments ---------- */
 .moments-head{display:flex;align-items:center;justify-content:space-between;padding:4px 16px 14px}
+.mu-bar{display:flex;gap:8px;align-items:center;padding:0 16px 12px}
+.mu-btn{display:inline-flex;align-items:center;gap:8px;max-width:100%;min-width:0;border:none;background:var(--field);color:var(--text);font:inherit;font-weight:700;font-size:14px;padding:9px 14px;border-radius:999px;cursor:pointer}
+.mu-btn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:52vw}
+.mu-btn.on{background:var(--accent);color:var(--on-accent)}
+.mu-clear{flex:0 0 auto;border:none;background:var(--field);color:var(--text);width:34px;height:34px;border-radius:50%;cursor:pointer;font-size:14px}
+.mu-clear.hidden{display:none}
+.mu-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding:10px 2px 6px;-webkit-overflow-scrolling:touch}
+.mu-row{display:flex;align-items:center;gap:12px;border:none;background:var(--field);color:var(--text);font:inherit;padding:8px 12px;border-radius:16px;cursor:pointer;text-align:left;width:100%}
+.mu-row.on{box-shadow:0 0 0 2px var(--accent) inset}
+.mu-row .nm{font-weight:700;font-size:15px;line-height:1.25}
+.mu-row .un{font-size:12px;color:var(--text2)}
+.mu-row .ic{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;background:var(--accent);color:var(--on-accent);flex:0 0 36px;font-size:17px}
+.mu-row>div:last-child{min-width:0}
+@media (min-width:821px){.mu-bar{padding:0 0 14px}.mu-row:hover{filter:brightness(1.06)}}
 .moments-head h2{margin:0;font-size:28px;font-weight:800;letter-spacing:-.03em}
 .moments-refresh-btn{background:rgba(var(--fg-rgb),.08);border:none;color:var(--text);font-size:17px;width:38px;height:38px;
   cursor:pointer;display:flex;align-items:center;justify-content:center;border-radius:50%;flex-shrink:0}
@@ -4047,6 +4061,10 @@ body.mv-feed .moments-feed{display:block !important}
       <button type="button" class="moments-refresh-btn" id="momentsRefreshBtn" onclick="refreshMomentsNow();return false;" title="Làm mới Moments" aria-label="Làm mới Moments">
         <i class="bi bi-arrow-clockwise" id="momentsRefreshIcon"></i>
       </button>
+    </div>
+    <div class="mu-bar" id="muBar">
+      <button type="button" class="mu-btn" id="muBtn" onclick="openUserPicker()" aria-haspopup="dialog"><i class="bi bi-people-fill"></i><span id="muBtnText">Tất cả bạn bè</span><i class="bi bi-chevron-down"></i></button>
+      <button type="button" class="mu-clear hidden" id="muClear" onclick="selectUser('','')" aria-label="Xem moments của tất cả bạn bè">✕</button>
     </div>
     <button type="button" class="moments-new-pill" id="momentsNewPill" onclick="applyPendingMoments();return false;"></button>
     <div class="moments-grid" id="momentsGrid"></div>
@@ -6114,7 +6132,135 @@ function prependNewMoments(freshItems){
   return true;
 }
 var _pendingMoments=null;
+/* ===== Moments của riêng 1 người bạn (dropdown) ===== */
+window._mu = window._mu || {uid:'', name:'', items:[], hasMore:false, busy:false, gen:0, rounds:0, started:false, saved:null, friends:null, sheet:null};
+function muActive(){ return !!(window._mu && window._mu.uid); }
+function muName(f){ return ((f.first_name||'')+' '+(f.last_name||'')).trim() || f.username || 'Bạn bè'; }
+function updateUserBtn(){
+  var btn=$('muBtn'), txt=$('muBtnText'), clr=$('muClear'); if(!btn) return;
+  var on=muActive();
+  btn.classList.toggle('on', on);
+  if(txt) txt.textContent = on ? window._mu.name : 'Tất cả bạn bè';
+  if(clr) clr.classList.toggle('hidden', !on);
+}
+function ensureUserSheet(){
+  var M=window._mu; if(M.sheet) return M.sheet;
+  var el=document.createElement('div'); el.className='cap-sheet hidden'; el.id='muSheet';
+  el.innerHTML='<div class="cap-sheet-bg" onclick="closeUserPicker()"></div>'+
+    '<div class="cap-sheet-body" role="dialog" aria-label="Chọn bạn bè">'+
+      '<div class="cap-sheet-head"><span>Xem moments của…</span><button type="button" onclick="closeUserPicker()" aria-label="Đóng">✕</button></div>'+
+      '<input class="input" id="muSearch" placeholder="Tìm bạn bè..." oninput="renderUserList()" autocomplete="off">'+
+      '<div class="mu-list" id="muList"></div>'+
+    '</div>';
+  document.body.appendChild(el); M.sheet=el;
+  document.addEventListener('keydown',function(e){
+    if(!M.sheet||M.sheet.classList.contains('hidden')) return;
+    if(e.key==='Escape') closeUserPicker();
+    else if(e.key==='Enter' && e.target&&e.target.id==='muSearch'){
+      var first=$('muList')&&$('muList').querySelector('.mu-row[data-u]:not([data-u=""])'); if(first){ e.preventDefault(); first.click(); }
+    }
+  });
+  return el;
+}
+function openUserPicker(){
+  var M=window._mu;
+  ensureUserSheet().classList.remove('hidden');
+  var q=$('muSearch'); if(q) q.value='';
+  renderUserList();
+  if(window.matchMedia && matchMedia('(hover:hover) and (pointer:fine)').matches) setTimeout(function(){ if(q) q.focus(); },60);
+  if(!M.friends){
+    apiTimeout('/api/friends', null, 30000).then(function(d){
+      if(d&&d.ok){ M.friends=(d.friends||[]).slice().sort(function(a,b){ return capNorm(muName(a)).localeCompare(capNorm(muName(b))); }); renderUserList(); }
+      else { var l=$('muList'); if(l&&!M.friends) l.innerHTML+='<div class="cap-empty">Không tải được danh sách bạn bè.</div>'; }
+    }).catch(function(){});
+  }
+}
+function closeUserPicker(){ var M=window._mu; if(M.sheet) M.sheet.classList.add('hidden'); }
+function renderUserList(){
+  var M=window._mu, box=$('muList'); if(!box) return;
+  var q=capNorm((($('muSearch')&&$('muSearch').value)||'').trim());
+  var h='';
+  function row(uid,name,sub,avatar){
+    return '<button type="button" class="mu-row'+(M.uid===uid?' on':'')+'" data-u="'+esc(uid)+'" data-n="'+esc(name)+'">'+avatar+
+      '<div><div class="nm">'+esc(name)+'</div>'+(sub?'<div class="un">'+esc(sub)+'</div>':'')+'</div></button>';
+  }
+  if(!q){
+    h+=row('', 'Tất cả bạn bè', 'Dòng thời gian chung', '<div class="ic">👥</div>');
+    h+=row('me','Moments của tôi','Những gì bạn đã đăng','<div class="ic">🙂</div>');
+  }
+  var list=M.friends||[], n=0;
+  for(var i=0;i<list.length;i++){
+    var f=list[i], nm=muName(f), un=f.username?('@'+f.username):'';
+    if(q && capNorm(nm+' '+un).indexOf(q)<0) continue;
+    var av=renderAvatar({first_name:f.first_name||f.username||'?', profile_picture_url:mediaSrc(f.profile_picture_url||'',96), badge:f.badge, celebrity:f.celebrity}, 38);
+    h+=row(String(f.uid||''), nm, un, av); n++;
+  }
+  if(M.friends===null && !q) h+='<div class="cap-empty">Đang tải danh sách bạn bè…</div>';
+  else if(!n && q) h='<div class="cap-empty">Không tìm thấy bạn nào.</div>';
+  box.innerHTML=h;
+  box.onclick=function(ev){
+    var b=ev.target.closest&&ev.target.closest('.mu-row'); if(!b) return;
+    selectUser(b.getAttribute('data-u')||'', b.getAttribute('data-n')||'');
+  };
+}
+function selectUser(uid, name){
+  closeUserPicker();
+  if(!uid){ clearUserFilter(); return; }
+  startUserMoments(uid, name, false);
+}
+function startUserMoments(uid, name, fresh){
+  var M=window._mu;
+  if(!M.uid) M.saved={hasMore:_momentsHasMore, streak:_momentsEmptyStreak};
+  M.uid=uid; M.name=name; M.gen++; M.items=[]; M.hasMore=true; M.busy=false; M.rounds=0; M.started=!!fresh&&false;
+  updateUserBtn(); hideNewMomentsPill();
+  _momentsHasMore=true; _momentsEmptyStreak=0;
+  renderMomentsUI([], true);
+  var emp=$('momentsEmpty'); if(emp) emp.classList.add('hidden');
+  showProgress('Đang tải moments của '+name+'…', 0, 1);
+  fetchUserMoments(false, !!fresh);
+}
+function fetchUserMoments(auto, fresh){
+  var M=window._mu; if(!M.uid||M.busy) return;
+  M.busy=true; var gen=M.gen; updateMoreLabel();
+  var url='/api/moments/user?uid='+encodeURIComponent(M.uid)+((M.started||fresh)?'&more=1':'')+(fresh?'&fresh=1':'');
+  apiTimeout(url, null, 45000).then(function(d){
+    if(gen!==M.gen) return;
+    M.busy=false;
+    if(!d||!d.ok){ hideProgress(0); toast((d&&d.error)||'Không tải được moments của bạn này'); updateMoreLabel(); return; }
+    M.started=true; M.hasMore=d.has_more!==false; _momentsHasMore=M.hasMore;
+    var items=(d.moments||[]).filter(function(m){return m&&(m.thumbnail_url||m.video_url||m.url)});
+    var prev=window._momentItems||[];
+    if(!prev.length){
+      M.items=items;
+      if(items.length) renderMomentsUI(items, true);
+    } else {
+      var seen={}; prev.forEach(function(m){ seen[momentKey(m)]=1; });
+      var fresh2=items.filter(function(m){ return !seen[momentKey(m)]; });
+      if(fresh2.length){ window._momentItems=prev.concat(fresh2); M.items=window._momentItems; appendMomentsBatch(); }
+    }
+    if(!(window._momentItems||[]).length){
+      if(M.hasMore){ showProgress('Đang quét lịch sử… ('+(d.scanned||0)+' moments)', 0, 1); }
+      else { hideProgress(0); showMomentsEmpty(false); var t=$('momentsEmptyText'); if(t) t.textContent=M.name+' chưa có khoảnh khắc nào mà bạn xem được'; }
+    }
+    updateMoreLabel(); pumpMore();
+    // keep scanning on its own until the first screen is reasonably full
+    if(M.hasMore && (window._momentItems||[]).length<24 && ++M.rounds<8){
+      setTimeout(function(){ fetchUserMoments(true); }, 200);
+    }
+  }).catch(function(){ if(gen===M.gen){ M.busy=false; hideProgress(0); updateMoreLabel(); } });
+}
+function clearUserFilter(){
+  var M=window._mu; if(!M.uid) return;
+  M.uid=''; M.name=''; M.gen++; M.items=[]; M.busy=false; M.started=false;
+  updateUserBtn();
+  _momentsHasMore=M.saved?M.saved.hasMore:true; _momentsEmptyStreak=0; M.saved=null;
+  var all=momentsCache||[];
+  if(all.length){ renderMomentsUI(all, true); setTimeout(pollMomentsOnce, 400); }
+  else loadMoments(true);
+}
+
 function showNewMomentsPill(freshItems){
+  if(muActive()){ hideNewMomentsPill(); return; }
   var n=countNewMoments(freshItems);
   var pill=$('momentsNewPill');
   if(n<=0 || !pill){ hideNewMomentsPill(); return; }
@@ -6135,6 +6281,7 @@ function applyPendingMoments(){
   if(!prependNewMoments(items)) renderMomentsUI(items);
 }
 function refreshMomentsNow(){
+  if(muActive()){ startUserMoments(window._mu.uid, window._mu.name, true); return; }
   var icon=$('momentsRefreshIcon');
   if(icon) icon.classList.add('icon-spin');
   apiTimeout('/api/moments?force=1', null, 20000).then(function(d){
@@ -6358,6 +6505,7 @@ var _momentsFetchInFlight = false;
 var _momentsFetchQueued = false;
 
 function applyMomentsNetworkResult(items, updatedAt, preferPrepend, opts){
+  if(muActive()){ return; }
   opts = opts || {};
   if(!items || !items.length){
     // Empty network response must NEVER wipe a healthy local cache (binhake glitch / timeout)
@@ -6436,6 +6584,7 @@ var _momentsMoreBusy=false, _momentsHasMore=true, _momentsAutoRounds=2;
 function momentTs(m){ return (m&&(m.timestamp||(m.date&&m.date._seconds)))||0; }
 var _momentsEmptyStreak=0;
 function fetchMoreMoments(auto){
+  if(muActive()){ fetchUserMoments(auto); return; }
   if(_momentsMoreBusy||!_momentsHasMore||navigator.onLine===false){ updateMoreLabel(); return; }
   _momentsMoreBusy=true; updateMoreLabel();
   var have=(window._momentItems||[]).length;
@@ -6477,6 +6626,7 @@ function fetchMoreMoments(auto){
 }
 
 function loadMoments(force){
+  if(muActive()){ return; }
   // 1) Always try to show something immediately
   var painted = ensureMomentsFromCache();
 
@@ -6584,7 +6734,7 @@ function preloadMoments(){
 }
 var _pollBusy=false;
 function pollMomentsOnce(){
-  if(document.hidden||_pollBusy) return;            // don't poll in background tabs / overlap requests
+  if(document.hidden||_pollBusy||muActive()) return;            // don't poll in background tabs / overlap requests
   _pollBusy=true; setTimeout(function(){_pollBusy=false},1500);
   try{ pumpMore(); updateMoreLabel(); }catch(e){}
   apiTimeout('/api/moments/poll?since='+encodeURIComponent(momentsUpdatedAt||0), null, 20000).then(function(d){
@@ -9339,6 +9489,104 @@ def api_moments():
         })
     except Exception as e:
         logger.error("MOMENTS error: %s", e)
+        return jsonify({"ok": False, "error": str(e)})
+
+
+# ---- Full history of ONE friend (dropdown in Moments) ---------------------------------------
+_USER_FEEDS: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_USER_FEEDS_LOCK = threading.Lock()
+_USER_FEED_TTL_SEC = 20 * 60
+_USER_FEED_BUDGET_SEC = 7.0       # per request; the client keeps asking until done
+_USER_FEED_PAGE = 100
+_USER_FEED_MAX_PAGES = 8
+_UID_RE = re.compile(r"^[A-Za-z0-9_.\-]{6,128}$")
+
+
+def _user_feed_state(local_id: str, uid: str, fresh: bool) -> Dict[str, Any]:
+    now = time.time()
+    key = (local_id, uid)
+    with _USER_FEEDS_LOCK:
+        st = _USER_FEEDS.get(key)
+        if fresh or st is None or now - st["at"] > _USER_FEED_TTL_SEC:
+            st = {"lock": threading.Lock(), "items": {}, "token": None, "started": False,
+                  "done": False, "scanned": 0, "at": now, "warn": ""}
+            _USER_FEEDS[key] = st
+        if len(_USER_FEEDS) > 40:
+            oldest = min(_USER_FEEDS.items(), key=lambda kv: kv[1]["at"])[0]
+            _USER_FEEDS.pop(oldest, None)
+    return st
+
+
+def _user_feed_key(m: Dict[str, Any]) -> str:
+    return _moment_id(m) or str(m.get("thumbnail_url") or m.get("video_url") or id(m))
+
+
+def _scan_user_feed(s: LocketSession, main_st: Dict[str, Any], uid: str, ust: Dict[str, Any],
+                    budget: float = _USER_FEED_BUDGET_SEC) -> None:
+    """Advance the scan of the global history (newest -> oldest), keeping only `uid`'s moments."""
+    t0 = time.time()
+    with main_st["lock"]:
+        dropped = set(main_st.get("deleted_ids") or ())
+        seed = [] if ust["started"] else [m for m in main_st["items"] if _moment_author(m) == uid]
+    for m in seed:
+        ust["items"][_user_feed_key(m)] = m
+    ust["started"] = True
+    pages = 0
+    while not ust["done"] and pages < _USER_FEED_MAX_PAGES and time.time() - t0 < budget:
+        try:
+            page, nxt = fetch_history_page(s, ust["token"], _USER_FEED_PAGE, timeout=15)
+        except Exception as e:
+            ust["warn"] = str(e)[:160]
+            if not ust["items"]:
+                # history unavailable -> latest few of just this friend via the official feed
+                try:
+                    others = [u for u in (_friend_uids(s, main_st) + [s.local_id]) if u and u != uid]
+                    raw, _ = _official_feed_page(s, None, others, quiet=True, timeout=15)
+                    for entry in raw:
+                        mm = _feed_entry_to_moment(entry) if isinstance(entry, dict) else None
+                        if mm is not None:
+                            ust["items"][_user_feed_key(mm)] = mm
+                except Exception as e2:
+                    ust["warn"] = (ust["warn"] + " | " + str(e2))[:200]
+            ust["done"] = True
+            break
+        pages += 1
+        ust["scanned"] += len(page)
+        for m in page:
+            if _moment_author(m) == uid and _moment_id(m) not in dropped:
+                ust["items"][_user_feed_key(m)] = m
+        ust["token"] = nxt
+        if not nxt:
+            ust["done"] = True
+
+
+@app.route("/api/moments/user")
+def api_moments_user():
+    s = get_session()
+    if not s:
+        return jsonify({"ok": False, "error": "Not logged in"})
+    try:
+        s = ensure_fresh_token(s)
+        uid = (request.args.get("uid") or "").strip()
+        if uid == "me":
+            uid = s.local_id
+        if not _UID_RE.match(uid):
+            return jsonify({"ok": False, "error": "Invalid uid"})
+        fresh = request.args.get("fresh") == "1"
+        advance = request.args.get("more") == "1" or fresh
+        main_st = _ensure_moments_state(s.local_id)
+        ust = _user_feed_state(s.local_id, uid, fresh)
+        with ust["lock"]:
+            if (not ust["started"]) or (advance and not ust["done"]):
+                _scan_user_feed(s, main_st, uid, ust)
+            ust["at"] = time.time()
+            items = sorted(ust["items"].values(), key=_moment_timestamp, reverse=True)
+            done, scanned, warn = ust["done"], ust["scanned"], ust["warn"]
+        items = _enrich_moments(s, items)
+        return jsonify({"ok": True, "uid": uid, "moments": items, "count": len(items),
+                        "has_more": not done, "scanned": scanned, "warning": warn})
+    except Exception as e:
+        logger.error("MOMENTS USER error: %s", e)
         return jsonify({"ok": False, "error": str(e)})
 
 
