@@ -206,7 +206,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "3.1"
+APP_VERSION = "3.2"
 APP_BUILD = "2026.11.14"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
@@ -888,12 +888,16 @@ def _enrich_moments(s: LocketSession, items: List[Dict[str, Any]]) -> List[Dict[
 
     out: List[Dict[str, Any]] = []
     for m in items:
-        p = profiles.get(m.get("user")) or {}
-        c = dict(m)
-        c["first_name"] = c.get("first_name") or p.get("first_name") or ""
-        c["last_name"] = c.get("last_name") or p.get("last_name") or ""
-        c["profile_picture_url"] = c.get("profile_picture_url") or p.get("profile_picture_url") or ""
-        c["from_celebrity"] = bool(c.get("from_celebrity") or p.get("celebrity"))
+        try:
+            p = profiles.get(m.get("user")) or {}
+            c = dict(m)
+            c["first_name"] = c.get("first_name") or p.get("first_name") or ""
+            c["last_name"] = c.get("last_name") or p.get("last_name") or ""
+            c["profile_picture_url"] = c.get("profile_picture_url") or p.get("profile_picture_url") or ""
+            c["from_celebrity"] = bool(c.get("from_celebrity") or p.get("celebrity"))
+        except Exception as e:
+            logger.debug("enrich: one moment failed (%s), keeping it unenriched", e)
+            c = dict(m)
         out.append(c)
     return out
 
@@ -989,21 +993,27 @@ def _moment_timestamp(m: Dict[str, Any]) -> int:
 
 
 def _overlay_to_client_shape(ov: Dict[str, Any]) -> Dict[str, Any]:
-    if isinstance(ov.get("data"), dict):
-        out = dict(ov)
-        text = ov["data"].get("text") or ov.get("alt_text") or ""
-        out["alt_text"] = out.get("alt_text") or text
-        return out
-    skip = ("overlay_id", "overlay_type", "alt_text")
-    data = {k: v for k, v in ov.items() if k not in skip}
-    text = ov.get("text") or ov.get("alt_text") or ""
-    kind = ov.get("type") or "standard"
-    return {
-        "overlay_id": ov.get("overlay_id") or f"caption:{kind}",
-        "overlay_type": ov.get("overlay_type") or "caption",
-        "alt_text": text,
-        "data": data,
-    }
+    try:
+        if isinstance(ov.get("data"), dict):
+            out = dict(ov)
+            text = ov["data"].get("text") or ov.get("alt_text") or ""
+            out["alt_text"] = out.get("alt_text") or text
+            return out
+        skip = ("overlay_id", "overlay_type", "alt_text")
+        data = {k: v for k, v in ov.items() if k not in skip and isinstance(k, str)}
+        text = ov.get("text") or ov.get("alt_text") or ""
+        kind = ov.get("type") or "standard"
+        if not isinstance(kind, str):
+            kind = "standard"
+        return {
+            "overlay_id": ov.get("overlay_id") or f"caption:{kind}",
+            "overlay_type": ov.get("overlay_type") or "caption",
+            "alt_text": text if isinstance(text, str) else "",
+            "data": data,
+        }
+    except Exception as e:
+        logger.debug("overlay shape fallback (%s): %r", e, ov)
+        return {"overlay_id": "caption:standard", "overlay_type": "caption", "alt_text": "", "data": {}}
 
 
 _OV_SEEN: set = set()
@@ -1025,19 +1035,26 @@ def _log_overlay_sample(ov: Dict[str, Any]) -> None:
 
 
 def _normalize_overlays(overlays: Any) -> List[Dict[str, Any]]:
-    if overlays is None:
+    try:
+        if overlays is None:
+            return []
+        if isinstance(overlays, list):
+            return [_overlay_to_client_shape(x) for x in overlays if isinstance(x, dict)]
+        if isinstance(overlays, dict):
+            if overlays.get("overlay_type") or overlays.get("type") or overlays.get("text"):
+                return [_overlay_to_client_shape(overlays)]
+            out = []
+            for v in overlays.values():
+                if isinstance(v, dict) and (v.get("text") or v.get("overlay_type") or v.get("type")):
+                    out.append(_overlay_to_client_shape(v))
+                elif isinstance(v, list):
+                    # a friend's app version may wrap a single overlay in a 1-item list here
+                    out.extend(_overlay_to_client_shape(x) for x in v if isinstance(x, dict))
+            return out
         return []
-    if isinstance(overlays, list):
-        return [_overlay_to_client_shape(x) for x in overlays if isinstance(x, dict)]
-    if isinstance(overlays, dict):
-        if overlays.get("overlay_type") or overlays.get("type") or overlays.get("text"):
-            return [_overlay_to_client_shape(overlays)]
-        out = []
-        for v in overlays.values():
-            if isinstance(v, dict) and (v.get("text") or v.get("overlay_type") or v.get("type")):
-                out.append(_overlay_to_client_shape(v))
-        return out
-    return []
+    except Exception as e:
+        logger.debug("overlays normalize fallback (%s): %r", e, overlays)
+        return []
 
 
 def _normalize_moment_official(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -5416,6 +5433,7 @@ function normalizeMediaUrl(u){
 /* mediaSrc defined once above with WebP-aware path */
 function isPhone(){return window.innerWidth<=520 || IS_PHONE}
 function extractCaption(m){
+  try{
   if(m.caption)return m.caption;
   if(m.overlays&&m.overlays.length){
     const cap=m.overlays.find(o=>o.overlay_id==='caption:standard')
@@ -5423,6 +5441,7 @@ function extractCaption(m){
     if(cap)return(cap.data&&cap.data.text)||cap.alt_text||'';
   }
   return'';
+  }catch(e){ return (typeof m.caption==='string'?m.caption:'') || ''; }
 }
 function timeAgo(seconds){
   if(!seconds)return'';
@@ -5769,22 +5788,24 @@ function capIconOf(ov){
   return (typeof ic==='string')?ic.slice(0,160):'';
 }
 function capOverlay(m){
-  var ovs=m&&m.overlays; if(!Array.isArray(ovs)) return null;
-  var pick=null, i, o;
-  for(i=0;i<ovs.length;i++){
-    o=ovs[i]; if(!o||typeof o!=='object') continue;
-    var id=String(o.overlay_id||'');
-    if(o.overlay_type==='caption'||id.indexOf('caption')===0){
-      if(id==='caption:standard') return o;
-      if(!pick) pick=o;
+  try{
+    var ovs=m&&m.overlays; if(!Array.isArray(ovs)) return null;
+    var pick=null, i, o;
+    for(i=0;i<ovs.length;i++){
+      o=ovs[i]; if(!o||typeof o!=='object') continue;
+      var id=String(o.overlay_id||'');
+      if(o.overlay_type==='caption'||id.indexOf('caption')===0){
+        if(id==='caption:standard') return o;
+        if(!pick) pick=o;
+      }
     }
-  }
-  return pick;
+    return pick;
+  }catch(e){ return null; }
 }
 function capSpecFromMoment(m, cap){
-  var ov=capOverlay(m), d=(ov&&ov.data)||{};
+  var ov=capOverlay(m), d=(ov&&typeof ov.data==='object'&&ov.data)||{};
   var type=String(d.type||'standard');
-  var colors=[], bg=d.background&&d.background.colors;
+  var colors=[], bg=d.background&&typeof d.background==='object'?d.background.colors:null;
   if(Array.isArray(bg)) for(var i=0;i<bg.length&&i<4;i++){ var c=capSafeColor(bg[i]); if(c) colors.push(c); }
   var st=CAP_TYPE_STYLE[type];
   if(!colors.length && st) colors=st.colors.slice();
@@ -5812,9 +5833,12 @@ function capPillHtml(sp){
   return '<div class="cap-pill'+(rich?' rich':'')+'" style="'+bgcss+'"><div class="cap-clip" style="'+col+'"><span class="cap-in">'+sw+ico+esc(sp.text)+'</span></div></div>';
 }
 function captionHtml(cap, m){
-  var sp=capSpecFromMoment(m||{}, cap);
-  if(!sp.text && !sp.swatches.length) return '';
-  return '<div class="moment-caption">'+capPillHtml(sp)+'</div>';
+  var sp;
+  try{ sp=capSpecFromMoment(m||{}, cap); }
+  catch(e){ sp={text:String(cap||''), icon:'', colors:[], color:'', type:'standard', swatches:[]}; }
+  if(!sp || (!sp.text && !sp.swatches.length)) return '';
+  try{ return '<div class="moment-caption">'+capPillHtml(sp)+'</div>'; }
+  catch(e){ return sp.text ? '<div class="moment-caption"><div class="cap-pill"><div class="cap-clip"><span class="cap-in">'+esc(sp.text)+'</span></div></div></div>' : ''; }
 }
 
 var _capRaf=0, _capForce=false, _capResizeT=null;
@@ -6044,7 +6068,12 @@ function appendMomentsBatch(){
   for(let idx=momentsRendered; idx<end; idx++){
     // first few: eager so newest shows immediately
     const eager = idx < (IS_PHONE ? 2 : 4);
-    if(frag) frag.appendChild(buildMomentNode(items[idx], idx, friendMap, eager));
+    try{
+      if(frag) frag.appendChild(buildMomentNode(items[idx], idx, friendMap, eager));
+    }catch(e){
+      console.error('buildMomentNode failed for item', idx, e);
+      if(frag){ var ph=document.createElement('div'); ph.className='moment-card'; ph.style.cssText='display:flex;align-items:center;justify-content:center;color:var(--text2);font-size:12px;min-height:120px'; ph.textContent='Không hiển thị được'; frag.appendChild(ph); }
+    }
   }
   if(target && frag) target.appendChild(frag);
   fitCaptionsSoon(false);
@@ -9531,6 +9560,9 @@ def _user_feed_state(local_id: str, uid: str, fresh: bool) -> Dict[str, Any]:
     return st
 
 
+_user_feed_state._logged = {}  # type: ignore[attr-defined]
+
+
 def _user_feed_key(m: Dict[str, Any]) -> str:
     return _moment_id(m) or str(m.get("thumbnail_url") or m.get("video_url") or id(m))
 
@@ -9660,7 +9692,18 @@ def _scan_user_feed(s: LocketSession, main_st: Dict[str, Any], uid: str, ust: Di
             break
         ust["phase"] = "history"
         ust["scanned"] += _USER_FEED_PAGE
-        add([m for m in page if _moment_author(m) == uid])
+        # Defensive: fetch_history_page already normalizes each entry via _feed_entry_to_moment,
+        # but re-normalizing a dict that is already a moment is a cheap no-op, and it means this
+        # branch keeps working even if that internal contract ever changes.
+        safe_page = []
+        for m in page:
+            try:
+                mm = m if m.get("canonical_uid") and isinstance(m.get("overlays"), list) else _feed_entry_to_moment(m)
+                if mm is not None and _moment_author(mm) == uid:
+                    safe_page.append(mm)
+            except Exception:
+                continue
+        add(safe_page)
         ust["hist_token"] = nxt
         if not nxt:
             ust["done"] = True
@@ -9688,7 +9731,24 @@ def api_moments_user():
             ust["at"] = time.time()
             items = sorted(ust["items"].values(), key=_moment_timestamp, reverse=True)
             done, scanned, warn, phase = ust["done"], ust["scanned"], ust["warn"], ust["phase"]
-        items = _enrich_moments(s, items)
+        try:
+            items = _enrich_moments(s, items)
+        except Exception as e:
+            logger.warning("MOMENTS USER enrich failed, returning unenriched items: %s", e)
+            warn = (warn + " | enrich failed: " + str(e))[:240]
+        # debug aid: surface the exact overlay shape for the first item of this friend once,
+        # so a "caption missing" report can be diagnosed from server logs precisely.
+        if items and not getattr(_user_feed_state, "_logged", {}).get(uid):
+            try:
+                getattr(_user_feed_state, "_logged", {}).setdefault(uid, True)
+            except Exception:
+                pass
+            try:
+                logger.info("user-feed sample moment [%s]: overlays=%s caption=%r",
+                            uid, json.dumps(items[0].get("overlays"), ensure_ascii=False)[:600],
+                            items[0].get("caption"))
+            except Exception:
+                pass
         return jsonify({"ok": True, "uid": uid, "moments": items, "count": len(items),
                         "has_more": not done, "scanned": scanned, "warning": warn, "phase": phase})
     except Exception as e:
