@@ -206,7 +206,7 @@ FAVICON_URL = "https://locket.binhake.dev/assets/images/app_icon/app_icon_previe
 # Engine name shown in Settings — "Lumen" for the light/glow theme this app already
 # leans on (gold badge, glow shadows, moments = little bursts of light).
 APP_CODENAME = "Lumen"
-APP_VERSION = "3.2"
+APP_VERSION = "3.3"
 APP_BUILD = "2026.11.14"
 APP_VERSION_STRING = f"{APP_CODENAME} {APP_VERSION} · build {APP_BUILD}"
 
@@ -3379,10 +3379,23 @@ body.mv-feed .moments-feed{display:block !important}
 .moments-grid.cols-2{grid-template-columns:repeat(2,1fr) !important}
 .moments-grid.cols-3{grid-template-columns:repeat(3,1fr) !important}
 .moments-grid.cols-4{grid-template-columns:repeat(4,1fr) !important}
-.moments-grid.dense .moment-caption{display:none}
-.moments-grid.dense .moment-top .mtime{display:none}
-.moments-grid.cols-4 .moment-top .mname{display:none}
-.moments-grid.cols-4 .moment-top{padding-right:3px}
+/* cols-4: tile is narrower, so shrink the pills instead of hiding name/time/caption */
+.moments-grid.cols-4 .moment-top{top:5px;left:5px;right:5px;padding:2px 7px 2px 2px;max-width:calc(100% - 10px)}
+.moments-grid.cols-4 .moment-top .avatar-wrap{margin-right:3px;transform:scale(.82);transform-origin:left center}
+.moments-grid.cols-4 .moment-top .mname{font-size:9.5px}
+.moments-grid.cols-4 .moment-top .mtime{font-size:8.5px;padding-left:4px}
+.moments-grid.cols-4 .moment-caption{bottom:6px;left:4%;right:4%}
+.moments-grid.cols-4 .cap-pill{padding:0}
+.moments-grid.cols-4 .cap-clip{font-size:10px;padding:3px 8px}
+.moments-grid.cols-4 .cap-ico{margin-right:3px;font-size:1em}
+.moments-grid.cols-4 .cap-ico svg{width:1em;height:1em}
+.moments-grid.cols-4 .cap-sw{width:11px;height:11px;margin:0 1px}
+/* cols-3 on a genuinely narrow window: same light shrink, never a hard hide */
+@media (max-width:760px){
+  .moments-grid.cols-3 .moment-top .mname{font-size:10px}
+  .moments-grid.cols-3 .moment-top .mtime{font-size:9px}
+  .moments-grid.cols-3 .cap-clip{font-size:11px;padding:3.5px 9px}
+}
 @media (max-width:520px){
   .moments-grid{display:none}
   .moments-feed{display:block}
@@ -5488,7 +5501,7 @@ function applyMomentsView(){
   var g=$('momentsGrid');
   if(g){
     var n=momentsCols();
-    g.className='moments-grid cols-'+n+((n>=4||(n>=3&&window.innerWidth<=520))?' dense':'');
+    g.className='moments-grid cols-'+n;
   }
   var seg=$('mvSeg');
   if(seg){
